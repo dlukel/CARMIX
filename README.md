@@ -52,6 +52,7 @@ state and re-mints capabilities during the migration.
 | In-kernel rematerialization. A computation's state checkpoints and rematerializes bit-identically. | Observed in the kernel. | kernel test R3 |
 | Two-machine diff-proportional migration, hash-verified. Cold sync 44505 bytes over 1093 objects. Three warm hops after small changes move 1176, 1176, and 2219 bytes. | Measured bytes on the wire between two emulator instances. | kernel/net_repro.sh |
 | Signed cross-machine authorization with real Ed25519. One legitimate migration accepted, seven adversaries each rejected by a distinct reason. | Observed between two emulator instances. | kernel/net_repro.sh |
+| Key lifecycle. A source key is learned by authority-signed enrollment, rotated and revoked under the authority key, monotonic epochs against replay and downgrade. Six lifecycle attacks each rejected by a distinct reason. | Observed between two emulator instances. | kernel/net_repro.sh |
 | Software-rendered desktop. Boot, framebuffer, console with scrolling, windows with focus, drag, and resize, driven by PS/2 keyboard and mouse. | Observed by framebuffer pixel readback in an emulator. | kernel self-tests |
 
 The two-machine byte counts and the proof results are reproducible. See docs/REPRODUCE.md.
@@ -67,9 +68,10 @@ in full in docs/ROADMAP.md.
 - Persistent storage, a filesystem, a process model, and a userspace.
 - GPU acceleration. The desktop is software-rendered. It draws CARMIX's own windows. It does not
   run third-party graphical applications, which would require the vendor GPU driver stack.
-- Real key distribution, a public-key infrastructure, and revocation. The signed-authorization
-  demo uses baked test keys with the source public key hard-coded. It proves the protocol and
-  the binding, not how a destination learns, rotates, or revokes a trust root.
+- The root of trust for keys. The key lifecycle, enrollment, rotation, revocation, and monotonic
+  epochs, is built, but the destination's first authority key is baked in. A certificate authority,
+  identity proofing, or an out-of-band bootstrap of that first key, and persistence of the trust
+  state across a reboot, are not built. See docs/SECURITY_MODEL.md.
 
 The honesty of this list is what makes the proven parts credible.
 

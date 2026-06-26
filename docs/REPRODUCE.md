@@ -69,6 +69,25 @@ expired record                REJECT replay-or-expired
 
 One legitimate migration is accepted. Seven adversaries are each rejected by a distinct reason.
 
+Key-lifecycle accept and reject table. The same reproducer prints this from the clean run.
+
+```
+enroll under the authority key            ACCEPT
+migrate under the enrolled key            ACCEPT
+migrate under a never-enrolled key        REJECT unknown-key
+rotate signed by a non-authority key      REJECT bad-authority
+rotate under the authority key            ACCEPT
+migrate under the new key                 ACCEPT
+migrate under the old key after rotation  REJECT unknown-key
+replay an old rotation                    REJECT stale-epoch
+revoke under the authority key            ACCEPT
+migrate under the revoked key             REJECT revoked-key
+revoke signed by a non-authority key      REJECT bad-authority
+```
+
+The legitimate enroll, rotate, and revoke sequence accepts. Each lifecycle attack is rejected by
+its own distinct reason, and revoked-key is distinct from unknown-key.
+
 ## Proof re-verification
 
 ```

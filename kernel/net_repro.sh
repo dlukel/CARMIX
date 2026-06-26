@@ -40,7 +40,10 @@ grep -E 'TAMPER\(node\)' /tmp/repro_node-tamper_A.log || true
 grep -E 'MISMATCH|cold pull done' /tmp/repro_node-tamper_B.log
 echo ""
 echo "--- D2 trust-boundary table (signed-authz gate; from the clean run) ---"
-sed -n '/verify-before-remint/,/B DONE/p' /tmp/repro_clean_B.log | grep -E 'case0|A[0-9]|TRUST BOUNDARY|legit case0'
+sed -n '/verify-before-remint/,/STEP 12/p' /tmp/repro_clean_B.log | grep -E 'case0|A[0-9]|TRUST BOUNDARY|legit case0'
+echo ""
+echo "--- K KEY-LIFECYCLE table (Step 12 distribution/rotation/revocation; clean run) ---"
+sed -n '/apply lifecycle/,/B DONE/p' /tmp/repro_clean_B.log | grep -E '^  \[|KEY-LIFECYCLE TABLE|KA[0-9]|legit enroll|KEY LIFECYCLE'
 echo ""
 echo "Full serial per variant: /tmp/repro_<variant>_{A,B}.log"
 echo "================================================================="

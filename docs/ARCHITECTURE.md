@@ -140,5 +140,20 @@ computation identifiers match, that the nonce is unseen and not expired, and fin
 capped at the authority ceiling through the anti-amplification gate. Each check fails closed with
 its own reason. The Ed25519 implementation is vendored tweetnacl. See kernel/TWEETNACL_PROVENANCE.txt.
 
+## Key lifecycle (kernel/nettest.c)
+
+The destination does not trust a single baked source key. It holds a trust store of an authority
+public key, the current source public key, a monotonic lifecycle epoch, and a permanent revoked
+set. Three authority-signed records drive it. An enrollment sets the first source key, a rotation
+replaces it, and a revocation adds a key to the revoked set. A lifecycle record applies only if it
+verifies under the authority key and its epoch strictly exceeds the stored epoch, which is what
+rejects replay and downgrade.
+
+Each migration carries its signing key. Before the five authorization checks, the destination
+checks that the signing key is the current source key, else unknown-key, and that it is not
+revoked, else revoked-key. These two reasons are distinct from each other and from a bad signature.
+The authority key is the one baked root of trust whose bootstrap is out of scope. See
+docs/SECURITY_MODEL.md.
+
 The proven modules ship exactly as verified. The kernel, the network harness, the proofs, and the
 documentation are the new code that uses them.

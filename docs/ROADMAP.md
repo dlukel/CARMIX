@@ -31,15 +31,23 @@ hidden.
 
 ## Two-machine migration
 
-- Real key distribution, a public-key infrastructure, and revocation. The signed-authorization
-  demo uses baked test keys with the source public key hard-coded. There is no mechanism for a
-  destination to learn, rotate, or revoke a trust root.
-- Persistent nonce state. The replay defense holds used nonces in memory and would forget them
-  across a restart.
-- A trustworthy clock. The expiry check needs a monotonic, trustworthy time source. The kernel
-  has a tick counter.
-- Real network transport. The transport is ivshmem shared memory between two local instances.
-  A real NIC, virtio-net, RDMA, or CXL memory is future work.
+The key lifecycle is built. A destination learns a source key by authority-signed enrollment,
+rotates and revokes it under the authority key, and rejects replay and downgrade by monotonic
+epochs. See docs/SECURITY_MODEL.md. What remains open is below.
+
+- The root of trust. The destination's first authority public key is baked in. A certificate
+  authority, identity proofing, or an out-of-band channel to obtain and prove that first key is the
+  irreducible bootstrap assumption, not built.
+- Persistent trust and nonce state. The trust store, the lifecycle epoch, the revoked set, and the
+  used nonces live in memory. The kernel has no disk, so a restart re-bootstraps from the baked
+  authority key at epoch zero. A real system must persist this state without rollback.
+- A trustworthy clock. The expiry check needs a monotonic, trustworthy time source. The kernel has
+  a tick counter.
+- Revocation scale and a single authority. The revoked set is a small fixed in-memory list with no
+  propagation, and one authority key whose compromise is unrecoverable. Distribution and a
+  multi-authority quorum are not built.
+- Real network transport. The transport is ivshmem shared memory between two local instances. A
+  real NIC, virtio-net, RDMA, or CXL memory is future work.
 
 ## Proofs
 

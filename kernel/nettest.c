@@ -314,6 +314,13 @@ static int wait_seq(volatile uint64_t *ctr, uint64_t last, uint64_t budget){
     while(budget--){ if(*ctr != last){ mfence(); return 1; } cpu_pause(); }
     return 0;
 }
+/* ABSOLUTE-sequence wait (timing-independent): spin until *ctr >= want. Used by
+ * the Step-12 K-suite so a reader that starts late (after the writer already
+ * bumped the counter) still rendezvouses correctly - no "!= last" toggle race. */
+static int wait_seq_ge(volatile uint64_t *ctr, uint64_t want, uint64_t budget){
+    while(budget--){ if(*ctr >= want){ mfence(); return 1; } cpu_pause(); }
+    return 0;
+}
 
 /* A side: serve WANT requests. Counts payload bytes streamed (= bytes on wire). */
 static uint64_t a_bytes_sent;
@@ -440,7 +447,7 @@ static int b_sync(cvsasx_sls_t *S){
  *
  * CRYPTO: real public-key Ed25519 (vendored tweetnacl ref - SHA-512 included, no
  * libc, links freestanding; host-side genkeys produced the TEST keys). This is
- * genuine source AUTHENTICATION, not a PSK MAC. // not implemented: real key distribution/PKI.
+ * genuine source AUTHENTICATION, not a PSK MAC. not implemented: real key distribution/PKI.
  * ===========================================================================*/
 
 /* D0: the authorization record. Packed, fixed layout = the signed message. */
@@ -485,12 +492,38 @@ static inline volatile uint64_t* authz_seqA(void){ return (volatile uint64_t*)(S
 static inline volatile uint64_t* authz_seqB(void){ return (volatile uint64_t*)(SHM+AUTHZ_SEQB); }
 static inline volatile uint32_t* authz_verd(void){ return (volatile uint32_t*)(SHM+AUTHZ_VERD); }
 
-/* distinct reject reasons (each adversary fails by its OWN check - E2 rigor). */
-enum { V_ACCEPT=0, V_BAD_SIG=1, V_ROOT_MISMATCH=2, V_WRONG_SCOPE=3, V_REPLAY_OR_EXPIRED=4, V_ANTIAMP=5 };
+/* Step 12 K-suite wire window (fresh region, clear of the AUTHZ window).
+ *   KIND   : 0=lifecycle op, 1=migration attempt
+ *   MSG    : signed message (lifecycle 112B or migration 128B)
+ *   SIGNER : signer_pk(32) - migration only
+ *   ROOT   : served root(32) - migration only  */
+#define K_KIND_OFF   0x5000   /* uint32 kind (A writes) */
+#define K_MSG_OFF    0x5010   /* signed message bytes */
+#define K_SIGNER_OFF 0x5090   /* signer_pk(32), migration */
+#define K_ROOT_OFF   0x50B0   /* served root(32), migration */
+#define K_SEQA_OFF   0x50E0   /* A's K seq */
+#define K_SEQB_OFF   0x50E8   /* B's K verdict seq */
+#define K_VERD_OFF   0x50F0   /* B's verdict */
+static inline volatile uint32_t* k_kind(void){ return (volatile uint32_t*)(SHM+K_KIND_OFF); }
+static inline volatile uint8_t*  k_msg(void){ return SHM+K_MSG_OFF; }
+static inline volatile uint8_t*  k_signer(void){ return SHM+K_SIGNER_OFF; }
+static inline volatile uint8_t*  k_root(void){ return SHM+K_ROOT_OFF; }
+static inline volatile uint64_t* k_seqA(void){ return (volatile uint64_t*)(SHM+K_SEQA_OFF); }
+static inline volatile uint64_t* k_seqB(void){ return (volatile uint64_t*)(SHM+K_SEQB_OFF); }
+static inline volatile uint32_t* k_verd(void){ return (volatile uint32_t*)(SHM+K_VERD_OFF); }
+#define K_LIFE 0u
+#define K_MIGR 1u
+
+/* distinct reject reasons (each adversary fails by its OWN check - E2 rigor).
+ * Step 10 verdicts V_ACCEPT..V_ANTIAMP; Step 12 adds the 4 key-lifecycle verdicts. */
+enum { V_ACCEPT=0, V_BAD_SIG=1, V_ROOT_MISMATCH=2, V_WRONG_SCOPE=3, V_REPLAY_OR_EXPIRED=4, V_ANTIAMP=5,
+       V_UNKNOWN_KEY=6, V_REVOKED_KEY=7, V_BAD_AUTHORITY=8, V_STALE_EPOCH=9 };
 static const char* verd_name(uint32_t v){
     switch(v){ case V_ACCEPT:return "ACCEPT"; case V_BAD_SIG:return "REJECT bad-signature [T1]";
         case V_ROOT_MISMATCH:return "REJECT root-mismatch [T1/T4]"; case V_WRONG_SCOPE:return "REJECT wrong-scope [T3]";
         case V_REPLAY_OR_EXPIRED:return "REJECT replay-or-expired [T2]"; case V_ANTIAMP:return "REJECT anti-amp-ceiling [T3]";
+        case V_UNKNOWN_KEY:return "REJECT unknown-key [K1a]"; case V_REVOKED_KEY:return "REJECT revoked-key [K1b]";
+        case V_BAD_AUTHORITY:return "REJECT bad-authority [K-lifecycle]"; case V_STALE_EPOCH:return "REJECT stale-epoch [K-lifecycle]";
         default:return "??"; } }
 
 /* B's nonce-seen set (single-use). Tiny ring; a real impl persists this. */
@@ -502,36 +535,11 @@ static void nonce_mark(uint64_t n){ if(seen_n<64) seen_nonces[seen_n++]=n; }
  * nettest, so "now" is a counter B advances each case - expiry < now => expired. */
 static uint64_t b_now;
 
-/* THE GATE (D1): verify a signed record IN ORDER, fail-closed with a DISTINCT
- * status, then re-mint capped at the ceiling via the anti-amp swcap gate. The
- * `served_root` is the root B ACTUALLY pulled (root-mismatch defense). */
+/* the anti-amp re-mint BACKSTOP (shared by the Step-10 gate AND the Step-12
+ * lifecycle gate): mint a fresh handle for `want_len` capped at SRC_CEILING via
+ * the UNMODIFIED swcap gate. Returns V_ACCEPT or V_ANTIAMP. */
 static uint8_t remint_arena[256];
-static uint32_t authz_verify_and_remint(const uint8_t signed_msg[SIGNED_LEN], const cvsasx_oid_t *served_root){
-    /* (1) signature valid under the EXPECTED source key? [T1] */
-    uint8_t recovered[SIGNED_LEN]; unsigned long long rlen=0;
-    if(crypto_sign_open(recovered, &rlen, signed_msg, SIGNED_LEN, SRC_PK) != 0) return V_BAD_SIG;
-    if(rlen != AUTHREC_LEN) return V_BAD_SIG;
-    /* parse the recovered authrec */
-    authrec_t r; for(int i=0;i<32;i++) r.epoch_root_hash[i]=recovered[i];
-    r.computation_id = (uint32_t)recovered[32]|((uint32_t)recovered[33]<<8)|((uint32_t)recovered[34]<<16)|((uint32_t)recovered[35]<<24);
-    r.dest_id        = (uint32_t)recovered[36]|((uint32_t)recovered[37]<<8)|((uint32_t)recovered[38]<<16)|((uint32_t)recovered[39]<<24);
-    r.authority_ceiling=0; for(int i=0;i<8;i++) r.authority_ceiling|=(uint64_t)recovered[40+i]<<(8*i);
-    r.nonce=0;  for(int i=0;i<8;i++) r.nonce |=(uint64_t)recovered[48+i]<<(8*i);
-    r.expiry=0; for(int i=0;i<8;i++) r.expiry|=(uint64_t)recovered[56+i]<<(8*i);
-    /* (2) record binds to the EXACT root B pulled? [T1/T4] */
-    for(int i=0;i<32;i++) if(r.epoch_root_hash[i]!=served_root->b[i]) return V_ROOT_MISMATCH;
-    /* (3) scope: this destination AND the expected computation? [T3] */
-    if(r.dest_id!=MY_DEST_ID || r.computation_id!=EXPECT_COMP) return V_WRONG_SCOPE;
-    /* (4) nonce unseen + not expired? [T2] */
-    if(nonce_seen(r.nonce) || r.expiry < b_now) return V_REPLAY_OR_EXPIRED;
-    nonce_mark(r.nonce);
-    /* (5) re-mint capped at the SOURCE's true authority via the anti-amp gate
-     * [T3 backstop]. B's custodian root authority = SRC_CEILING (the source's real
-     * ceiling, established out of band like the source key). The record asks for
-     * authority_ceiling; if it exceeds the source's, the anti-amp gate REJECTS with
-     * BAD_BOUNDS (the SAME E2/C1 "wider-bounds" gate). No arena clamp - the gate,
-     * not a min(), must be what bounds the grant, else over-ceiling slips through. */
-    uint64_t want_len = r.authority_ceiling;
+static uint32_t antiamp_remint(uint64_t want_len, const cvsasx_oid_t *served_root){
     cvsasx_swcap_t croot={ (uint64_t)(uintptr_t)remint_arena, SRC_CEILING,
                            CVSASX_PERM_LOAD|CVSASX_PERM_STORE|CVSASX_PERM_GLOBAL, 1 };
     cvsasx_sw_custodian_t cust; cvsasx_sw_custodian_init(&cust, croot);
@@ -546,8 +554,142 @@ static uint32_t authz_verify_and_remint(const uint8_t signed_msg[SIGNED_LEN], co
     return V_ACCEPT;
 }
 
+/* checks (2)-(5) on an ALREADY-signature-verified recovered authrec. Shared by
+ * the Step-10 gate (fixed SRC_PK) and the Step-12 gate (trust-store key). */
+static uint32_t authz_checks_2to5(const uint8_t *recovered, unsigned long long rlen,
+                                  const cvsasx_oid_t *served_root){
+    if(rlen != AUTHREC_LEN) return V_BAD_SIG;
+    authrec_t r; for(int i=0;i<32;i++) r.epoch_root_hash[i]=recovered[i];
+    r.computation_id = (uint32_t)recovered[32]|((uint32_t)recovered[33]<<8)|((uint32_t)recovered[34]<<16)|((uint32_t)recovered[35]<<24);
+    r.dest_id        = (uint32_t)recovered[36]|((uint32_t)recovered[37]<<8)|((uint32_t)recovered[38]<<16)|((uint32_t)recovered[39]<<24);
+    r.authority_ceiling=0; for(int i=0;i<8;i++) r.authority_ceiling|=(uint64_t)recovered[40+i]<<(8*i);
+    r.nonce=0;  for(int i=0;i<8;i++) r.nonce |=(uint64_t)recovered[48+i]<<(8*i);
+    r.expiry=0; for(int i=0;i<8;i++) r.expiry|=(uint64_t)recovered[56+i]<<(8*i);
+    /* (2) record binds to the EXACT root B pulled? [T1/T4] */
+    for(int i=0;i<32;i++) if(r.epoch_root_hash[i]!=served_root->b[i]) return V_ROOT_MISMATCH;
+    /* (3) scope: this destination AND the expected computation? [T3] */
+    if(r.dest_id!=MY_DEST_ID || r.computation_id!=EXPECT_COMP) return V_WRONG_SCOPE;
+    /* (4) nonce unseen + not expired? [T2] */
+    if(nonce_seen(r.nonce) || r.expiry < b_now) return V_REPLAY_OR_EXPIRED;
+    nonce_mark(r.nonce);
+    /* (5) re-mint capped at the SOURCE's true authority via the anti-amp gate
+     * [T3 backstop]. The gate, not a min(), bounds the grant; over-ceiling REJECTS
+     * with BAD_BOUNDS (the SAME E2/C1 wider-bounds check). */
+    return antiamp_remint(r.authority_ceiling, served_root);
+}
+
+/* THE STEP-10 GATE (D1): verify a signed record IN ORDER under the FIXED source
+ * key, fail-closed with a DISTINCT status, then re-mint capped at the ceiling. */
+static uint32_t authz_verify_and_remint(const uint8_t signed_msg[SIGNED_LEN], const cvsasx_oid_t *served_root){
+    /* (1) signature valid under the EXPECTED source key? [T1] */
+    uint8_t recovered[SIGNED_LEN]; unsigned long long rlen=0;
+    if(crypto_sign_open(recovered, &rlen, signed_msg, SIGNED_LEN, SRC_PK) != 0) return V_BAD_SIG;
+    return authz_checks_2to5(recovered, rlen, served_root);
+}
+
+/* ===========================================================================
+ * STEP 12 - KEY-DISTRIBUTION / ROTATION / REVOCATION LIFECYCLE (K0/K1/K2/K3).
+ * Step 10 hardcoded SRC_PK as the one true signer. Real systems rotate and revoke
+ * source keys. We add a tiny in-memory TRUST STORE on B, fed by AUTHORITY-signed
+ * lifecycle records, and gate the migration on the CURRENT (non-revoked) key.
+ *
+ * Trust chain: AUTH_PK (the irreducible bootstrap root, established out of band //
+ * OPEN) signs enroll/rotate/revoke records; those records set/replace the current
+ * source key and the revocation set; the migration gate then verifies the wire
+ * signer against that live trust state BEFORE the Step-10 checks. The anti-amp
+ * swcap gate remains the backstop (a key-valid migration still re-mints capped).
+ * ===========================================================================*/
+
+/* K0: the lifecycle record. op + subject_pk(32) + epoch(8). Signed by AUTH_SK. */
+enum { LC_ENROLL=0, LC_ROTATE=1, LC_REVOKE=2 };
+#define LIFEREC_LEN 48u   /* 1 op + 32 pk + 8 epoch (+ 7 pad) - fixed signed message */
+#define LC_SIGNED_LEN (64u + LIFEREC_LEN)   /* sm = sig(64) || liferec(48) = 112 */
+typedef struct { uint8_t op; uint8_t subject_pk[32]; uint64_t epoch; } liferec_t;
+_Static_assert(sizeof(liferec_t) <= LIFEREC_LEN, "liferec fits");
+static void liferec_pack(const liferec_t *r, uint8_t out[LIFEREC_LEN]){
+    for(uint32_t i=0;i<LIFEREC_LEN;i++) out[i]=0;
+    out[0]=r->op;
+    for(int i=0;i<32;i++) out[1+i]=r->subject_pk[i];
+    for(int i=0;i<8;i++) out[33+i]=(uint8_t)(r->epoch>>(8*i));
+}
+
+/* K0: the trust store (B-side, in-memory). authority_pk is BAKED = AUTH_PK - the
+ * one root we cannot derive from anything else (not implemented: out-of-band bootstrap /
+ * CA / identity proofing of this first key; not implemented: persistence across reboot -
+ * this store is RAM-only, a reboot re-bootstraps from the baked AUTH_PK). */
+#define TS_REVOKED_MAX 16
+typedef struct {
+    uint8_t  authority_pk[32];
+    uint8_t  current_src_pk[32];
+    uint8_t  has_current;                 /* 0 until the first enroll */
+    uint64_t lifecycle_epoch;             /* monotonic; every accepted op raises it */
+    uint8_t  revoked[TS_REVOKED_MAX][32];
+    int      n_revoked;
+} trust_store_t;
+static trust_store_t TRUST;
+
+static int pk_eq(const uint8_t a[32], const uint8_t b[32]){ for(int i=0;i<32;i++) if(a[i]!=b[i]) return 1; return 0; }
+static int ts_is_revoked(const uint8_t pk[32]){
+    for(int i=0;i<TRUST.n_revoked;i++) if(pk_eq(TRUST.revoked[i],pk)==0) return 1; return 0; }
+
+static void ts_init(void){
+    for(int i=0;i<32;i++) TRUST.authority_pk[i]=AUTH_PK[i];
+    for(int i=0;i<32;i++) TRUST.current_src_pk[i]=0;
+    TRUST.has_current=0; TRUST.lifecycle_epoch=0; TRUST.n_revoked=0;
+}
+
+/* K1 (lifecycle apply gate): verify a signed lifecycle record under authority_pk,
+ * require strictly-monotonic epoch, then apply. Returns the DISTINCT verdict.
+ * Fail-closed: a forged record (bad authority) or a stale/replayed epoch changes
+ * NOTHING. enroll/rotate set current_src_pk; revoke appends permanently. */
+static uint32_t lifecycle_apply(const uint8_t signed_msg[LC_SIGNED_LEN]){
+    uint8_t recovered[LC_SIGNED_LEN]; unsigned long long rlen=0;
+    /* signature MUST verify under the authority key, else bad-authority [forgery] */
+    if(crypto_sign_open(recovered, &rlen, signed_msg, LC_SIGNED_LEN, TRUST.authority_pk) != 0) return V_BAD_AUTHORITY;
+    if(rlen != LIFEREC_LEN) return V_BAD_AUTHORITY;
+    liferec_t r; r.op=recovered[0];
+    for(int i=0;i<32;i++) r.subject_pk[i]=recovered[1+i];
+    r.epoch=0; for(int i=0;i<8;i++) r.epoch|=(uint64_t)recovered[33+i]<<(8*i);
+    /* monotonic: strictly greater than the stored epoch, else stale/replay */
+    if(r.epoch <= TRUST.lifecycle_epoch) return V_STALE_EPOCH;
+    /* APPLY (all accepted ops raise the epoch) */
+    switch(r.op){
+        case LC_ENROLL:
+        case LC_ROTATE:
+            for(int i=0;i<32;i++) TRUST.current_src_pk[i]=r.subject_pk[i];
+            TRUST.has_current=1; break;
+        case LC_REVOKE:
+            if(TRUST.n_revoked<TS_REVOKED_MAX){ for(int i=0;i<32;i++) TRUST.revoked[TRUST.n_revoked][i]=r.subject_pk[i]; TRUST.n_revoked++; }
+            break;
+        default: return V_BAD_AUTHORITY;   /* unknown op = malformed = fail-closed */
+    }
+    TRUST.lifecycle_epoch=r.epoch;
+    return V_ACCEPT;
+}
+
+/* K1 (migration gate, lifecycle-aware): the wire now carries signer_pk(32). Before
+ * the Step-10 checks, fail-closed with DISTINCT new verdicts:
+ *   (a) signer_pk == trust.current_src_pk  else V_UNKNOWN_KEY
+ *   (b) signer_pk NOT in revoked[]         else V_REVOKED_KEY
+ * then verify the signature under signer_pk (== current key) and run checks (2)-(5).
+ * Note: signature verification under signer_pk (a verified-current key) is genuine
+ * source auth - the current key is itself authenticated by the AUTH-signed lifecycle. */
+static uint32_t migrate_verify_lifecycle(const uint8_t signed_msg[SIGNED_LEN], const uint8_t signer_pk[32],
+                                         const cvsasx_oid_t *served_root){
+    /* (a) is this the current source key? (covers downgrade-to-old-key too) */
+    if(!TRUST.has_current || pk_eq(signer_pk, TRUST.current_src_pk)!=0) return V_UNKNOWN_KEY;
+    /* (b) revoked? (DISTINCT from unknown - a key that WAS current but is killed) */
+    if(ts_is_revoked(signer_pk)) return V_REVOKED_KEY;
+    /* signature under the (current, non-revoked) signer key */
+    uint8_t recovered[SIGNED_LEN]; unsigned long long rlen=0;
+    if(crypto_sign_open(recovered, &rlen, signed_msg, SIGNED_LEN, signer_pk) != 0) return V_BAD_SIG;
+    return authz_checks_2to5(recovered, rlen, served_root);
+}
+
 static void d_source(const cvsasx_oid_t *base_root);   /* fwd */
 static void d_dest(const cvsasx_oid_t *base_root);
+static void k_source(const cvsasx_oid_t *base_root);   /* Step 12 fwd */
+static void k_dest(const cvsasx_oid_t *base_root);
 
 /* ===========================================================================
  * MAIN - role select then run the stages.
@@ -611,6 +753,8 @@ static void run_source(void){
 
     /* ===== STEP 10 D1/D2: signed-authorization adversarial suite (A side) ===== */
     d_source(&root);
+    /* ===== STEP 12 K: key-lifecycle suite (A side). Bound to the cold-sync root. */
+    k_source(&root);
     sputs("##### A DONE - all stages observed #####\n");
 }
 
@@ -705,6 +849,8 @@ static void run_dest(void){
     /* ===== STEP 10 D1/D2: signed-authorization adversarial suite (B side) ===== */
     /* the legit migration's root = the cold-sync root (root B installed in B2). */
     d_dest(&b2_root);
+    /* ===== STEP 12 K: key-lifecycle suite (B side). Bound to the same root. */
+    k_dest(&b2_root);
     sputs("##### B DONE - all stages observed #####\n");
 }
 
@@ -744,6 +890,154 @@ static void d_dest(const cvsasx_oid_t *base_root){
         "TRUST BOUNDARY CLOSED: integrity(hash)+authorization(signed record) both enforced\n":
         "*** FAIL - authorization gate not sound ***\n");
     sputs("  (A7 tamper = the B5 leaf+node BLAKE3 rejection, proven separately; integrity backstop intact)\n");
+}
+
+/* ===========================================================================
+ * STEP 12 K2 - the key-lifecycle adversarial suite. A drives a fixed script of
+ * lifecycle ops + migration attempts; B applies/verifies each through the K1
+ * gates and prints the KEY-LIFECYCLE TABLE. Both sides walk the SAME ordered
+ * script (the step descriptors below) so they stay in lockstep by index.
+ *
+ * Script (monotonic epochs; each KA rejected by its OWN distinct verdict):
+ *  0 L  enroll(SRC ,e1) AUTH         -> ACCEPT  (current := SRC)
+ *  1 M  migrate signer=SRC           -> ACCEPT  (K1 happy: rotated-trust migrate)
+ *  2 M  KA1 migrate signer=SRC2(new) -> UNKNOWN_KEY (never enrolled)
+ *  3 L  KA2 rotate(SRC2) by WRONG    -> BAD_AUTHORITY (forged rotate)
+ *  4 M  migrate signer=SRC           -> ACCEPT  (KA2 no effect: current still SRC)
+ *  5 L  rotate(SRC2,e2) AUTH         -> ACCEPT  (current := SRC2)
+ *  6 M  migrate signer=SRC2          -> ACCEPT  (K1 rotate happy path)
+ *  7 M  KA4 migrate signer=SRC(old)  -> UNKNOWN_KEY (key-downgrade)
+ *  8 L  KA3 replay rotate(SRC2,e2)   -> STALE_EPOCH (epoch <= stored)
+ *  9 M  migrate signer=SRC2          -> ACCEPT  (KA3 didn't roll the key back)
+ * 10 L  KA5 revoke(SRC2,e3) AUTH     -> ACCEPT  (SRC2 revoked)
+ * 11 M  KA5 migrate signer=SRC2      -> REVOKED_KEY (use-after-revoke, DISTINCT)
+ * 12 L  rotate(SRC,e5) AUTH          -> ACCEPT  (re-establish a good key = SRC)
+ * 13 L  KA6 revoke(SRC,e6) by WRONG  -> BAD_AUTHORITY (forged revoke)
+ * 14 M  migrate signer=SRC           -> ACCEPT  (KA6 no DoS: good key still works)
+ * ===========================================================================*/
+#define K_NSTEP 15
+/* per-step expected verdict + label (B side checks each got==want). */
+static const uint32_t KWANT[K_NSTEP]={
+    V_ACCEPT, V_ACCEPT, V_UNKNOWN_KEY, V_BAD_AUTHORITY, V_ACCEPT,
+    V_ACCEPT, V_ACCEPT, V_UNKNOWN_KEY, V_STALE_EPOCH, V_ACCEPT,
+    V_ACCEPT, V_REVOKED_KEY, V_ACCEPT, V_BAD_AUTHORITY, V_ACCEPT };
+static const char* KLABEL[K_NSTEP]={
+    "L  enroll(SRC,e1) AUTH        ","M  migrate signer=SRC         ","KA1 migrate signer=SRC2(new)  ",
+    "KA2 rotate(SRC2) by WRONG     ","M  migrate signer=SRC         ","L  rotate(SRC2,e2) AUTH       ",
+    "M  migrate signer=SRC2        ","KA4 migrate signer=SRC(old)   ","KA3 replay rotate(SRC2,e2)    ",
+    "M  migrate signer=SRC2        ","KA5 revoke(SRC2,e3) AUTH      ","KA5 migrate signer=SRC2(revkd)",
+    "L  rotate(SRC,e5) AUTH        ","KA6 revoke(SRC,e6) by WRONG   ","M  migrate signer=SRC         " };
+
+/* The wire signer_pk we present must MATCH the key used to sign (else V_BAD_SIG
+ * would mask the lifecycle verdict). For unknown/old keys we present the genuine
+ * pk so the lifecycle check (a)/(b) - not the signature - is what fires. */
+
+/* A side: build + publish each scripted step, wait B's verdict, print framing. */
+static void k_source(const cvsasx_oid_t *base_root){
+    sputs("\n##### STEP 12: KEY-LIFECYCLE (distribution / rotation / revocation) #####\n");
+    sputs("K0 [A] AUTHORITY=AUTH_PK signs enroll/rotate/revoke; migration gated on the CURRENT non-revoked key\n");
+    for(uint32_t s=0; s<K_NSTEP; s++){
+        uint32_t kind; uint8_t signer[32]; cvsasx_oid_t served=*base_root;
+        uint8_t msg[SIGNED_LEN]; unsigned long long smlen=0;
+        switch(s){
+            /* ---- lifecycle ops (signed by AUTH_SK, or WRONG_SK for forgeries) ---- */
+            case 0: case 3: case 5: case 8: case 10: case 12: case 13: {
+                kind=K_LIFE; liferec_t lr;
+                const uint8_t *lsk=AUTH_SK;
+                switch(s){
+                    case 0:  lr.op=LC_ENROLL; for(int i=0;i<32;i++)lr.subject_pk[i]=SRC_PK[i];  lr.epoch=1; break;
+                    case 3:  lr.op=LC_ROTATE; for(int i=0;i<32;i++)lr.subject_pk[i]=SRC2_PK[i]; lr.epoch=9; lsk=WRONG_SK; break; /* forged */
+                    case 5:  lr.op=LC_ROTATE; for(int i=0;i<32;i++)lr.subject_pk[i]=SRC2_PK[i]; lr.epoch=2; break;
+                    case 8:  lr.op=LC_ROTATE; for(int i=0;i<32;i++)lr.subject_pk[i]=SRC2_PK[i]; lr.epoch=2; break; /* replay: <= stored */
+                    case 10: lr.op=LC_REVOKE; for(int i=0;i<32;i++)lr.subject_pk[i]=SRC2_PK[i]; lr.epoch=3; break;
+                    case 12: lr.op=LC_ROTATE; for(int i=0;i<32;i++)lr.subject_pk[i]=SRC_PK[i];  lr.epoch=5; break;
+                    case 13: lr.op=LC_REVOKE; for(int i=0;i<32;i++)lr.subject_pk[i]=SRC_PK[i];  lr.epoch=6; lsk=WRONG_SK; break; /* forged */
+                }
+                uint8_t flat[LIFEREC_LEN]; liferec_pack(&lr, flat);
+                crypto_sign(msg, &smlen, flat, LIFEREC_LEN, lsk);
+                for(int i=0;i<32;i++) signer[i]=0;   /* unused for lifecycle */
+            } break;
+            /* ---- migration attempts (signed by the presented source key) -------- */
+            default: {
+                kind=K_MIGR;
+                const uint8_t *msk; const uint8_t *spk;
+                switch(s){
+                    case 2:  msk=SRC2_SK; spk=SRC2_PK; break;            /* KA1 never-enrolled */
+                    case 7:  msk=SRC_SK;  spk=SRC_PK;  break;            /* KA4 old key (downgrade) */
+                    case 6: case 9: msk=SRC2_SK; spk=SRC2_PK; break;     /* current = SRC2 */
+                    case 11: msk=SRC2_SK; spk=SRC2_PK; break;           /* KA5 revoked SRC2 */
+                    default: msk=SRC_SK; spk=SRC_PK; break;             /* steps 1,4,14: current = SRC */
+                }
+                authrec_t r;
+                for(int i=0;i<32;i++) r.epoch_root_hash[i]=base_root->b[i];
+                r.computation_id=EXPECT_COMP; r.dest_id=MY_DEST_ID;
+                r.authority_ceiling=SRC_CEILING; r.nonce=0x2000+s; r.expiry=0xFFFFFFFF;
+                uint8_t flat[AUTHREC_LEN]; authrec_pack(&r, flat);
+                crypto_sign(msg, &smlen, flat, AUTHREC_LEN, msk);
+                for(int i=0;i<32;i++) signer[i]=spk[i];
+            } break;
+        }
+        /* publish step: kind + msg + signer + served root, set A seq = s+1
+         * (ABSOLUTE so a late-starting B still rendezvouses). */
+        *k_kind()=kind;
+        for(uint32_t i=0;i<SIGNED_LEN;i++) k_msg()[i]=msg[i];
+        bcopy_to(k_signer(), signer, 32);
+        bcopy_to(k_root(), served.b, 32);
+        mfence(); *k_seqA()=s+1; mfence();
+        if(!wait_seq_ge(k_seqB(), s+1, WAIT_BUDGET)){ sputs("K [A] TIMEOUT step "); sdec(s); sputc('\n'); hcf(); }
+        uint32_t v=*k_verd();
+        sputs("K [A] step "); if(s<10)sputc(' '); sdec(s); sputs("  "); sputs(KLABEL[s]);
+        sputs(" -> "); sputs(verd_name(v)); sputc('\n');
+    }
+    sputs("K [A] suite complete.\n");
+}
+
+/* B side: receive each scripted step, dispatch to the K1 lifecycle/migration gate,
+ * post the distinct verdict, and print the KEY-LIFECYCLE TABLE (the proof). */
+static void k_dest(const cvsasx_oid_t *base_root){
+    (void)base_root;
+    sputs("\n##### STEP 12: KEY-LIFECYCLE (apply lifecycle + lifecycle-gated migrate) #####\n");
+    sputs("K1 [B] migrate gate order: (a)current-key (b)not-revoked (1)sig (2)root (3)scope (4)nonce+expiry (5)anti-amp; DISTINCT reasons\n");
+    ts_init();
+    b_now=100; seen_n=0;
+    uint32_t got[K_NSTEP]; int all_ok=1;
+    for(uint32_t s=0;s<K_NSTEP;s++){
+        /* wait for A's step s (ABSOLUTE: k_seqA reaches s+1) - race-free vs start time */
+        if(!wait_seq_ge(k_seqA(), s+1, WAIT_BUDGET)){ sputs("K [B] TIMEOUT step "); sdec(s); sputc('\n'); hcf(); }
+        uint32_t kind=*k_kind();
+        uint8_t msg[SIGNED_LEN]; for(uint32_t i=0;i<SIGNED_LEN;i++) msg[i]=k_msg()[i];
+        uint32_t v;
+        if(kind==K_LIFE){
+            v = lifecycle_apply(msg);   /* msg holds the 112-byte lifecycle sm */
+        } else {
+            uint8_t signer[32]; bcopy_from(signer, k_signer(), 32);
+            cvsasx_oid_t served; bcopy_from(served.b, k_root(), 32);
+            v = migrate_verify_lifecycle(msg, signer, &served);
+        }
+        got[s]=v;
+        *k_verd()=v; mfence(); *k_seqB()=s+1; mfence();
+        int ok=(v==KWANT[s]); if(!ok) all_ok=0;
+        sputs("  ["); if(s<10)sputc(' '); sdec(s); sputs("] "); sputs(KLABEL[s]); sputs(" -> "); sputs(verd_name(v));
+        sputs(ok?"   (intended)\n":"   *** WRONG REASON ***\n");
+    }
+    sputs("\n===== KEY-LIFECYCLE TABLE (each KA rejected by its OWN distinct verdict) =====\n");
+    /* the load-bearing assertions */
+    int ka1=(got[2]==V_UNKNOWN_KEY), ka2=(got[3]==V_BAD_AUTHORITY && got[4]==V_ACCEPT);
+    int ka3=(got[8]==V_STALE_EPOCH && got[9]==V_ACCEPT), ka4=(got[7]==V_UNKNOWN_KEY);
+    int ka5=(got[11]==V_REVOKED_KEY), ka6=(got[13]==V_BAD_AUTHORITY && got[14]==V_ACCEPT);
+    int legit=(got[0]==V_ACCEPT && got[1]==V_ACCEPT && got[5]==V_ACCEPT && got[6]==V_ACCEPT);
+    sputs("  legit enroll->migrate + rotate->migrate ACCEPT?  "); sputs(legit?"y":"n"); sputc('\n');
+    sputs("  KA1 unknown-key      -> V_UNKNOWN_KEY            : "); sputs(ka1?"y":"n"); sputc('\n');
+    sputs("  KA2 rotation-forgery -> V_BAD_AUTHORITY, key kept: "); sputs(ka2?"y":"n"); sputc('\n');
+    sputs("  KA3 rotation-replay  -> V_STALE_EPOCH, key kept  : "); sputs(ka3?"y":"n"); sputc('\n');
+    sputs("  KA4 key-downgrade    -> V_UNKNOWN_KEY (old key)  : "); sputs(ka4?"y":"n"); sputc('\n');
+    sputs("  KA5 use-after-revoke -> V_REVOKED_KEY (distinct) : "); sputs(ka5?"y":"n"); sputc('\n');
+    sputs("  KA6 revoke-forgery   -> V_BAD_AUTHORITY, no DoS  : "); sputs(ka6?"y":"n"); sputc('\n');
+    sputs("  KA7 Step-10 D2 suite still green (same boot, above): see D2 TRUST-BOUNDARY TABLE\n");
+    int pass = legit&&ka1&&ka2&&ka3&&ka4&&ka5&&ka6&&all_ok;
+    sputs("\n  -> "); sputs(pass?
+        "KEY LIFECYCLE CLOSED: distribution+rotation+revocation enforced; anti-amp backstop intact\n":
+        "*** FAIL - key-lifecycle gate not sound ***\n");
 }
 
 void kmain(void);
@@ -791,9 +1085,9 @@ void kmain(void){
     uint64_t cur = *magic;
     int is_A;
     if(cur != SH_MAGIC){
-        /* unclaimed -> I'm A: zero the B1 mailboxes AND the B2 seq counters, claim. */
+        /* unclaimed -> I'm A: zero the B1 mailboxes AND the B2 + K seq counters, claim. */
         A2B()->flag=MB_EMPTY; B2A()->flag=MB_EMPTY;
-        *seqA()=0; *seqB()=0; mfence();
+        *seqA()=0; *seqB()=0; *k_seqA()=0; *k_seqB()=0; mfence();
         *magic = SH_MAGIC; mfence();
         is_A = 1;
     } else {

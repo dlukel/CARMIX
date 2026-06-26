@@ -16,6 +16,17 @@ threats are the following.
 - Scope escalation. A source authorized for one computation, one destination, or one authority
   ceiling presents state for a different computation, a different destination, or a higher ceiling.
 
+The signing key itself is a target.
+
+- Unknown key. A source signs a well-formed record under a key the destination was never told to
+  trust.
+- Rotation forgery. An attacker forges a key-rotation message the destination did not receive from
+  the trusted authority.
+- Rotation replay or downgrade. An old, once-valid rotation or an old key is replayed to force the
+  destination back to a superseded key.
+- Use after revoke. A migration is signed by a key that was valid but has since been revoked.
+- Revocation forgery. A forged revocation of a still-good key, to deny service.
+
 ## What each mechanism guarantees
 
 Hash verification guards integrity. Each block's identity is the BLAKE3 hash of its content. The
@@ -40,18 +51,41 @@ check failing closed with a distinct reason:
 The cryptography is real Ed25519, vendored tweetnacl. It is public-key source authentication, not
 a shared-secret scheme.
 
+## The key lifecycle
+
+The destination holds a trust store rather than a baked source key. The store has an authority
+public key, the current source public key, a monotonic lifecycle epoch, and a permanent revoked
+set. Three record types, each signed by the authority key and stamped with an epoch, drive it. An
+enrollment sets the first source key. A rotation replaces it with a new key. A revocation adds a
+key to the revoked set. A lifecycle record is applied only if its signature verifies under the
+authority key and its epoch is strictly greater than the stored epoch, which makes rotation and
+revocation monotonic and rejects replay and downgrade.
+
+Before the five authorization checks above, the destination resolves the migration's signing key
+through the trust store. The key must equal the current source key, else the migration is rejected
+as an unknown key, and it must not be in the revoked set, else it is rejected as a revoked key.
+These two reasons are distinct. A downgrade to an old key reads as unknown-key, while a migration
+under a killed key reads as revoked-key. A forged rotation or revocation under a non-authority key
+is rejected as bad-authority, and an old lifecycle record is rejected as a stale epoch.
+
 ## What is not provided
 
-The demo uses baked test keys. The source public key is hard-coded in the destination. The
-following are not built, and a real deployment requires them.
+The keys in the demo are deterministic test keys. The lifecycle above provides enrollment,
+authority-signed rotation, revocation, and monotonic epochs. The following are not built, and a
+real deployment requires them.
 
-- Key distribution and a public-key infrastructure. There is no mechanism for a destination to
-  learn the legitimate source key, to rotate it, or to revoke it. The demo proves the protocol
-  and the binding logic under a known key, not how trust roots are managed.
-- Persistent nonce state. The replay defense relies on remembering used nonces. The demo holds
-  this in memory. A real system must survive a restart without forgetting, or an attacker replays
-  across a reboot.
-- A trustworthy clock. The expiry check needs a monotonic, trustworthy time source. The kernel
-  has a tick counter, not a verified clock.
+- The root of trust. The destination's first authority public key is baked in. How a destination
+  obtains and proves that first key, through a certificate authority, identity proofing, or an
+  out-of-band channel, is the one irreducible bootstrap assumption. The lifecycle is proven given a
+  trustworthy authority key, not how that key is established.
+- Persistent trust and nonce state. The trust store and the used-nonce set live in memory. The
+  kernel has no disk, so a restart re-bootstraps from the baked authority key at epoch zero. A real
+  system must persist the current key, the epoch, the revoked set, and the seen nonces without
+  rollback.
+- A trustworthy clock. The expiry check needs a monotonic, trustworthy time source. The kernel has
+  a tick counter, not a verified clock.
+- Revocation scale and a single authority. The revoked set is a small fixed in-memory list with no
+  propagation, and there is one authority key whose compromise is unrecoverable. Distribution and a
+  multi-authority quorum are not built.
 
 These are listed in docs/ROADMAP.md.
