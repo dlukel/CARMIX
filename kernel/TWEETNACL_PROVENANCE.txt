@@ -1,0 +1,1 @@
+tweetnacl ref Ed25519 (SHA-512 included, no libc). Source: github.com/dominictarr/tweetnacl @ master (mirror of nacl tweet by D.J.Bernstein et al). keypair() is host-only (commented out in the kernel copy); kernel uses crypto_sign + crypto_sign_open only.

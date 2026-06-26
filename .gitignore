@@ -1,0 +1,20 @@
+# Build artifacts
+*.o
+*.elf
+*.iso
+*.bin
+
+# Coq build outputs
+*.vo
+*.vos
+*.vok
+*.glob
+.*.aux
+_audit.v
+
+# Captures and scratch
+*.log
+serial_*.log
+*.out
+*.tmp
+build/
