@@ -107,6 +107,23 @@ kernel/kernel.c.
 - In-kernel rematerialization. The store and the single-level store, linked into the kernel,
   checkpoint a counter, rematerialize it, and demonstrate the diff-proportional structural diff.
 
+## Task substrate and scheduler hook (kernel/kernel.c)
+
+The kernel runs and switches between tasks. A task is a saved execution context, an id, a stack, a
+saved stack pointer, a state of ready, running, or done, and a reserved content-address handle
+named remat_root that is unused today. A small assembly routine, switch_to, saves the running
+task's callee-saved registers and stack pointer and restores the next task's, which is a real
+context switch, not a function call. A cooperative yield calls it directly. The timer interrupt
+calls it too, so a task that never yields is still preempted on a tick.
+
+The scheduling policy is isolated as a single function, pick_next, which today is round-robin. This
+function and the save and restore in switch_to are the seam. The policy is deliberately a
+placeholder. The reserved remat_root handle and the switch_to seam are where a future
+rematerialization-native scheduler attaches, the open question of whether a context switch should
+become a store and rematerialize cycle over content-addressed task state. That policy is not
+designed here. The substrate exists, the policy slot is named and isolated, and the placeholder is
+labeled as such.
+
 ## Two-machine migration (kernel/nettest.c)
 
 Two emulator instances share memory through an ivshmem device, a PCI device whose second base

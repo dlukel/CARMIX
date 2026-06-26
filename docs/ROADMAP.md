@@ -11,8 +11,13 @@ hidden.
 - USB input. Input is PS/2, which the emulator provides. Real modern hardware needs a USB HID
   stack over xHCI.
 - Persistent storage. There is no storage driver. NVMe or AHCI is needed.
-- A filesystem, a process model, and a userspace. None of these exist. The kernel runs a single
-  flow of self-tests and a desktop loop.
+- A memory manager, a userspace, and a syscall boundary. A task substrate exists. The kernel
+  creates tasks, switches between them with a real assembly context switch, and preempts a
+  non-yielding task on the timer interrupt. See docs/ARCHITECTURE.md. What does not exist is memory
+  isolation between tasks, a user and kernel privilege split, a syscall boundary, and a real memory
+  manager. The tasks share the kernel address space.
+- A filesystem and persistent process state. There is no filesystem, and a task's state lives only
+  in RAM.
 - GPU acceleration. The desktop is software-rendered and draws CARMIX's own windows. Running
   third-party graphical applications would require the vendor GPU driver stack, which is out of
   scope.

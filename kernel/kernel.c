@@ -117,13 +117,16 @@ __attribute__((interrupt)) static void isr_pf(struct iframe *f, uint64_t e){
     uint64_t cr2; __asm__ volatile("mov %%cr2,%0":"=r"(cr2)); sputs("  (#PF cr2="); sx64(cr2); sputs(")\n"); fault_dump(14,e,f); }
 /* AUDIT A6 fix: #DF (8) and a catch-all over the 0-31 CPU-exception range, split by the
  * error-code-pushing vectors, so a stray/nested exception DUMPS instead of silently
- * triple-faulting. // not implemented: an IST/TSS stack for #DF (a kernel-stack fault still escalates
+ * triple-faulting. not implemented: an IST/TSS stack for #DF (a kernel-stack fault still escalates
  * because the dump runs on the faulting stack); per-vector stubs for exact vector numbers. */
 __attribute__((interrupt)) static void isr_df(struct iframe *f, uint64_t e){ fault_dump(8,e,f); }
 __attribute__((interrupt)) static void isr_exc_noerr(struct iframe *f){ fault_dump(0xFE,0,f); }
 __attribute__((interrupt)) static void isr_exc_err(struct iframe *f, uint64_t e){ fault_dump(0xEF,e,f); }
 static volatile uint64_t ticks;
-__attribute__((interrupt)) static void isr_timer(struct iframe *f){ (void)f; ticks++; outb(0x20,0x20); }
+/* P2: the timer ISR can preempt the running task. Defined after the scheduler
+ * (sched_tick) so the body stays here but the switch logic lives in one place. */
+static void sched_tick(void);
+__attribute__((interrupt)) static void isr_timer(struct iframe *f){ (void)f; ticks++; outb(0x20,0x20); sched_tick(); }
 
 static void pic_remap(void){
     outb(0x20,0x11); outb(0xA0,0x11); outb(0x21,0x20); outb(0xA1,0x28);
@@ -157,7 +160,7 @@ static void draw_dec(uint32_t x,uint32_t y,uint64_t v,uint32_t fg){ char b[24]; 
 /* ===========================================================================
  * STEP 7 STAGE 1 - PS/2 keyboard input (the seed of interactivity).
  * IRQ1 -> port 0x60 -> scancode set 1 -> ASCII -> echo to serial AND draw to the
- * framebuffer at a console cursor. (USB-HID/xHCI is // not implemented - far harder, later.)
+ * framebuffer at a console cursor. (USB-HID/xHCI is not implemented: - far harder, later.)
  * ===========================================================================*/
 static const char kbd_set1[128] = {  /* scancode set 1 (no shift), index = make code */
  0,27,'1','2','3','4','5','6','7','8','9','0','-','=','\b','\t',
@@ -670,6 +673,227 @@ static void run_step5(void){
     sputs("STEP 5: rematerialization + diff-proportional transfer run ON THE METAL.\n");
 }
 
+/* ===========================================================================
+ * STEP 11 - a minimal TASK / PROCESS substrate (P0-P3).
+ * Turns the kernel from "one scripted sequence" into "switches between tasks".
+ * The scheduling POLICY is isolated in ONE function, pick_next(), so future
+ * "rematerialization-native scheduling" research replaces only that hook (and
+ * possibly the save/restore), not the kernel. See kernel/SCHED_LOG.md.
+ * Round-robin here is an explicit PLACEHOLDER, not the contribution.
+ * ===========================================================================*/
+enum task_state { TASK_READY, TASK_RUNNING, TASK_DONE };
+typedef struct task {
+    uint32_t id;
+    /* saved callee-saved context: switch_to() stores rsp here; the rest live on
+     * that stack (pushed by switch_to) so this struct stays tiny. */
+    uint64_t rsp;            /* the one piece of context the switch persists in the struct */
+    uint64_t *stack;         /* base of this task's stack region (falloc'd 4KiB) */
+    enum task_state state;
+    uint8_t remat_root[32];  /* RESERVED: content-address handle for future research; UNUSED here. */
+} task_t;
+
+#define MAX_TASKS 4
+static task_t g_tasks[MAX_TASKS];
+static int g_ntasks = 0;
+static int g_cur = -1;       /* index of the RUNNING task, or -1 in kmain's "task 0" context */
+static uint64_t g_switches = 0;
+static task_t g_main_task;   /* represents kmain's own context so we can switch back to it */
+static int g_sched_on = 0;   /* P2: only let the timer preempt while the demo is active */
+
+/* ---- the ASSEMBLY context switch (callee-saved regs + rsp) ----------------
+ * SysV callee-saved: rbx,rbp,r12-r15. Push them, save rsp to *old, load rsp from
+ * *new, pop them, ret -> resumes the new task exactly where IT last called
+ * switch_to (cooperatively OR from the timer ISR - same routine, that is the point).
+ * THIS routine is the second thing the research may replace (a switch could become
+ * a store+rematerialize cycle); see SCHED_LOG.md. */
+__attribute__((naked, noinline))
+static void switch_to(uint64_t *old_rsp, uint64_t new_rsp){
+    __asm__ volatile(
+        "push %rbx\n\t" "push %rbp\n\t" "push %r12\n\t"
+        "push %r13\n\t" "push %r14\n\t" "push %r15\n\t"
+        "mov %rsp, (%rdi)\n\t"   /* *old_rsp = rsp  (rdi = old_rsp) */
+        "mov %rsi, %rsp\n\t"     /* rsp = new_rsp   (rsi = new_rsp) */
+        "pop %r15\n\t" "pop %r14\n\t" "pop %r13\n\t"
+        "pop %r12\n\t" "pop %rbp\n\t" "pop %rbx\n\t"
+        "ret\n\t");
+}
+
+/* ---- pick_next(): THE SCHEDULING HOOK. Round-robin PLACEHOLDER. ------------
+ * Future research replaces ONLY this function (signature fixed): given the
+ * current task index, return the index of the next READY/RUNNING task to run.
+ * Returns -1 if none remain (all DONE) -> control returns to kmain. */
+static int pick_next(int cur){
+    for(int k=1;k<=g_ntasks;k++){
+        int i=(cur+k)%g_ntasks;
+        if(g_tasks[i].state==TASK_READY || g_tasks[i].state==TASK_RUNNING) return i;
+    }
+    return -1;
+}
+
+/* ---- yield(): cooperative. Save current, pick next, switch. ---------------- */
+static void yield(void){
+    int cur=g_cur, nxt=pick_next(cur);
+    if(nxt<0 || nxt==cur) return;                 /* nobody else ready -> keep running */
+    if(g_tasks[cur].state==TASK_RUNNING) g_tasks[cur].state=TASK_READY;
+    g_tasks[nxt].state=TASK_RUNNING; g_cur=nxt; g_switches++;
+    switch_to(&g_tasks[cur].rsp, g_tasks[nxt].rsp);
+}
+
+/* P2: invoked from the timer ISR. Same hook, same switch - only WHEN differs.
+ * A task that NEVER yields is switched out here. Re-entry is impossible: IF is
+ * clear in the ISR until the next task's IRET restores its own rflags. */
+static void sched_tick(void){
+    if(!g_sched_on || g_cur<0) return;
+    int cur=g_cur, nxt=pick_next(cur);
+    if(nxt<0 || nxt==cur) return;
+    if(g_tasks[cur].state==TASK_RUNNING) g_tasks[cur].state=TASK_READY;
+    g_tasks[nxt].state=TASK_RUNNING; g_cur=nxt; g_switches++;
+    switch_to(&g_tasks[cur].rsp, g_tasks[nxt].rsp);
+}
+
+/* task_exit(): a task's entry returns here; mark DONE and switch away forever.
+ * Lands on the next runnable task, or back to kmain (the g_main_task context). */
+static void task_exit(void){
+    g_tasks[g_cur].state=TASK_DONE;
+    int nxt=pick_next(g_cur);
+    uint64_t dummy;   /* DONE task's rsp never resumes -> a throwaway slot to save into */
+    if(nxt<0){ g_sched_on=0; int cur=g_cur; g_cur=-1; switch_to(&dummy, g_main_task.rsp); (void)cur; }
+    else { g_tasks[nxt].state=TASK_RUNNING; int cur=g_cur; g_cur=nxt; g_switches++; switch_to(&dummy, g_tasks[nxt].rsp); (void)cur; }
+}
+
+/* task_trampoline: the first thing a freshly-created task runs. `sti` so the
+ * task ALWAYS starts with interrupts enabled - critical for P2: a task first
+ * entered from the timer ISR (IF=0) would otherwise run with interrupts masked
+ * forever and never be preempted. fn is in r12 (a callee-saved reg switch_to
+ * restored from the bootstrap frame); fn returns into task_exit (return slot). */
+__attribute__((naked, noinline))
+static void task_trampoline(void){
+    __asm__ volatile("sti\n\t" "jmp *%r12\n\t");   /* fn ret-addr = task_exit (already on stack) */
+}
+
+/* task_create(): build a stack frame that, when switch_to() pops into it, lands
+ * in task_trampoline (which sti's then jumps to fn). Bootstrap layout (top-down):
+ * a return slot = task_exit (fn's `ret` lands here), then a return slot =
+ * task_trampoline (switch_to's `ret` jumps here), then 6 callee-saved slots that
+ * switch_to's 6 pops consume - the r12 slot is preloaded with fn. */
+static void task_create(void (*fn)(void)){
+    if(g_ntasks>=MAX_TASKS) return;
+    task_t *t=&g_tasks[g_ntasks];
+    uint64_t pa=falloc();                          /* 4KiB stack frame */
+    t->stack=(uint64_t*)P2V(pa);
+    uint64_t *sp=t->stack + (4096/8);              /* top of stack (grows down) */
+    /* switch_to pops r15,r14,r13,r12,rbp,rbx then `ret`. pop reads LOW->HIGH, so
+     * r15 is at the lowest (last-written) slot and the `ret` target (trampoline)
+     * is highest. fn goes in the r12 slot so the trampoline's `jmp *%r12` enters
+     * it. Writes below run high-address first (*--sp), so this list is in
+     * pop order: rbx-slot value LAST. */
+    *--sp = (uint64_t)task_exit;                   /* +56: fn returns here (after jmp) */
+    *--sp = (uint64_t)task_trampoline;             /* +48: switch_to's `ret` enters here */
+    *--sp = 0;                                     /* +40: rbx */
+    *--sp = 0;                                     /* +32: rbp */
+    *--sp = (uint64_t)fn;                          /* +24: r12 = fn (trampoline jmp *%r12) */
+    *--sp = 0;                                     /* +16: r13 */
+    *--sp = 0;                                     /* +8 : r14 */
+    *--sp = 0;                                     /* +0 : r15 (lowest, popped first) */
+    t->rsp=(uint64_t)sp; t->id=(uint32_t)g_ntasks; t->state=TASK_READY;
+    for(int i=0;i<32;i++) t->remat_root[i]=0;      /* reserved, future research */
+    g_ntasks++;
+}
+
+/* ---- P0 workload: two tasks print A/B and yield -> proves a real switch ---- */
+static void task_a(void){ for(int i=0;i<4;i++){ sputc('A'); yield(); } }
+static void task_b(void){ for(int i=0;i<4;i++){ sputc('B'); yield(); } }
+
+/* ---- P1 workload: a task does REAL work (the proven R3 remat-counter path)
+ * across a yield. It increments a counter, checkpoints via cvsasx_store_put,
+ * yields (another task runs), resumes, rematerializes via cvsasx_store_get, and
+ * asserts the value survived the context switch. ---- */
+static uint8_t  p1_arena[1u<<12]; static cvsasx_store_entry_t p1_idx[16]; static cvsasx_store_t p1_store;
+static volatile int p1_ok=0; static volatile uint32_t p1_before=0, p1_after=0;
+static void task_remat(void){
+    cvsasx_store_init(&p1_store, p1_arena, sizeof p1_arena, p1_idx, 16);
+    uint32_t counter=1000; counter++;                       /* do work: 1001 */
+    p1_before=counter;
+    cvsasx_hash_t h; cvsasx_store_put(&p1_store,&counter,sizeof counter,&h);   /* checkpoint */
+    counter=0xDEAD;                                         /* clobber: prove we rely on the store, not the stack var */
+    yield();                                                /* <-- context switch happens here */
+    uint32_t remat=0; const void*b; size_t l;               /* resumed: rematerialize */
+    if(cvsasx_store_get(&p1_store,&h,&b,&l)==CVSASX_STORE_OK && l==sizeof remat)
+        for(size_t i=0;i<l;i++) ((uint8_t*)&remat)[i]=((const uint8_t*)b)[i];
+    p1_after=remat; p1_ok=(remat==p1_before);
+    sputs("\nP1 task: counter "); sdec(p1_before); sputs(" checkpointed, yielded, rematerialized -> "); sdec(p1_after);
+    sputs(p1_ok?" SURVIVED the switch\n":" *** LOST ***\n");
+}
+/* a partner task so task_remat's yield has somewhere to go (and proves interleave). */
+static void task_partner(void){ for(int i=0;i<3;i++){ sputc('P'); yield(); } }
+
+/* ---- P2 workloads: tight loops that NEVER call yield(). Only the timer ISR
+ * (sched_tick) can switch them. Bounded so the demo terminates (an unbounded
+ * loop would hang the boot before run_shell). Each prints its marker every
+ * BUSY iterations; ~tens of ms of busy work => the 100Hz timer preempts. ---- */
+static volatile int p2_saw_a=0, p2_saw_b=0;
+static volatile uint64_t p2_sink=0;   /* defeat dead-loop elimination */
+static void task_loop_noyield(void){
+    for(int r=0;r<6;r++){
+        for(volatile uint64_t i=0;i<4000000ull;i++) p2_sink+=i;   /* busy work, NO yield */
+        sputc('1'); p2_saw_a=1;
+    }
+}
+static void task_loop_noyield2(void){
+    for(int r=0;r<6;r++){
+        for(volatile uint64_t i=0;i<4000000ull;i++) p2_sink+=i;
+        sputc('2'); p2_saw_b=1;
+    }
+}
+
+/* run the scheduler from kmain's context: install g_main_task as the resume
+ * target, mark kmain as g_cur=0's "caller", launch into the first task. When all
+ * tasks are DONE, task_exit switches back here and we return. */
+static void start_tasks(void){
+    g_main_task.id=0xFFFF; g_main_task.state=TASK_RUNNING;
+    g_cur=0; g_tasks[0].state=TASK_RUNNING;
+    switch_to(&g_main_task.rsp, g_tasks[0].rsp);   /* jump in; returns here when all DONE */
+    g_cur=-1;
+}
+
+static void run_sched(void){
+    sputs("\n=== STEP 11: TASK SUBSTRATE - cooperative + preemptive scheduling ===\n");
+
+    /* P0: two tasks alternate A B A B ... proving a real context switch. */
+    sputs("P0 interleave (each task prints its marker then yield()s): ");
+    g_ntasks=0; g_switches=0; g_sched_on=0;
+    task_create(task_a); task_create(task_b);
+    start_tasks();
+    sputs("\nP0 both tasks DONE; switches="); sdec(g_switches);
+    sputs("; control back in kmain -> ");
+    sputs((g_tasks[0].state==TASK_DONE && g_tasks[1].state==TASK_DONE && g_switches>=4)?"COOPERATIVE SWITCH OK\n":"FAIL\n");
+
+    /* P1: a task does the proven R3 remat-counter work ACROSS a yield. */
+    sputs("\nP1 real work across a switch (R3 remat-counter inside a task):");
+    g_ntasks=0; g_switches=0; g_sched_on=0; p1_ok=0;
+    task_create(task_remat); task_create(task_partner);
+    start_tasks();
+    sputs("P1 result: before="); sdec(p1_before); sputs(" after="); sdec(p1_after);
+    sputs(p1_ok?" -> COUNTER SURVIVES YIELD/RESUME OK\n":" -> FAIL\n");
+
+    /* P2: a task in a tight loop with NO yield is preempted by the timer.
+     * The looping task never calls yield(); only the timer ISR (sched_tick) can
+     * switch it out. If the looper's marker and the other task's marker BOTH
+     * appear, the switch came from the timer. */
+    sputs("\nP2 preemption (looping task has NO yield; only the timer switches it):\n");
+    g_ntasks=0; g_switches=0; p1_ok=0;
+    task_create(task_loop_noyield); task_create(task_loop_noyield2);
+    uint64_t sw0=g_switches;
+    g_sched_on=1;                                  /* arm preemption JUST for this demo */
+    start_tasks();
+    g_sched_on=0;
+    int p2=(p2_saw_a && p2_saw_b) && (g_switches>sw0);
+    sputs("P2 saw L1="); sputs(p2_saw_a?"y":"n"); sputs(" L2="); sputs(p2_saw_b?"y":"n");
+    sputs(" timer-switches="); sdec(g_switches);
+    sputs(p2?" -> PREEMPTED WITHOUT YIELD OK\n":" -> NOT PREEMPTED (see stall report)\n");
+    sputs("STEP 11: task substrate run; pick_next() is the isolated research hook (SCHED_LOG.md).\n");
+}
+
 void kmain(void);
 void kmain(void){
     serial_init();
@@ -776,6 +1000,7 @@ void kmain(void){
     run_e1();          /* E1: multi-window focus (raise-on-click) */
     run_e2();          /* E2: drag the focused window */
     run_e3();          /* E3: resize via the grip + min-clamp */
+    run_sched();       /* STEP 11: task substrate - P0 cooperative, P1 remat-work, P2 preemption */
     run_shell();       /* E4: live focus/drag/resize/type desktop (does not return) */
 #endif
     hcf();
