@@ -238,8 +238,30 @@ gate that refuses a migration. Loading the same image twice gives two processes 
 resolves to one physical frame by hash while their writable data and stacks are private. Loading
 therefore joins faulting, migrating, and crossing as one operation, rematerialization under the
 proven gate, with integrity gated by construction. The image is embedded in the kernel because there
-is no filesystem yet, the two loaded processes run sequentially because the scheduler does not yet
-carry concurrent ring-3 tasks, and the loaded program is a static executable.
+is no filesystem yet, and the loaded program is a static executable.
+
+## Concurrent processes and descheduling as rematerialization (kernel/kernel.c)
+
+The scheduler runs more than one ring-3 process at once. Each process carries its own page-table
+root, its own user instruction and stack pointers, and its own re-minted ceiling, and the timer
+preempts a running process and restores another exactly. Two processes run interleaved, each bounded
+by its own ceiling, and neither can exercise the other's authority.
+
+A descheduled process is a content-addressed object. Instead of keeping a descheduled process
+resident, the scheduler dematerializes its schedulable state to a hash in the store and releases its
+frames, so that not running and not resident become different states. When the scheduler selects it
+again, the state is rematerialized from the hash with verification and the process resumes where it
+left off, its counter surviving the round trip. Descheduling joins faulting, migrating, crossing, and
+loading as rematerialization under the proven path.
+
+The cost is measured. Resuming a resident process is a register and page-table-root restore near ten
+thousand cycles, resuming a dematerialized process is a store fetch, a verification, and a remap near
+half a million cycles, about fifty times more. So dematerializing on every deschedule would be
+wasteful. The mechanism is built, the policy that decides when to use it, based on how long a process
+is expected to stay descheduled against this cost, is a named future seam, and pick_next stays a
+round-robin placeholder. Today the register context and the private data page dematerialize, the
+page-table root stays resident, dematerializing the full page-table state is the open wider
+task-state object.
 
 ## Two-machine migration (kernel/nettest.c)
 

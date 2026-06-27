@@ -2797,6 +2797,479 @@ static void run_loader(void){
     sputs((a.stack_frame!=b.stack_frame)?" -> DISTINCT (private) OK\n":" -> *** SHARED STACK ***\n");
     sputs("L4 HONEST: the two processes are loaded (spaces + frames + entry/stack ready) and the sharing is shown AT LOAD TIME;\n");
     sputs("   they run SEQUENTIALLY (the single-g_ur / single ring-3 slot from US has no concurrent ring-3 scheduler) - stated, not faked.\n");
+    sputs("   (C0 below removes this limitation: the same two processes run CONCURRENTLY, timer-preempted.)\n");
+}
+
+/* ===========================================================================
+ * CONCURRENT MULTI-PROCESS SCHEDULING (C0-C3) - the local single-node mechanism.
+ *
+ * SCOPE (binding, from the scheduling research): the LOCAL mechanism ONLY -
+ * concurrent content-addressed ring-3 processes, per-process re-minted authority,
+ * one deschedule->dematerialize->rematerialize cycle. NO unified decentralized-
+ * orchestration model is claimed (research rated that 3/10). pick_next stays the
+ * isolated round-robin hook; a rematerialization-AWARE policy (deciding WHEN to
+ * dematerialize from cost) is a NAMED future seam, NOT implemented here.
+ *
+ * What is genuinely NEW vs the loader (which ran ring-3 procs SEQUENTIALLY via the
+ * synchronous IRETQ-call-and-return g_ur slot): a FULL ring-3 context save/restore
+ * driven by the timer. When the PIT fires while CPL=3, conc_trap (naked) saves the
+ * interrupted process's ENTIRE register frame + iretq frame, the C scheduler picks
+ * the next process, conc_trap restores ITS frame and CR3, and IRETQs into it. The
+ * loader, the per-task page tables (mm_new_space), the proven store, and the anti-
+ * amp gate are REUSED unchanged; only this context-switch + the C scheduler are new.
+ * ===========================================================================*/
+
+/* the full trapframe pushed on RSP0 by conc_trap/conc_sysent (low addr -> high):
+ * 15 GPRs (r15 lowest) then the CPU's 5-qword iretq frame. The C scheduler reads
+ * and rewrites this in place; the naked entry pops the GPRs and IRETQs from it. */
+typedef struct {
+    uint64_t r15,r14,r13,r12,r11,r10,r9,r8,rbp,rdi,rsi,rdx,rcx,rbx,rax;
+    uint64_t rip,cs,rflags,rsp,ss;
+} c_tf_t;
+
+#define CONC_MAX 2
+#define CONC_CODE_VA 0x0000000040000000ULL   /* shared, read-only-by-hash code page */
+#define CONC_DATA_VA 0x0000000060000000ULL   /* private, writable per-process state page */
+#define CONC_STK_VA  0x0000000050000000ULL   /* private user stack (= LD_STACK_VA, but per-space) */
+
+/* the per-process schedulable state (the content-addressed process). */
+typedef struct {
+    uint32_t id; uint8_t tag; int live; int present;   /* present=context resident (vs dematerialized) */
+    uint64_t cr3;                                       /* the process's own page-table root */
+    uint64_t data_frame, stack_frame, code_frame;      /* its resident frames */
+    c_tf_t tf;                                          /* full saved ring-3 context */
+    /* C1 authority: each process has its OWN re-minted ceiling over its OWN object range. */
+    cvsasx_sw_custodian_t cust; cvsasx_sw_region_t region; uint64_t ceil_off, ceil_len;
+    uint8_t  ceilH[CVSASX_BLAKE3_LEN];                  /* content hash of the process's object range */
+    /* C2: content address of the dematerialized schedulable state (when !present). */
+    uint8_t remat_root[32]; int dematerialized;
+    uint64_t carried;                                  /* value carried out on SYS_EXIT (the counter) */
+} cproc_t;
+
+static cproc_t g_cp[CONC_MAX];
+static int g_ncp=0, g_ccur=-1, g_clive=0;
+static uint64_t g_cswitches=0, g_csyscalls=0;
+static uint64_t g_c2_park_at=0;   /* C2: if >0, the scheduler parks the running proc back to kmain once its counter reaches this */
+uint64_t conc_kmain_rsp=0;                    /* kmain's stack to return to (referenced by name in conc_enter's asm; non-static so the symbol is emitted) */
+static uint64_t conc_kcr3=0;                 /* kernel CR3 (restored when leaving the demo) */
+static int g_conc_active=0;                  /* the trap/syscall route through conc_sched only while set */
+
+/* the privileged object the C1 ceilings are carved from (one shared object, each
+ * process bounded to a DISJOINT sub-range so no process can name another's). */
+static uint8_t conc_obj[256];
+
+/* the shared ring-3 program (PIC; talks only via int 0x80). It reads its private
+ * data page at CONC_DATA_VA: [tag:1][pad:7][counter:8][n_done:8][n_target:8]. It
+ * busy-spins (so the 100Hz timer preempts mid-spin), SYS_WRITEs its tag, bumps the
+ * carried counter + n_done, and SYS_EXITs (carrying counter in rsi) at n_target. */
+extern char conc_blob[], conc_blob_end[];
+__asm__(
+    ".pushsection .text\n\t"
+    ".global conc_blob\n\t .global conc_blob_end\n\t"
+    "conc_blob:\n\t"
+    "  movq $0x60000000, %r15\n\t"              /* &data page (CONC_DATA_VA) */
+    "cb_loop:\n\t"
+    "  movq $3000000, %rcx\n\t"                 /* busy-spin: long enough for a 100Hz tick to land mid-spin */
+    "cb_spin:\n\t  decq %rcx\n\t  jnz cb_spin\n\t"
+    "  movzbq (%r15), %rsi\n\t  movq $1, %rdi\n\t  int $0x80\n\t"   /* SYS_WRITE tag */
+    "  incq 8(%r15)\n\t"                         /* counter++   (the value that survives C2) */
+    "  incq 16(%r15)\n\t"                        /* n_done++ */
+    "  movq 16(%r15), %rax\n\t  cmpq 24(%r15), %rax\n\t  jb cb_loop\n\t"
+    "  movq $9, %rdi\n\t  movq 8(%r15), %rsi\n\t  int $0x80\n\t"    /* SYS_EXIT(counter) */
+    "cb_hang:\n\t  jmp cb_hang\n\t"
+    "conc_blob_end:\n\t"
+    ".popsection\n\t");
+
+/* C1 - re-mint a process's authority through the PROVEN anti-amp gate against ITS
+ * OWN custodian/region. Returns the gate status; *out is the bounded re-minted cap. */
+static cvsasx_status_t conc_remint(cproc_t *p, const cvsasx_pir_t *pir, cvsasx_swcap_t *out){
+    return cvsasx_sw_cap_remint(&p->cust, pir, &p->region, out);
+}
+/* build a PIR naming an offset/len within an object identified by hash h, load-only. */
+static void conc_make_pir(cvsasx_pir_t *pir, const uint8_t *h, uint64_t off, uint64_t len, uint32_t perms){
+    for(unsigned i=0;i<sizeof *pir;i++) ((uint8_t*)pir)[i]=0;
+    for(int i=0;i<(int)CVSASX_BLAKE3_LEN;i++) pir->referent_hash[i]=h[i];
+    pir->offset=off; pir->length=len; pir->struct_version=CVSASX_PIR_VERSION; pir->perms=perms;
+    pir->flags=CVSASX_PIR_FLAG_REFERENT_VALID;
+}
+
+/* syscall numbers reused from US (SYS_WRITE=1, SYS_EXIT=9). */
+/* THE C SCHEDULER. Called by the naked entries with the in-place trapframe. reason
+ * 0 = timer preempt; 1 = syscall. It saves the current process, services/reschedules,
+ * rewrites *tf with the NEXT process's frame, and switches CR3. pick_next() is the
+ * isolated round-robin policy hook - the ONLY scheduling decision, unchanged from
+ * STEP 11's contract. A rematerialization-aware policy replaces ONLY pick_next. */
+static int conc_pick_next(int cur){                 /* round-robin over live, present procs */
+    for(int k=1;k<=g_ncp;k++){ int i=(cur+k)%g_ncp; if(g_cp[i].live && g_cp[i].present) return i; }
+    /* a live-but-dematerialized proc still needs picking (C2 rematerializes it on select). */
+    for(int k=1;k<=g_ncp;k++){ int i=(cur+k)%g_ncp; if(g_cp[i].live) return i; }
+    return -1;
+}
+static cvsasx_hash_t conc_dematerialize(cproc_t *p);   /* C2, defined below */
+static int           conc_rematerialize(cproc_t *p);   /* C2, defined below */
+
+__attribute__((used)) static void conc_sched(c_tf_t *tf, uint64_t reason){
+    outb(0x20,0x20);                                /* EOI for the timer path (harmless on syscall path) */
+    if(g_ccur<0){ return; }
+    cproc_t *cur=&g_cp[g_ccur];
+    cur->tf=*tf;                                    /* save the interrupted/ trapping process's FULL context */
+
+    if(reason==1){                                  /* SYSCALL path */
+        g_csyscalls++;
+        uint64_t n=tf->rdi, a1=tf->rsi;
+        if(n==SYS_WRITE){ kputc((char)a1); sputc((char)a1); cur->tf.rax=0; *tf=cur->tf; return; }  /* service + stay on the SAME process */
+        if(n==SYS_EXIT){ cur->live=0; g_clive--; cur->carried=a1; (void)cur; }   /* fallthrough -> reschedule */
+        else { cur->tf.rax=(uint64_t)-1; *tf=cur->tf; return; }
+    }
+    /* C2: a one-process deschedule probe - once the running proc's carried counter
+     * reaches g_c2_park_at, PARK it back to kmain (keeping it live + its context saved
+     * in cur->tf) so the driver can dematerialize it. */
+    if(reason==0 && g_c2_park_at>0 && cur->present && cur->data_frame){
+        uint64_t ctr=*(uint64_t*)(P2V(cur->data_frame)+8);
+        if(ctr>=g_c2_park_at){
+            __asm__ volatile("mov %0,%%cr3"::"r"(conc_kcr3):"memory");
+            extern char conc_return[];
+            tf->rip=(uint64_t)conc_return; tf->cs=SEL_KCODE; tf->ss=SEL_KDATA;
+            tf->rsp=conc_kmain_rsp; tf->rflags=0x2;     /* IF=0 */
+            return;
+        }
+    }
+    /* TIMER preempt OR a SYS_EXIT that must move on: pick the next runnable process. */
+    int nxt=conc_pick_next(g_ccur);
+    if(nxt<0){                                      /* all processes have exited -> leave the demo */
+        g_conc_active=0;
+        __asm__ volatile("mov %0,%%cr3"::"r"(conc_kcr3):"memory");
+        /* hand control back to kmain by IRETQ-returning to conc_enter's saved ring-0 frame. */
+        extern char conc_return[];
+        tf->rip=(uint64_t)conc_return; tf->cs=SEL_KCODE; tf->ss=SEL_KDATA;
+        tf->rsp=conc_kmain_rsp; tf->rflags=0x2;     /* IF=0: stay in the kernel, no re-entry */
+        return;
+    }
+    cproc_t *np=&g_cp[nxt];
+    if(!np->present){ conc_rematerialize(np); }     /* C2: a selected dematerialized proc is rematerialized */
+    g_ccur=nxt; g_cswitches++;
+    __asm__ volatile("mov %0,%%cr3"::"r"(np->cr3):"memory");   /* switch to the next process's address space */
+    *tf=np->tf;                                     /* restore its full ring-3 context (asm pops + iretqs) */
+}
+
+/* the naked timer entry for the concurrent demo: save GPRs, call conc_sched(tf,0),
+ * restore GPRs, IRETQ. Replaces isr_timer in the IDT only for the demo's duration. */
+__attribute__((naked)) static void conc_trap(void){
+    __asm__ volatile(
+        "push %%rax\n\t push %%rbx\n\t push %%rcx\n\t push %%rdx\n\t push %%rsi\n\t push %%rdi\n\t push %%rbp\n\t"
+        "push %%r8\n\t push %%r9\n\t push %%r10\n\t push %%r11\n\t push %%r12\n\t push %%r13\n\t push %%r14\n\t push %%r15\n\t"
+        "mov %%rsp,%%rdi\n\t xor %%rsi,%%rsi\n\t"   /* rdi=tf, rsi=reason(0=timer) */
+        "call conc_sched\n\t"
+        "pop %%r15\n\t pop %%r14\n\t pop %%r13\n\t pop %%r12\n\t pop %%r11\n\t pop %%r10\n\t pop %%r9\n\t pop %%r8\n\t"
+        "pop %%rbp\n\t pop %%rdi\n\t pop %%rsi\n\t pop %%rdx\n\t pop %%rcx\n\t pop %%rbx\n\t pop %%rax\n\t"
+        "iretq\n\t" ::: "memory");
+}
+/* the naked int-0x80 syscall entry for the concurrent demo (DPL=3 gate). Same frame,
+ * reason=1; conc_sched dispatches WRITE (stay) / EXIT (reschedule). */
+__attribute__((naked)) static void conc_sysent(void){
+    __asm__ volatile(
+        "push %%rax\n\t push %%rbx\n\t push %%rcx\n\t push %%rdx\n\t push %%rsi\n\t push %%rdi\n\t push %%rbp\n\t"
+        "push %%r8\n\t push %%r9\n\t push %%r10\n\t push %%r11\n\t push %%r12\n\t push %%r13\n\t push %%r14\n\t push %%r15\n\t"
+        "mov %%rsp,%%rdi\n\t mov $1,%%rsi\n\t"
+        "call conc_sched\n\t"
+        "pop %%r15\n\t pop %%r14\n\t pop %%r13\n\t pop %%r12\n\t pop %%r11\n\t pop %%r10\n\t pop %%r9\n\t pop %%r8\n\t"
+        "pop %%rbp\n\t pop %%rdi\n\t pop %%rsi\n\t pop %%rdx\n\t pop %%rcx\n\t pop %%rbx\n\t pop %%rax\n\t"
+        "iretq\n\t" ::: "memory");
+}
+
+/* conc_enter(tf, cr3): the ONE entry into a concurrent ring-3 process from kmain's
+ * ring-0 context. Saves kmain's callee-saved frame + rsp (into conc_kmain_rsp),
+ * switches CR3, restores the FULL GPR set from *tf (rdi=tf, rsi=cr3 on entry -
+ * load them into scratch first), pushes the 5-qword iret frame from *tf, and IRETQs.
+ * The scheduler returns control to conc_run by IRETQ-ing to the conc_return label
+ * (it sets tf->rip=conc_return, tf->rsp=conc_kmain_rsp); we pop the callee-saved
+ * frame and `ret`. Restoring ALL GPRs (not just the iret frame) is the fix for the
+ * mid-execution resume: e.g. the blob keeps its data-page pointer in r15. */
+__attribute__((used, naked)) static void conc_enter(c_tf_t *tf, uint64_t cr3){
+    __asm__ volatile(
+        "push %%rbx\n\t push %%rbp\n\t push %%r12\n\t push %%r13\n\t push %%r14\n\t push %%r15\n\t"
+        "mov %%rsp, conc_kmain_rsp(%%rip)\n\t"      /* save kmain's resume rsp */
+        "mov %%rsi, %%cr3\n\t"                       /* switch to the process address space */
+        "mov %%rdi, %%rax\n\t"                       /* rax = tf base (we restore rax LAST from tf) */
+        /* push the iret frame from tf: ss, rsp, rflags, cs, rip (offsets after 15 GPRs) */
+        "pushq 19*8(%%rax)\n\t"                      /* ss      (tf+19) */
+        "pushq 18*8(%%rax)\n\t"                      /* rsp     (tf+18) */
+        "pushq 17*8(%%rax)\n\t"                      /* rflags  (tf+17) */
+        "pushq 16*8(%%rax)\n\t"                      /* cs      (tf+16) */
+        "pushq 15*8(%%rax)\n\t"                      /* rip     (tf+15) */
+        /* restore all 15 GPRs from tf (struct order: r15,r14,...,rbx,rax = idx 0..14) */
+        "mov  0*8(%%rax), %%r15\n\t"  "mov  1*8(%%rax), %%r14\n\t"  "mov  2*8(%%rax), %%r13\n\t"
+        "mov  3*8(%%rax), %%r12\n\t"  "mov  4*8(%%rax), %%r11\n\t"  "mov  5*8(%%rax), %%r10\n\t"
+        "mov  6*8(%%rax), %%r9\n\t"   "mov  7*8(%%rax), %%r8\n\t"   "mov  8*8(%%rax), %%rbp\n\t"
+        "mov  9*8(%%rax), %%rdi\n\t"  "mov 10*8(%%rax), %%rsi\n\t"  "mov 11*8(%%rax), %%rdx\n\t"
+        "mov 12*8(%%rax), %%rcx\n\t"  "mov 13*8(%%rax), %%rbx\n\t"  "mov 14*8(%%rax), %%rax\n\t"
+        "iretq\n\t"
+        ".global conc_return\n\t conc_return:\n\t"   /* scheduler IRETQs here when procs park/exit */
+        "pop %%r15\n\t pop %%r14\n\t pop %%r13\n\t pop %%r12\n\t pop %%rbp\n\t pop %%rbx\n\t"
+        "ret\n\t" ::: "memory");
+}
+extern char conc_return[];
+
+/* C2 - DEMATERIALIZE a process's SCHEDULABLE STATE to a content hash and RELEASE its
+ * resident state; REMATERIALIZE (verified) on reselect. HONEST SCOPE (the wider-task-
+ * state-object OPEN item): we dematerialize the schedulable REGISTER/STACK state - the
+ * c_tf_t (all GPRs + the iretq frame: rip/rsp/rflags/cs/ss) PLUS the private writable
+ * DATA page (which carries the process's counter). On dematerialize we ALSO release the
+ * stack + data resident frames (their content is in the hash). The page-table ROOT
+ * (cr3) and the mappings are NOT dematerialized - they stay resident and are reused on
+ * rematerialize. So "state not resident" = the register/stack/data CONTENT is gone (in
+ * the store), but the address-space SKELETON (cr3 + PTEs) persists. Dematerializing the
+ * full page-table state too is the named OPEN item. */
+static uint8_t  conc_arena[1u<<16]; static cvsasx_store_entry_t conc_idx[64]; static cvsasx_store_t conc_store; static int conc_store_ready=0;
+static uint8_t  conc_demat_buf[sizeof(c_tf_t)+4096];
+static int      conc_demat_len_was=0;
+static void conc_store_once(void){ if(!conc_store_ready){ cvsasx_store_init(&conc_store,conc_arena,sizeof conc_arena,conc_idx,64); conc_store_ready=1; } }
+static cvsasx_hash_t conc_dematerialize(cproc_t *p){
+    conc_store_once();
+    /* serialize: [c_tf_t][4096B data-page image]. The data page holds the counter. */
+    uint8_t *b=conc_demat_buf; uint64_t off=0;
+    for(unsigned i=0;i<sizeof(c_tf_t);i++) b[off++]=((uint8_t*)&p->tf)[i];
+    const uint8_t *dp=(const uint8_t*)P2V(p->data_frame);
+    for(int i=0;i<4096;i++) b[off++]=dp[i];
+    conc_demat_len_was=(int)off;
+    cvsasx_hash_t h; cvsasx_store_put(&conc_store,b,off,&h);
+    for(int i=0;i<32;i++) p->remat_root[i]=h.b[i];
+    /* RELEASE the resident schedulable content: unmap + free the stack and data frames. */
+    mm_unmap(p->cr3, CONC_STK_VA); mm_unmap(p->cr3, CONC_DATA_VA);
+    frame_release_physical(p->stack_frame); frame_release_physical(p->data_frame);
+    p->stack_frame=p->data_frame=0;
+    p->present=0; p->dematerialized=1;
+    return h;
+}
+static int conc_rematerialize(cproc_t *p){
+    conc_store_once();
+    cvsasx_hash_t h; for(int i=0;i<32;i++) h.b[i]=p->remat_root[i];
+    const void *b; size_t l;
+    if(cvsasx_store_get(&conc_store,&h,&b,&l)!=CVSASX_STORE_OK) return 0;      /* MISS = fail-closed */
+    cvsasx_hash_t chk; cvsasx_blake3(b,l,&chk);
+    if(!cvsasx_hash_eq(&chk,&h)) return 0;                                     /* verify (integrity by construction) */
+    if(l!=sizeof(c_tf_t)+4096) return 0;
+    const uint8_t *p8=(const uint8_t*)b; uint64_t off=0;
+    for(unsigned i=0;i<sizeof(c_tf_t);i++) ((uint8_t*)&p->tf)[i]=p8[off++];     /* restore registers + iretq frame */
+    /* re-acquire fresh frames for stack + data, write the data image back, re-map. */
+    p->stack_frame=frame_reserve(); p->data_frame=frame_reserve();
+    if(!p->stack_frame||!p->data_frame) return 0;
+    uint8_t *dp=(uint8_t*)P2V(p->data_frame);
+    for(int i=0;i<4096;i++) dp[i]=p8[off++];
+    mm_map(p->cr3, CONC_STK_VA,  p->stack_frame, MM_USER|MM_WRITE);
+    mm_map(p->cr3, CONC_DATA_VA, p->data_frame,  MM_USER|MM_WRITE);
+    p->present=1; p->dematerialized=0;
+    return 1;
+}
+
+/* build one concurrent ring-3 process: fresh space (mm_new_space), shared code page
+ * by hash (share-by-hash, proves own-page-tables + sharing), private data + stack
+ * pages, the initial ring-3 trapframe, and its OWN C1 ceiling over a disjoint object
+ * range. n_target = how many SYS_WRITEs before it exits. */
+static cvsasx_hash_t conc_code_hash; static int conc_code_stored=0;
+static int conc_make_proc(cproc_t *p, int id, uint8_t tag, uint64_t target, uint64_t ceil_off, uint64_t ceil_len){
+    p->id=id; p->tag=tag; p->live=1; p->present=1; p->dematerialized=0;
+    p->cr3=mm_new_space(); if(!p->cr3) return 0;
+    /* shared code page by hash: store the blob once, materialize-by-hash into every space. */
+    uint64_t bloblen=(uint64_t)(conc_blob_end-conc_blob);
+    if(!conc_code_stored){ rm_store_once(); cvsasx_store_put(&rm_store, conc_blob, bloblen, &conc_code_hash); conc_code_stored=1; }
+    p->code_frame=rm_materialize(&conc_code_hash);            /* SHARED frame across procs (refcount++) */
+    if(!p->code_frame) return 0;
+    mm_map(p->cr3, CONC_CODE_VA, p->code_frame, MM_USER);     /* code: U/S, read-only (W^X) */
+    /* private data page: [tag][pad][counter=0][n_done=0][n_target] */
+    p->data_frame=frame_reserve(); p->stack_frame=frame_reserve();
+    if(!p->data_frame||!p->stack_frame) return 0;
+    uint8_t *dp=(uint8_t*)P2V(p->data_frame); for(int i=0;i<4096;i++) dp[i]=0;
+    dp[0]=tag; *(uint64_t*)(dp+8)=0; *(uint64_t*)(dp+16)=0; *(uint64_t*)(dp+24)=target;
+    mm_map(p->cr3, CONC_DATA_VA, p->data_frame, MM_USER|MM_WRITE);
+    mm_map(p->cr3, CONC_STK_VA,  p->stack_frame, MM_USER|MM_WRITE);
+    /* initial ring-3 trapframe: enter at the blob, user stack top, IF=1 (preemptible). */
+    for(unsigned i=0;i<sizeof p->tf;i++) ((uint8_t*)&p->tf)[i]=0;
+    p->tf.rip=CONC_CODE_VA; p->tf.cs=SEL_UCODE; p->tf.ss=SEL_UDATA;
+    p->tf.rsp=CONC_STK_VA + 4096 - 16; p->tf.rflags=0x202;     /* IF=1 */
+    /* C1: this process's OWN ceiling over a DISJOINT sub-range of conc_obj, treated
+     * as its own object: region length = ceil_len, base = conc_obj+ceil_off, and the
+     * region hash = BLAKE3 of THIS process's slice (distinct per process -> no two
+     * processes can present each other's referent). */
+    p->ceil_off=ceil_off; p->ceil_len=ceil_len;
+    { cvsasx_hash_t h; cvsasx_blake3(conc_obj+ceil_off, ceil_len, &h); for(int i=0;i<(int)CVSASX_BLAKE3_LEN;i++) p->ceilH[i]=h.b[i]; }
+    cvsasx_swcap_t root={ (uint64_t)(uintptr_t)conc_obj+ceil_off, ceil_len,
+                          CVSASX_PERM_LOAD|CVSASX_PERM_GLOBAL, 1 };
+    cvsasx_sw_custodian_init(&p->cust, root);
+    p->region.object_cap=root; p->region.object_base_addr=(uint64_t)(uintptr_t)conc_obj+ceil_off;
+    p->region.object_length=ceil_len;
+    for(int i=0;i<(int)CVSASX_BLAKE3_LEN;i++) p->region.hash[i]=p->ceilH[i];
+    return 1;
+}
+
+/* conc_run launches the loaded processes concurrently. The ring-0 frame it must
+ * return to when all exit is captured at conc_return (the C scheduler IRETQs to it). */
+extern char conc_return[];
+static volatile int g_conc_done=0;
+static void conc_run(void){
+    sputs("\n=== CONCURRENT MULTI-PROCESS SCHEDULING (C0-C3): two ring-3 processes, timer-preempted ===\n");
+    __asm__ volatile("mov %%cr3,%0":"=r"(conc_kcr3)); conc_kcr3&=~0xfffULL;
+    for(int i=0;i<256;i++) conc_obj[i]=(uint8_t)(i+1);
+
+    /* ---- C0: two ring-3 processes in the scheduler, each its own page tables. ---- */
+    g_ncp=0; g_ccur=-1; g_clive=0; g_cswitches=0; g_csyscalls=0; g_conc_done=0;
+    int okA=conc_make_proc(&g_cp[0], 0, 'A', 6, 0,   128);   /* A: ceiling = conc_obj[0..128)  */
+    int okB=conc_make_proc(&g_cp[1], 1, 'B', 6, 128, 128);   /* B: ceiling = conc_obj[128..256) */
+    if(!okA||!okB){ sputs("C0 NOT RUN: could not build two processes (frames/space)\n"); return; }
+    g_ncp=2; g_clive=2;
+    sputs("C0 built 2 ring-3 procs: A cr3="); sx64(g_cp[0].cr3); sputs(" B cr3="); sx64(g_cp[1].cr3);
+    sputs(" (distinct address spaces="); sputs(g_cp[0].cr3!=g_cp[1].cr3?"y":"n"); sputs(")\n");
+    sputs("C0 shared code frame#"); sdec(fr_idx(g_cp[0].code_frame)); sputs(" / #"); sdec(fr_idx(g_cp[1].code_frame));
+    sputs(" (share-by-hash="); sputs(g_cp[0].code_frame==g_cp[1].code_frame?"y":"n"); sputs("), private data A#");
+    sdec(fr_idx(g_cp[0].data_frame)); sputs(" B#"); sdec(fr_idx(g_cp[1].data_frame)); sputc('\n');
+    sputs("C0 interleaved ring-3 output (each tag = one SYS_WRITE; preempted mid-spin by the 100Hz timer):\n   ");
+
+    /* install the concurrent timer + syscall traps (saved/restored around the demo). */
+    idt_set(0x20,(void*)conc_trap,SEL_KCODE);
+    idt_set(0x80,(void*)conc_sysent,SEL_KCODE); idt[0x80].type=0xEE;   /* DPL=3: ring 3 may int 0x80 */
+    { struct idtr idtr={(uint16_t)(sizeof(idt)-1),(uint64_t)idt}; __asm__ volatile("lidt %0"::"m"(idtr):"memory"); }
+    g_conc_active=1;
+
+    /* launch process A; the scheduler round-robins to B on each timer tick, and back.
+     * Save kmain's ring-0 return frame: the C scheduler IRETQs here (conc_return) when
+     * all procs have exited. We enter A by IRETQ-to-CPL3 into its initial trapframe. */
+    g_ccur=0;
+    conc_enter(&g_cp[0].tf, g_cp[0].cr3);   /* launch A; scheduler round-robins to B and back; returns here when both exit */
+
+    /* back in kmain (kernel CR3 restored by conc_sched before the IRETQ to conc_return). */
+    g_conc_active=0;
+    /* restore the original timer + syscall handlers so the rest of the boot is unchanged. */
+    idt_set(0x20,(void*)isr_timer,SEL_KCODE);
+    idt_set(0x80,(void*)isr_syscall,SEL_KCODE); idt[0x80].type=0xEE;
+    { struct idtr idtr={(uint16_t)(sizeof(idt)-1),(uint64_t)idt}; __asm__ volatile("lidt %0"::"m"(idtr):"memory"); }
+
+    uint64_t ca=*(uint64_t*)(P2V(g_cp[0].data_frame)+8), cb=*(uint64_t*)(P2V(g_cp[1].data_frame)+8);
+    sputs("\nC0 both procs exited: A counter="); sdec(ca); sputs(" B counter="); sdec(cb);
+    sputs(" timer-switches="); sdec(g_cswitches); sputs(" syscalls="); sdec(g_csyscalls); sputc('\n');
+    int c0=(ca==6)&&(cb==6)&&(g_cswitches>=2)&&(g_cp[0].live==0)&&(g_cp[1].live==0);
+    sputs(c0 ? "C0 -> TWO RING-3 PROCESSES RAN CONCURRENTLY, TIMER-INTERLEAVED, EACH SURVIVED PREEMPTION OK\n"
+             : "C0 -> *** FAIL (see stall report) ***\n");
+
+    /* ---- C1: per-process authority under concurrency (the proven anti-amp gate). ---- */
+    sputs("\n=== C1: per-process authority - each process bounded by its OWN re-minted ceiling ===\n");
+    cproc_t *A=&g_cp[0], *B=&g_cp[1];
+    cvsasx_swcap_t c; cvsasx_status_t s; cvsasx_pir_t pir;
+    /* PIR offsets are RELATIVE to each process's own region (object_length=ceil_len). */
+    /* A's in-ceiling: 64B sub-range of A's OWN object, naming A's referent -> ACCEPT. */
+    conc_make_pir(&pir, A->ceilH, 0, 64, CVSASX_PERM_LOAD); s=conc_remint(A,&pir,&c);
+    int a_in=(s==CVSASX_OK)&&c.valid&&c.length==64;
+    sputs("   A in-ceiling (load-only, 64B of A's range) status="); sdec((uint64_t)s); sputs(" len="); sdec(c.length);
+    sputs(a_in?" -> ACCEPT\n":" *** A legit rejected ***\n");
+    /* B's in-ceiling: ACCEPT concurrently against B's OWN region/referent. */
+    conc_make_pir(&pir, B->ceilH, 0, 64, CVSASX_PERM_LOAD); s=conc_remint(B,&pir,&c);
+    int b_in=(s==CVSASX_OK)&&c.valid&&c.length==64;
+    sputs("   B in-ceiling (load-only, 64B of B's range) status="); sdec((uint64_t)s); sputs(" len="); sdec(c.length);
+    sputs(b_in?" -> ACCEPT\n":" *** B legit rejected ***\n");
+    /* A over-ceiling: wider bounds than A's region -> REFUSED, BAD_BOUNDS (distinct). */
+    conc_make_pir(&pir, A->ceilH, 0, A->ceil_len+1, CVSASX_PERM_LOAD); s=conc_remint(A,&pir,&c);
+    int a_over=(s==CVSASX_ERR_BAD_BOUNDS)&&!c.valid;
+    sputs("   A over-ceiling (len="); sdec(A->ceil_len+1); sputs(">ceiling) status="); sdec((uint64_t)s);
+    sputs(a_over?" (DISTINCT: BAD_BOUNDS) REFUSED\n":" *** WRONG-REASON/AMPLIFIED ***\n");
+    /* B over-ceiling via a perm never granted -> REFUSED, AMPLIFY_PERMS (distinct). */
+    conc_make_pir(&pir, B->ceilH, 0, 64, CVSASX_PERM_LOAD); pir.perms|=CVSASX_PERM_STORE_CAP; s=conc_remint(B,&pir,&c);
+    int b_amp=(s==CVSASX_ERR_AMPLIFY_PERMS)&&!c.valid;
+    sputs("   B over-ceiling (+STORE_CAP claim)    status="); sdec((uint64_t)s);
+    sputs(b_amp?" (DISTINCT: AMPLIFY_PERMS) REFUSED\n":" *** WRONG-REASON/AMPLIFIED ***\n");
+    /* CROSS-PROCESS LEAK: A presents B's REFERENT (B's object hash) against A's own
+     * custodian/region. The gate binds cap->referent to A's region hash; B's referent
+     * mismatches -> REFUSED (REFERENT_MISMATCH). A cannot reach into B's authority. */
+    conc_make_pir(&pir, B->ceilH, 0, 64, CVSASX_PERM_LOAD); s=conc_remint(A,&pir,&c);
+    int no_leak=(s!=CVSASX_OK)&&!c.valid;
+    sputs("   CROSS-PROCESS: A presents B's referent against A's ceiling status="); sdec((uint64_t)s);
+    sputs(no_leak?" -> REFUSED (no cross-process authority leak)\n":" *** A REACHED B'S AUTHORITY ***\n");
+    int c1=a_in&&b_in&&a_over&&b_amp&&no_leak;
+    sputs(c1 ? "C1 -> PER-PROCESS CEILINGS BOUND EACH UNDER CONCURRENCY; over-ceiling refused DISTINCT; no leak OK\n"
+             : "C1 -> *** FAIL ***\n");
+
+    /* ---- C2: deschedule -> dematerialize -> rematerialize (one full cycle). ----
+     * Take a FRESH process, run it part-way (so it carries a non-trivial counter),
+     * deschedule it, dematerialize its schedulable state to a hash (releasing its
+     * resident stack+data frames), then rematerialize from ONLY the hash and resume
+     * it to completion - its counter survives the round trip. */
+    sputs("\n=== C2: deschedule -> dematerialize-to-hash -> rematerialize-from-hash -> resume ===\n");
+    g_ncp=0; g_ccur=-1; g_clive=0; g_cswitches=0; g_csyscalls=0;
+    int okC=conc_make_proc(&g_cp[0], 0, 'C', 8, 0, 128);     /* one process, 8 writes total */
+    if(!okC){ sputs("C2 NOT RUN: could not build process\n"); return; }
+    g_ncp=1; g_clive=1;
+    /* run it cooperatively for a FEW iterations by single-stepping the scheduler in ring 3:
+     * we enter ring 3, let the timer preempt it a few times (it keeps running, no partner),
+     * then we forcibly deschedule it after it has made progress. Easiest: run it until its
+     * counter passes a threshold, by polling its data page between short ring-3 bursts. */
+    cproc_t *C=&g_cp[0];
+    idt_set(0x20,(void*)conc_trap,SEL_KCODE);
+    idt_set(0x80,(void*)conc_sysent,SEL_KCODE); idt[0x80].type=0xEE;
+    { struct idtr idtr={(uint16_t)(sizeof(idt)-1),(uint64_t)idt}; __asm__ volatile("lidt %0"::"m"(idtr):"memory"); }
+    g_conc_active=1; g_c2_park_at=3;   /* the scheduler parks C back to kmain once its counter reaches 3 */
+    g_ccur=0;
+    conc_enter(&C->tf, C->cr3);         /* run C until it parks (counter reaches 3) -> returns here */
+    g_conc_active=0; g_c2_park_at=0;
+    /* C is now DESCHEDULED (parked back to kmain by the scheduler; its full context is in C->tf). */
+    uint64_t counter_before=*(uint64_t*)(P2V(C->data_frame)+8);
+    sputs("C2 process descheduled at counter="); sdec(counter_before); sputs(" (state still resident)\n");
+
+    /* DEMATERIALIZE: schedulable state -> content hash H; resident stack+data frames RELEASED. */
+    uint64_t df_was=fr_idx(C->data_frame), sf_was=fr_idx(C->stack_frame);
+    cvsasx_hash_t H=conc_dematerialize(C);
+    int data_unmapped=(mm_resolve(C->cr3, CONC_DATA_VA)==0), stk_unmapped=(mm_resolve(C->cr3, CONC_STK_VA)==0);
+    sputs("C2 DEMATERIALIZED to hash H="); sputs(hx(H.b,32)); sputc('\n');
+    sputs("C2 released resident state: data frame#"); sdec(df_was); sputs(" + stack frame#"); sdec(sf_was);
+    sputs(" freed; data-VA-resolves="); sputs(data_unmapped?"NO":"YES"); sputs(" stack-VA-resolves="); sputs(stk_unmapped?"NO":"YES");
+    sputs((data_unmapped&&stk_unmapped)?" -> STATE NOT RESIDENT (content is in the store) OK\n":" *** still resident ***\n");
+
+    /* REMATERIALIZE from ONLY H (verified), then RESUME to completion. */
+    int remat_ok=conc_rematerialize(C);
+    uint64_t counter_after_remat=remat_ok?*(uint64_t*)(P2V(C->data_frame)+8):0;
+    sputs("C2 REMATERIALIZED from H (BLAKE3-verified="); sputs(remat_ok?"y":"n");
+    sputs("): restored counter="); sdec(counter_after_remat);
+    sputs(counter_after_remat==counter_before?" (SURVIVED the round trip)\n":" *** counter lost ***\n");
+    /* resume C from the rematerialized context; it runs to its n_target=8 and exits. */
+    g_ncp=1; g_clive=1; C->live=1; C->present=1;
+    idt_set(0x20,(void*)conc_trap,SEL_KCODE);
+    idt_set(0x80,(void*)conc_sysent,SEL_KCODE); idt[0x80].type=0xEE;
+    { struct idtr idtr={(uint16_t)(sizeof(idt)-1),(uint64_t)idt}; __asm__ volatile("lidt %0"::"m"(idtr):"memory"); }
+    g_conc_active=1; g_c2_park_at=0; g_ccur=0;
+    sputs("C2 resumed ring-3 output (from the rematerialized context): ");
+    conc_enter(&C->tf, C->cr3);          /* resume from the FULL rematerialized context (all GPRs incl. r15) */
+    g_conc_active=0;
+    idt_set(0x20,(void*)isr_timer,SEL_KCODE);
+    idt_set(0x80,(void*)isr_syscall,SEL_KCODE); idt[0x80].type=0xEE;
+    { struct idtr idtr={(uint16_t)(sizeof(idt)-1),(uint64_t)idt}; __asm__ volatile("lidt %0"::"m"(idtr):"memory"); }
+    uint64_t counter_final=*(uint64_t*)(P2V(C->data_frame)+8);
+    sputs("\nC2 resumed to completion: final counter="); sdec(counter_final); sputs(" (target 8), exited="); sputs(C->live?"n":"y"); sputc('\n');
+    int c2=remat_ok&&(counter_after_remat==counter_before)&&(counter_before>=3)&&(counter_final==8)&&(C->live==0)&&data_unmapped&&stk_unmapped;
+    sputs(c2 ? "C2 -> DESCHEDULE->DEMATERIALIZE->REMATERIALIZE->RESUME, COUNTER SURVIVED OK\n"
+             : "C2 -> *** FAIL (see stall report) ***\n");
+    sputs("C2 HONEST SCOPE: dematerialized = the c_tf_t (all GPRs + iretq frame rip/rsp/rflags/cs/ss) + the\n");
+    sputs("   private DATA page (carrying the counter); resident stack+data frames RELEASED to the store.\n");
+    sputs("   NOT dematerialized: the page-table ROOT (cr3) + its PTEs - they stay resident and are reused.\n");
+    sputs("   Dematerializing the full page-table state too is the named OPEN item (wider task-state object).\n");
+
+    /* ---- C3: the policy hook + the named cost question (MEASURED via rdtsc). ---- */
+    sputs("\n=== C3: policy hook (round-robin) + MEASURED resume-resident vs resume-from-hash ===\n");
+    /* resume-RESIDENT cost: a full context restore = copy the c_tf_t + CR3 load (a switch). */
+    uint64_t t0=rdtsc();
+    { c_tf_t scratch; for(int r=0;r<256;r++){ scratch=C->tf; __asm__ volatile("mov %0,%%cr3"::"r"(C->cr3):"memory"); (void)scratch; } }
+    __asm__ volatile("mov %0,%%cr3"::"r"(conc_kcr3):"memory");
+    uint64_t resident_cyc=(rdtsc()-t0)/256;
+    /* resume-FROM-HASH cost: rematerialize (store_get + BLAKE3 verify + write-back + re-map). */
+    cvsasx_hash_t H2=conc_dematerialize(C);   /* re-dematerialize so we can time a real rematerialize */
+    uint64_t t1=rdtsc();
+    int rr=conc_rematerialize(C);
+    uint64_t fromhash_cyc=rdtsc()-t1;
+    (void)H2;(void)rr;
+    sputs("C3 resume-RESIDENT (context restore + CR3 load) = "); sdec(resident_cyc); sputs(" cycles\n");
+    sputs("C3 resume-FROM-HASH (store_get + BLAKE3 verify + writeback + remap) = "); sdec(fromhash_cyc); sputs(" cycles\n");
+    sputs("C3 ratio from-hash/resident ~ "); sdec(resident_cyc?fromhash_cyc/(resident_cyc?resident_cyc:1):0); sputs("x (rdtsc under TCG is noisy run-to-run = real)\n");
+    sputs("C3 pick_next() stays the ISOLATED round-robin policy. A rematerialization-AWARE policy\n");
+    sputs("   (dematerialize ONLY when the expected deschedule duration amortizes this measured cost)\n");
+    sputs("   is the NAMED next seam, NOT implemented here (SCHED_LOG.md). Numbers COMPUTED via rdtsc.\n");
+
+    sputs("\nCONCURRENT SCHEDULING: C0-C3 run; local mechanism only; pick_next round-robin is the hook (SCHED_LOG.md).\n");
 }
 
 void kmain(void);
@@ -2911,6 +3384,7 @@ void kmain(void){
     run_fault();       /* REMATERIALIZING FAULT HANDLER: F0 #PF+safety, F1 fault-in via A, F2 fail-closed on verify, F3 dedup-at-fault, F4 binding B + measured A-vs-B, F5 re-entrancy probe */
     run_userspace();   /* USERSPACE + USER/KERNEL BOUNDARY: US0 ring-3 + protection refuse, US1 syscall round trip, US2 re-mint-at-crossing, US3 adversarial table, US4 hash-passing+TOCTOU */
     run_loader();      /* PROCESS LOADER: L0 ELF as a stored object + parse, L1 materialize segments by hash (W^X), L2 enter+run the loaded ELF, L3 load-time authority ceiling, L4 two procs share code by hash */
+    conc_run();        /* CONCURRENT MULTI-PROCESS SCHEDULING: C0 two ring-3 procs timer-preempted, C1 per-process ceilings, C2 deschedule->dematerialize->rematerialize, C3 measured policy-cost */
     run_shell();       /* E4: live focus/drag/resize/type desktop (does not return) */
 #endif
     hcf();

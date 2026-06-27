@@ -61,6 +61,7 @@ state and re-mints capabilities during the migration.
 | Rematerializing fault handler. A not-present access traps through the page-fault vector and is serviced by a BLAKE3-verified materialize-by-hash that gates resume. Content that fails verification is refused at the fault boundary, and identical content is shared on the fault path. | Observed by serial trace in an emulator. | kernel fault-handler self-test |
 | Authority-bounded user and kernel crossing. A ring-3 process enters the kernel through a re-mint of its bounded capability under the same anti-amplification gate that bounds migration and faults. Six userspace amplification attempts are each refused by their own distinct reason, the same status codes the migration table uses. | Observed by serial trace in an emulator. | kernel userspace self-test |
 | Content-addressed process loader. A program image is an object in the store. Loading a process materializes its ELF segments by hash with BLAKE3 verification into a fresh ring-3 space under a re-minted ceiling, enforces W^X, and two processes from one image share read-only code by hash. | Observed by serial trace in an emulator. | kernel loader self-test |
+| Concurrent content-addressed processes. Two ring-3 processes run interleaved on the timer, each in its own address space under its own re-minted ceiling. A descheduled process is dematerialized to a hash and rematerialized to resume, its counter surviving the round trip. | Observed and measured in an emulator. | kernel concurrency self-test |
 
 The two-machine byte counts and the proof results are reproducible. See docs/REPRODUCE.md.
 
@@ -73,8 +74,9 @@ in full in docs/ROADMAP.md.
   machine from a USB stick, but that has not been verified on physical hardware.
 - USB input. Input is PS/2, which the emulator provides. Modern hardware needs a USB HID stack.
 - Persistent storage and a filesystem. The store is in RAM. A process model, a ring-3 userspace, a
-  re-minting syscall boundary, and a content-addressed process loader exist, but per-process memory
-  management, dynamic linking, and more than one concurrent userspace task do not. See
+  re-minting syscall boundary, a content-addressed process loader, and concurrent scheduling of two
+  ring-3 processes exist, but per-process memory management, dynamic linking, and a
+  rematerialization-aware scheduling policy do not. See
   docs/ROADMAP.md.
 - GPU acceleration. The desktop is software-rendered. It draws CARMIX's own windows. It does not
   run third-party graphical applications, which would require the vendor GPU driver stack.

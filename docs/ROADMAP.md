@@ -11,15 +11,17 @@ hidden.
 - USB input. Input is PS/2, which the emulator provides. Real modern hardware needs a USB HID
   stack over xHCI.
 - Persistent storage. There is no storage driver. NVMe or AHCI is needed.
-- Concurrent multi-process scheduling and process memory management. A ring-3 process, per-task page
-  tables with memory isolation, a re-minting syscall boundary, and a content-addressed process loader
-  all exist. The loader stores an ELF image in the content-addressed store, parses it, materializes
-  each segment by hash with BLAKE3 verification into a fresh ring-3 space under a re-minted authority
-  ceiling with W^X, and two processes from one image share read-only code by hash. See
-  docs/ARCHITECTURE.md. What does not exist is more than one concurrent ring-3 task in the scheduler
-  (two processes are loaded and share at load time but run sequentially), a brk or mmap equivalent
-  for a process heap, dynamic linking (static ELF only), a persistent crash-surviving replay-nonce
-  for the crossing, and binding the carried capability to a trustworthy source through signing.
+- A rematerialization-aware scheduling policy and a fully content-addressed process. Concurrent
+  ring-3 scheduling exists. Two ring-3 processes run interleaved on the timer, each in its own
+  address space under its own re-minted ceiling, and a descheduled process can be dematerialized to a
+  hash (its register context and private data released to the store) then rematerialized to resume,
+  with its counter surviving the round trip. See docs/ARCHITECTURE.md. What does not exist is a policy
+  that decides when to dematerialize from the measured cost (resume-from-hash is about fifty times a
+  resident switch, so the mechanism exists but pick_next stays round-robin), dematerializing the
+  page-table root as well (today the register and data state dematerialize and the page tables stay
+  resident, the wider task-state object is open), a brk or mmap process heap, dynamic linking, more
+  than two concurrent processes under real load, blocking and waking on input and output, and binding
+  the carried capability to a trustworthy source through signing.
 - A complete content-addressed task object. The task state object today is the registers and the
   stack only. The page table and the capability slots are not yet part of it. A residency manager now
   gives tasks per-task page mappings, and dirty tracking is measured both ways, the x86-64 page-table
