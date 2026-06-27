@@ -60,7 +60,7 @@ EOF
 "$LIM/limine" bios-install "$OUT/carmix.iso" 2>&1 | tail -1
 cp "$OUT/carmix.iso" "$HERE/carmix.iso"   # real-hardware-bootable (USB) + qemu
 
-echo "=== headless boot (serial, 25s cap) ==="
-timeout 25 "$X/usr/bin/qemu-system-x86_64" -M q35 -m 512M -cdrom "$OUT/carmix.iso" \
+echo "=== headless boot (serial, 40s cap) ==="
+timeout 40 "$X/usr/bin/qemu-system-x86_64" -M q35 -m 512M -cdrom "$OUT/carmix.iso" \
     -serial stdio -display none -no-reboot -L "$X/usr/share/seabios" -L "$X/usr/share/qemu" 2>&1 || true
 rm -rf "$OUT"

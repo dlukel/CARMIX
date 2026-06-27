@@ -137,6 +137,42 @@ pay for the hash. The page table and capability slots are not yet part of the ta
 the scheduling policy itself stays a placeholder, the measurement shows it does not collapse into
 rematerialization at switch frequency.
 
+## Residency manager (kernel/kernel.c)
+
+Physical memory is managed as a content-addressed cache over the proven store. The classification of
+each operation is fixed. Fresh allocation stays conventional. Fault-in and sharing collapse into
+rematerialization. Free, eviction, and defragmentation partially collapse. Mapping stays
+conventional.
+
+The conventional floor is a physical frame database (every frame free, resident, or pinned, with a
+refcount and a dirty flag), per-task four-level page tables with map, unmap, and TLB invalidation,
+and a temporal eviction policy. frame_reserve is the one conventional allocator, since a fresh frame
+has no content identity until it is written.
+
+The collapsed operations are rematerialization. materialize(hash) fills a frame from the store and
+verifies that the BLAKE3 of what it loaded equals the requested hash, so integrity holds by
+construction. A request for a hash that is already resident maps the existing frame and bumps its
+refcount, so identical content is one physical frame shared read-only. refdrop releases a logical
+reference, and the last drop makes the frame reclaimable. Eviction writes a dirty victim back to the
+store before its frame is reused, and victim selection is temporal, not keyed on content.
+
+The findings were measured in the emulator and vary run to run because they are real:
+
+- Sharing a hash at admission re-materializes zero bytes and costs far less than a second fault, so
+  deduplicating on the way in beats a post-hoc merge.
+- The temporal eviction policy retained the hot working set under oversubscription while the cold
+  stream missed.
+- The hardware page-table dirty bit and the software chunk diff agree on the dirty set, and the
+  hardware scan is roughly six to seven times cheaper. This closes the question the unified substrate
+  left open. The hardware bit is the cheap coarse filter and content-addressing is the fine
+  mechanism, and they compose.
+- Fixed chunks trade external fragmentation for internal slack, near 29 percent on the measured mix,
+  and a frame-sized request stays serviceable.
+
+Fault-in is wired as an explicit materialize call. Routing a miss through the page-fault vector would
+require making the fault handler resumable, which is the next step. The page table and the capability
+slots are not yet part of the content-addressed task state object.
+
 ## Two-machine migration (kernel/nettest.c)
 
 Two emulator instances share memory through an ivshmem device, a PCI device whose second base

@@ -18,10 +18,13 @@ hidden.
   not exist is memory isolation between tasks, a user and kernel privilege split, a syscall
   boundary, and a real memory manager. The tasks share the kernel address space.
 - A complete content-addressed task object. The task state object today is the registers and the
-  stack only. The page table and the capability slots are not yet part of it. Dirty tracking uses a
-  software chunk diff, because the stacks are direct-mapped rather than per-task mapped, so the
-  x86-64 page-table dirty bit is not used. A hardware dirty-bit assist and the wider state object
-  are future work.
+  stack only. The page table and the capability slots are not yet part of it. A residency manager now
+  gives tasks per-task page mappings, and dirty tracking is measured both ways, the x86-64 page-table
+  dirty bit and the software chunk diff agree on the dirty set and the hardware scan is six to seven
+  times cheaper. See docs/ARCHITECTURE.md. The wider state object remains future work.
+- Page-fault-driven fault-in. The residency manager materializes a frame from a hash on an explicit
+  call. Routing a miss through the page-fault vector needs the fault handler made resumable, which is
+  the next step, so demand paging is not yet automatic on a stray access.
 - A scheduling policy that uses content-addressing per switch. The measured crossover shows
   activate-by-hash costs two to three orders of magnitude more than a register switch at every
   dirty-set size, so it is used only at coarse boundaries. A policy that schedules over content

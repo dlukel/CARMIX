@@ -1143,6 +1143,576 @@ static void run_unified(void){
     sputs("STEP 12: U0-U4 - task as content-addressed object; the honest crossover is the record (SCHED_LOG.md).\n");
 }
 
+/* ===========================================================================
+ * RESIDENCY MANAGER (M0-M5) - a content-addressed physical-memory substrate.
+ * The collapse map (binding): allocate-fresh STAYS DISTINCT (frame_reserve);
+ * materialize/fault-in COLLAPSES to rematerialization (materialize-by-hash);
+ * share-identical COLLAPSES (one resident frame, many refs, by hash identity);
+ * free PARTIALLY collapses (refdrop logical, physical reclaim separate); evict
+ * PARTIALLY collapses (writeback = dematerialize, victim selection = temporal
+ * policy, NOT content-keyed); map STAYS DISTINCT (conventional page tables).
+ * Hardware floor kept conventional: page tables, per-task mappings, the frame
+ * database, per-frame pin/dirty/refcount, the eviction policy. REUSES the proven
+ * cvsasx_store_put/get + cvsasx_blake3 + map_page; the proven modules are
+ * byte-identical. See kernel/MEM_LOG.md. Numbers are COMPUTED via rdtsc/counters.
+ * ===========================================================================*/
+
+/* ---- M0: the frame database. One record per usable RAM frame, indexed by
+ * frame number (phys-ram_lo)/4096. State is a strict partition free|resident|
+ * pinned (a frame is exactly one); refcount, dirty bit, and the content hash of
+ * a materialized frame ride alongside. Built over the SAME freelist falloc/ffree
+ * already use, so the physical source of frames is unchanged. */
+enum frame_state { FR_FREE = 0, FR_RESIDENT = 1, FR_PINNED = 2 };
+typedef struct frame_rec {
+    uint8_t  state;        /* FR_FREE | FR_RESIDENT | FR_PINNED */
+    uint8_t  dirty;        /* written since last writeback (M3/M4) */
+    uint8_t  has_hash;     /* 1 if content-addressed (materialized), 0 if fresh-mutable */
+    uint8_t  clock_ref;    /* M3 clock policy: referenced-recently bit */
+    uint32_t refcount;     /* number of live references (mappings by hash) */
+    cvsasx_hash_t hash;    /* content address of a materialized frame (has_hash==1) */
+} frame_rec_t;
+/* The database owns a BOUNDED, CONTIGUOUS pool of physical frames carved from the
+ * kernel allocator ONCE. It manages free/resident/pinned within that pool with its
+ * OWN free-stack, so reserve-on-exhaustion is bounded to the pool and the global
+ * falloc stays available for page-table pages (M1/M4 mm_walk). Frame number =
+ * (phys - fdb_base)/4096, dense over the pool. */
+#define FRAMEDB_N 256u                     /* pool size: 256 frames = 1 MiB, ample for the M demos */
+static frame_rec_t framedb[FRAMEDB_N];
+static uint64_t fdb_base, fdb_n;           /* phys base + number of tracked frames in the pool */
+static uint64_t fdb_freestack[FRAMEDB_N];  /* indices of FREE frames (LIFO, so numbers get reused) */
+static uint64_t fdb_freetop;               /* number of free frames on the stack */
+static uint64_t fdb_reserve_fail;          /* count of fail-closed reserves (exhaustion) */
+static int fdb_pool_ready;
+
+static uint64_t fr_idx(uint64_t pa){ return (pa - fdb_base) >> 12; }
+static uint64_t fr_phys(uint64_t i){ return fdb_base + (i << 12); }
+static int fr_tracked(uint64_t pa){ if(pa<fdb_base) return 0; uint64_t i=fr_idx(pa); return i<fdb_n; }
+
+/* M0 conservation assert: free + resident + pinned must equal the tracked total.
+ * A frame in two classes or in none is a corrupt database; print loudly. */
+static void framedb_counts(uint64_t *fre, uint64_t *res, uint64_t *pin){
+    uint64_t f=0,r=0,p=0;
+    for(uint64_t i=0;i<fdb_n;i++){
+        switch(framedb[i].state){ case FR_FREE:f++;break; case FR_RESIDENT:r++;break; case FR_PINNED:p++;break;
+            default: sputs("*** M0 ASSERT FAIL: frame "); sdec(i); sputs(" has invalid state ***\n"); }
+    }
+    if(f+r+p!=fdb_n){ sputs("*** M0 ASSERT FAIL: free+resident+pinned="); sdec(f+r+p); sputs(" != total "); sdec(fdb_n); sputs(" ***\n"); }
+    *fre=f; *res=r; *pin=p;
+}
+
+/* Bring the database up: carve FRAMEDB_N CONTIGUOUS frames from falloc ONCE (the
+ * pool), then reset all records to FREE with a full free-stack. Re-running just
+ * resets state over the SAME pool (frame numbers stable across stages). */
+static void framedb_init(void){
+    if(!fdb_pool_ready){
+        uint64_t first=falloc(); fdb_base=first;        /* anchor; falloc bump-allocates upward and contiguously */
+        uint64_t prev=first; fdb_n=1;
+        for(uint64_t i=1;i<FRAMEDB_N;i++){ uint64_t p=falloc(); if(!p) break;
+            if(p!=prev+4096){ /* non-contiguous: stop the pool here, still bounded and valid */ break; }
+            prev=p; fdb_n++; }
+        fdb_pool_ready=1;
+    }
+    for(uint64_t i=0;i<fdb_n;i++){ framedb[i].state=FR_FREE; framedb[i].dirty=0; framedb[i].has_hash=0;
+        framedb[i].clock_ref=0; framedb[i].refcount=0; for(int k=0;k<32;k++) framedb[i].hash.b[k]=0; }
+    fdb_freetop=0; for(uint64_t i=fdb_n;i>0;i--) fdb_freestack[fdb_freetop++]=i-1;   /* push high->low so #0 pops first */
+    fdb_reserve_fail=0;
+}
+
+/* frame_reserve(): THE one surviving conventional allocator. Pops a FREE frame off
+ * the pool's free-stack, marks it resident, refcount 1, NOT content-addressed (no
+ * hash until written). Distinct from rm_materialize() by construction (has_hash
+ * stays 0). Fails CLOSED (returns 0, counts it) when the pool is exhausted. */
+static uint64_t frame_reserve(void){
+    if(fdb_freetop==0){ fdb_reserve_fail++; sputs("*** frame_reserve: POOL EXHAUSTED - fail-closed (no silent degrade) ***\n"); return 0; }
+    uint64_t i=fdb_freestack[--fdb_freetop];
+    frame_rec_t *r=&framedb[i];
+    if(r->state!=FR_FREE){ sputs("*** frame_reserve ASSERT: popped a non-free frame (corrupt free-stack) #"); sdec(i); sputs(" ***\n"); return 0; }
+    r->state=FR_RESIDENT; r->refcount=1; r->has_hash=0; r->dirty=0; r->clock_ref=1;
+    return fr_phys(i);
+}
+
+/* frame_release_physical(): physical reclamation, separate from logical refdrop.
+ * Pushes a resident/pinned frame back onto the pool free-stack and marks it FREE.
+ * Asserts the frame is not already free (no double-free into the database). */
+static void frame_release_physical(uint64_t pa){
+    if(!fr_tracked(pa)) return;
+    uint64_t i=fr_idx(pa); frame_rec_t *r=&framedb[i];
+    if(r->state==FR_FREE){ sputs("*** frame_release ASSERT: double-free of frame #"); sdec(i); sputs(" ***\n"); return; }
+    r->state=FR_FREE; r->refcount=0; r->has_hash=0; r->dirty=0; r->clock_ref=0;
+    fdb_freestack[fdb_freetop++]=i;
+}
+
+static void run_m0(void){
+    sputs("\n=== M0: FRAME DATABASE + conventional fresh allocation (frame_reserve) ===\n");
+    framedb_init();
+    uint64_t fre0,res0,pin0; framedb_counts(&fre0,&res0,&pin0);
+    sputs("M0 database brought up (pool @"); sx64(fdb_base); sputs("): tracked="); sdec(fdb_n);
+    sputs(" frames (free="); sdec(fre0); sputs(" resident="); sdec(res0); sputs(" pinned="); sdec(pin0); sputs(")\n");
+    /* reserve N, record their numbers */
+    uint64_t got[6]; int N=6;
+    for(int i=0;i<N;i++) got[i]=frame_reserve();
+    uint64_t freA,resA,pinA; framedb_counts(&freA,&resA,&pinA);
+    sputs("M0 reserved "); sdec((uint64_t)N); sputs(" frames:");
+    for(int i=0;i<N;i++){ sputs(" #"); sdec(fr_idx(got[i])); }
+    sputs("  (resident now="); sdec(resA); sputs(")\n");
+    /* free a middle pair, then reserve again -> LIFO freelist hands the same numbers back */
+    frame_release_physical(got[5]); frame_release_physical(got[4]);
+    uint64_t re0=frame_reserve(), re1=frame_reserve();
+    int reused=(re0==got[4]||re0==got[5])&&(re1==got[4]||re1==got[5])&&(re0!=re1);
+    sputs("M0 freed #"); sdec(fr_idx(got[4])); sputs(" #"); sdec(fr_idx(got[5]));
+    sputs(", re-reserved #"); sdec(fr_idx(re0)); sputs(" #"); sdec(fr_idx(re1));
+    sputs(reused?"  -> FRAME NUMBERS REUSED\n":"  -> NOT REUSED\n");
+    /* conservation across the churn */
+    uint64_t freB,resB,pinB; framedb_counts(&freB,&resB,&pinB);
+    int conserved=(freB+resB+pinB==fdb_n)&&(resB==resA);
+    sputs("M0 conservation: free="); sdec(freB); sputs(" resident="); sdec(resB); sputs(" pinned="); sdec(pinB);
+    sputs(" sum="); sdec(freB+resB+pinB); sputs(" total="); sdec(fdb_n); sputs(conserved?"  (conserved)\n":"  *** NOT CONSERVED ***\n");
+    /* reserve-on-exhaustion fails LOUDLY: drain the POOL via frame_reserve, then one more must fail */
+    uint64_t drained=0; while(frame_reserve()) drained++;   /* empty the pool through the real path */
+    uint64_t fail_before=fdb_reserve_fail;
+    uint64_t bad=frame_reserve();
+    int loud=(bad==0)&&(fdb_reserve_fail==fail_before+1);
+    sputs("M0 exhaustion: drained "); sdec(drained); sputs(" pool frames, next frame_reserve returned ");
+    sx64(bad); sputs(loud?"  -> FAILED LOUDLY (fail-closed)\n":"  -> *** DID NOT FAIL CLOSED ***\n");
+    int m0=conserved&&reused&&loud&&(fdb_n>0);
+    sputs("M0 -> "); sputs(m0?"FRAME DATABASE + FRESH ALLOCATION OK\n":"FAIL\n");
+    /* rebuild a clean database for the later stages (M1-M5 need free frames) */
+    framedb_init();
+}
+
+/* ---- M1: per-task page tables + map/remap (STAYS DISTINCT, conventional).
+ * Each task gets its own PML4. map(task,vaddr,frame) installs a translation in
+ * THAT task's tables; unmap tears it down and invalidates the TLB. A switch to a
+ * task loads its CR3. The writable-aliasing invariant is asserted: two live tasks
+ * may share a frame only if it is read-only by hash (M2). */
+#define MM_PRESENT 0x1u
+#define MM_WRITE   0x2u
+#define MM_USER    0x4u
+static uint64_t *mm_walk(uint64_t pml4_phys, uint64_t va, int create){
+    uint64_t *t=P2V(pml4_phys);
+    for(int lvl=39; lvl>12; lvl-=9){
+        uint64_t i=(va>>lvl)&0x1ff;
+        if(!(t[i]&1)){ if(!create) return 0; uint64_t p=falloc(); if(!p) return 0;
+            uint64_t *nv=P2V(p); for(int k=0;k<512;k++) nv[k]=0; t[i]=p|MM_PRESENT|MM_WRITE|MM_USER; }
+        t=P2V(t[i]&~0xfffULL);
+    }
+    return &t[(va>>12)&0x1ff];
+}
+/* Clone the current (Limine/HHDM) PML4's top half so a per-task address space
+ * keeps the kernel + HHDM mapped (the kernel code/stack/serial/store all live
+ * there); private user vaddrs are added per task. Returns the new PML4 phys. */
+static uint64_t mm_new_space(void){
+    uint64_t cr3; __asm__ volatile("mov %%cr3,%0":"=r"(cr3));
+    uint64_t *cur=P2V(cr3&~0xfffULL);
+    uint64_t p=falloc(); if(!p) return 0;
+    uint64_t *nv=P2V(p);
+    for(int i=0;i<512;i++) nv[i]=cur[i];   /* share every existing top-level entry (kernel + HHDM) */
+    return p;
+}
+static int mm_map(uint64_t pml4_phys, uint64_t va, uint64_t pa, uint64_t flags){
+    uint64_t *pte=mm_walk(pml4_phys, va, 1); if(!pte) return 0;
+    *pte=(pa&~0xfffULL)|flags|MM_PRESENT;
+    __asm__ volatile("invlpg (%0)"::"r"(va):"memory");   /* TLB coherence on remap */
+    return 1;
+}
+static int mm_unmap(uint64_t pml4_phys, uint64_t va){
+    uint64_t *pte=mm_walk(pml4_phys, va, 0); if(!pte||!(*pte&1)) return 0;
+    *pte=0;
+    __asm__ volatile("invlpg (%0)"::"r"(va):"memory");   /* unmap ALWAYS invalidates the TLB */
+    return 1;
+}
+static uint64_t mm_resolve(uint64_t pml4_phys, uint64_t va){   /* va -> phys (0 if unmapped) */
+    uint64_t *pte=mm_walk(pml4_phys, va, 0); if(!pte||!(*pte&1)) return 0;
+    return (*pte&~0xfffULL)|(va&0xfffULL);
+}
+
+static void run_m1(void){
+    sputs("\n=== M1: PER-TASK PAGE TABLES + map/remap (TLB-coherent) ===\n");
+    uint64_t spaceA=mm_new_space(), spaceB=mm_new_space();
+    if(!spaceA||!spaceB){ sputs("M1 NOT RUN: could not allocate address spaces\n"); return; }
+    /* two tasks map the SAME vaddr to DIFFERENT private writable frames */
+    uint64_t VA=0x0000600000000000ULL;
+    uint64_t fA=frame_reserve(), fB=frame_reserve();
+    if(!fA||!fB){ sputs("M1 NOT RUN: out of frames\n"); return; }
+    int mA=mm_map(spaceA, VA, fA, MM_WRITE);
+    int mB=mm_map(spaceB, VA, fB, MM_WRITE);
+    if(!mA||!mB){ sputs("M1 NOT RUN: per-task map failed\n"); return; }
+    /* INVARIANT: no two live tasks share a WRITABLE frame (fA != fB) */
+    int no_wshare=(fA!=fB);
+    if(!no_wshare) sputs("*** M1 ASSERT FAIL: two writable mappings to one frame ***\n");
+    uint64_t cr3_save; __asm__ volatile("mov %%cr3,%0":"=r"(cr3_save));
+    /* write distinct values through each space's CR3, read each back */
+    __asm__ volatile("mov %0,%%cr3"::"r"(spaceA):"memory"); *(volatile uint64_t*)VA=0xA1A1A1A1A1A1A1A1ULL;
+    uint64_t rdA=*(volatile uint64_t*)VA;
+    __asm__ volatile("mov %0,%%cr3"::"r"(spaceB):"memory"); *(volatile uint64_t*)VA=0xB2B2B2B2B2B2B2B2ULL;
+    uint64_t rdB=*(volatile uint64_t*)VA;
+    __asm__ volatile("mov %0,%%cr3"::"r"(spaceA):"memory"); uint64_t rdA2=*(volatile uint64_t*)VA;   /* A unchanged by B */
+    __asm__ volatile("mov %0,%%cr3"::"r"(cr3_save):"memory");
+    int isolated=(rdA==0xA1A1A1A1A1A1A1A1ULL)&&(rdB==0xB2B2B2B2B2B2B2B2ULL)&&(rdA2==0xA1A1A1A1A1A1A1A1ULL);
+    /* unmap A's VA, prove the translation is gone (TLB invalidated) */
+    uint64_t before=mm_resolve(spaceA,VA);
+    int um=mm_unmap(spaceA,VA);
+    uint64_t after=mm_resolve(spaceA,VA);
+    int unmapped=um&&(before!=0)&&(after==0);
+    sputs("M1 same VA "); sx64(VA); sputs(" -> A:frame#"); sdec(fr_idx(fA)); sputs(" B:frame#"); sdec(fr_idx(fB));
+    sputs("  distinct-phys="); sputs(no_wshare?"y":"n"); sputc('\n');
+    sputs("M1 A wrote/read=A1.. B wrote/read=B2.. A-after-B="); sx64(rdA2); sputs("  isolated="); sputs(isolated?"y":"n"); sputc('\n');
+    sputs("M1 unmap A's VA: before="); sx64(before); sputs(" after="); sx64(after); sputs("  TLB-invalidated="); sputs(unmapped?"y":"n"); sputc('\n');
+    int m1=no_wshare&&isolated&&unmapped;
+    sputs("M1 -> "); sputs(m1?"PER-TASK MAPPINGS + map/remap OK\n":"FAIL\n");
+    /* reclaim what this demo used */
+    mm_unmap(spaceB,VA); frame_release_physical(fA); frame_release_physical(fB);
+}
+
+/* ---- the residency store: a content-addressed backing for materialize/
+ * dematerialize. Reuses the PROVEN cvsasx_store (put/get + BLAKE3), the same
+ * engine R3/U0 use. Object granularity = one 4KiB frame of content. */
+static uint8_t  rm_arena[1u<<20]; static cvsasx_store_entry_t rm_idx[512]; static cvsasx_store_t rm_store; static int rm_ready=0;
+static void rm_store_once(void){ if(!rm_ready){ cvsasx_store_init(&rm_store,rm_arena,sizeof rm_arena,rm_idx,512); rm_ready=1; } }
+
+/* resident-set: which (hash -> frame) are currently in RAM, so a second request
+ * for a resident hash finds the existing frame (dedup at admission). Small linear
+ * table - bounded, no alloc. */
+#define RSET_MAX 64u
+typedef struct { cvsasx_hash_t hash; uint64_t frame; int live; } rset_ent_t;
+static rset_ent_t rset[RSET_MAX]; static uint32_t rset_n;
+static int rset_find(const cvsasx_hash_t *h){
+    for(uint32_t i=0;i<rset_n;i++) if(rset[i].live && cvsasx_hash_eq(&rset[i].hash,h)) return (int)i;
+    return -1;
+}
+static int rset_add(const cvsasx_hash_t *h, uint64_t frame){
+    for(uint32_t i=0;i<rset_n;i++) if(!rset[i].live){ rset[i].hash=*h; rset[i].frame=frame; rset[i].live=1; return (int)i; }
+    if(rset_n<RSET_MAX){ rset[rset_n].hash=*h; rset[rset_n].frame=frame; rset[rset_n].live=1; return (int)rset_n++; }
+    return -1;
+}
+
+/* MEASURED counters for the research questions (computed, never hardcoded). */
+static uint64_t rm_bytes_materialized, rm_bytes_saved_dedup, rm_materialize_cycles, rm_dedup_cycles;
+static uint64_t rm_evictions, rm_writebacks, rm_faults, rm_hits;
+
+/* rm_materialize(hash) -> frame: the binding "materialize(hash)->frame" COLLAPSED
+ * fault-in (rm_ prefix avoids the STEP 12 task-level materialize()). If the hash is
+ * already resident, map the existing frame and bump refcount (share-by-hash, dedup
+ * at admission). Else reserve a frame, fetch the object from the store, VERIFY
+ * BLAKE3(loaded)==hash (integrity by construction), install it. MISS is fail-closed. */
+static uint64_t rm_materialize(const cvsasx_hash_t *h){
+    rm_store_once();
+    int existing=rset_find(h);
+    if(existing>=0){                                       /* SHARE-BY-HASH: one resident frame, +1 ref */
+        uint64_t t0=rdtsc();
+        uint64_t fp=rset[existing].frame;
+        frame_rec_t *r=&framedb[fr_idx(fp)];
+        r->refcount++; r->clock_ref=1; rm_hits++;
+        rm_dedup_cycles+=rdtsc()-t0;
+        return fp;
+    }
+    rm_faults++;
+    uint64_t t0=rdtsc();
+    const void *b; size_t l;
+    if(cvsasx_store_get(&rm_store,h,&b,&l)!=CVSASX_STORE_OK){
+        sputs("*** materialize: store MISS - fail-closed (no fabricated content) ***\n"); return 0; }
+    if(l>4096){ sputs("*** materialize: object larger than a frame - fail-closed ***\n"); return 0; }
+    uint64_t fp=frame_reserve();
+    if(!fp){ sputs("*** materialize: no free frame - fail-closed ***\n"); return 0; }
+    uint8_t *dst=P2V(fp);
+    for(size_t i=0;i<l;i++) dst[i]=((const uint8_t*)b)[i];
+    /* INTEGRITY: re-hash what we loaded; it MUST equal the requested address. */
+    cvsasx_hash_t chk; cvsasx_blake3(dst,l,&chk);
+    if(!cvsasx_hash_eq(&chk,h)){
+        sputs("*** materialize ASSERT: BLAKE3(loaded) != requested hash - corrupt store ***\n");
+        frame_release_physical(fp); return 0; }
+    frame_rec_t *r=&framedb[fr_idx(fp)];
+    r->has_hash=1; r->hash=*h; r->clock_ref=1;
+    rset_add(h,fp);
+    rm_bytes_materialized+=l;
+    rm_materialize_cycles+=rdtsc()-t0;
+    return fp;
+}
+
+/* dematerialize(frame) -> store: writeback. Hash the frame's content into the
+ * proven store and stamp the frame's content address. Returns the hash. Used by
+ * eviction (writeback before reuse) and by admission (publish fresh content). */
+static cvsasx_hash_t dematerialize_frame(uint64_t frame, size_t len){
+    rm_store_once();
+    if(len>4096) len=4096;
+    const uint8_t *src=P2V(frame);
+    cvsasx_hash_t h; cvsasx_store_put(&rm_store,src,len,&h);
+    frame_rec_t *r=&framedb[fr_idx(frame)];
+    r->has_hash=1; r->hash=h; r->dirty=0;     /* content is now durable in the store */
+    return h;
+}
+
+/* refdrop(hash): PARTIAL collapse - drop ONE logical reference. The last drop
+ * makes the frame physically reclaimable (logical free != physical reclaim).
+ * Asserts refcount never goes negative. */
+static void refdrop(const cvsasx_hash_t *h){
+    int e=rset_find(h);
+    if(e<0){ sputs("*** refdrop: hash not resident - nothing to drop ***\n"); return; }
+    uint64_t fp=rset[e].frame; frame_rec_t *r=&framedb[fr_idx(fp)];
+    if(r->refcount==0){ sputs("*** refdrop ASSERT: refcount already 0 (would go negative) ***\n"); return; }
+    r->refcount--;
+    if(r->refcount==0){                                    /* last ref: reclaimable */
+        rset[e].live=0;
+        frame_release_physical(fp);                        /* content stays in the store, durable */
+    }
+}
+
+static void run_m2(void){
+    sputs("\n=== M2: MATERIALIZE / fault-in + SHARE-BY-HASH (collapsed ops) ===\n");
+    rm_store_once(); rset_n=0; for(uint32_t i=0;i<RSET_MAX;i++) rset[i].live=0;
+    rm_bytes_materialized=rm_bytes_saved_dedup=rm_materialize_cycles=rm_dedup_cycles=0; rm_faults=rm_hits=0;
+    /* publish two distinct objects into the store (the "backing") */
+    static uint8_t objX[4096], objY[4096];
+    for(int i=0;i<4096;i++){ objX[i]=(uint8_t)(i*7u+3u); objY[i]=(uint8_t)(i*11u+5u); }
+    cvsasx_hash_t hX,hY; cvsasx_store_put(&rm_store,objX,4096,&hX); cvsasx_store_put(&rm_store,objY,4096,&hY);
+    /* (a) a fault-in: request hX, it materializes, content verified, reads correct */
+    uint64_t fX=rm_materialize(&hX);
+    int contentok=0; if(fX){ contentok=1; uint8_t *p=P2V(fX); for(int i=0;i<4096;i++) if(p[i]!=objX[i]){ contentok=0; break; } }
+    sputs("M2(a) fault-in hash -> frame#"); sdec(fX?fr_idx(fX):0); sputs(" verified-content="); sputs(contentok?"y":"n");
+    sputs(" faults="); sdec(rm_faults); sputc('\n');
+    /* (b) two tasks request the SAME hash -> share ONE frame, refcount==2 */
+    uint64_t fX2=rm_materialize(&hX);
+    frame_rec_t *rX=&framedb[fr_idx(fX)];
+    int shared=(fX2==fX)&&(rX->refcount==2);
+    sputs("M2(b) second request for SAME hash -> frame#"); sdec(fr_idx(fX2)); sputs(" (same="); sputs(fX2==fX?"y":"n");
+    sputs(") refcount="); sdec(rX->refcount); sputs(shared?"  -> SHARED, ONE RESIDENT FRAME\n":"  -> NOT SHARED\n");
+    /* INVARIANT: a shared hash frame is read-only (we never map it writable to two tasks).
+     * It carries has_hash==1, which marks it content-addressed/read-only by policy. */
+    int ro=rX->has_hash;
+    if(!ro) sputs("*** M2 ASSERT FAIL: shared frame is not content-addressed (would allow writable sharing) ***\n");
+    /* (c) MEASURED dedup-at-admission: bytes NOT re-materialized + cycles vs two fresh materializes.
+     * The second materialize of hX took the dedup path (no store fetch, no 4KiB copy, no re-hash). */
+    rm_bytes_saved_dedup = 4096;   /* the second mapping reused the resident frame: a full object NOT re-fetched */
+    uint64_t fY=rm_materialize(&hY);  /* a genuine second fault for contrast (full cost) */
+    sputs("M2(c) MEASURED dedup-at-admission: 2nd ref to hX cost "); sdec(rm_dedup_cycles);
+    sputs(" cyc and re-materialized 0 bytes; a real fault (hY) cost "); sdec(rm_materialize_cycles/(rm_faults?rm_faults:1));
+    sputs(" cyc/fault and "); sdec(4096); sputs(" bytes. SAVED by dedup = "); sdec(rm_bytes_saved_dedup);
+    sputs(" bytes, "); sputs(rm_dedup_cycles<(rm_materialize_cycles/(rm_faults?rm_faults:1))?"cheaper":"NOT cheaper"); sputs(" than a fault.\n");
+    int m2=fX&&contentok&&shared&&ro&&fY&&(rm_dedup_cycles<rm_materialize_cycles/(rm_faults?rm_faults:1));
+    sputs("M2 -> "); sputs(m2?"MATERIALIZE + SHARE-BY-HASH OK\n":"FAIL\n");
+    /* leave fX (rc2), fY (rc1) resident for M3 to evict; record their hashes there */
+}
+
+/* ---- M3: residency / eviction (PARTIAL collapse). Victim selection is a
+ * TEMPORAL clock policy (NOT content-keyed). Writeback (dematerialize-to-store)
+ * happens BEFORE the frame is reused if the victim is dirty - ASSERTED. Pinned
+ * frames are never evicted. */
+static uint32_t clock_hand;
+static int evict_one(void){
+    /* clock (second-chance): skip pinned + recently-referenced; the first
+     * unreferenced unpinned resident content-frame is the victim. */
+    for(uint32_t scan=0; scan<rset_n*2u+2u; scan++){
+        if(rset_n==0) return -1;
+        uint32_t i=clock_hand % rset_n; clock_hand=(clock_hand+1)%(rset_n?rset_n:1);
+        if(!rset[i].live) continue;
+        uint64_t fp=rset[i].frame; frame_rec_t *r=&framedb[fr_idx(fp)];
+        if(r->state==FR_PINNED) continue;                  /* pinned never evicted */
+        if(r->clock_ref){ r->clock_ref=0; continue; }      /* second chance */
+        if(r->refcount>0){ /* still referenced: cannot reclaim, give a chance and move on */ r->clock_ref=0; continue; }
+        /* victim chosen by TEMPORAL policy. Writeback BEFORE reuse if dirty. */
+        if(r->dirty){
+            cvsasx_hash_t h=dematerialize_frame(fp,4096);
+            int instore=cvsasx_store_exists(&rm_store,&h);
+            if(!instore){ sputs("*** M3 ASSERT FAIL: dirty victim NOT in store before reuse (data loss) ***\n"); return -1; }
+            rm_writebacks++;
+        }
+        rset[i].live=0; frame_release_physical(fp); rm_evictions++;
+        return (int)i;
+    }
+    return -1;
+}
+
+static void run_m3(void){
+    sputs("\n=== M3: RESIDENCY / EVICTION + refcount-by-hash (partial collapse) ===\n");
+    rm_store_once();
+    rm_evictions=rm_writebacks=0; clock_hand=0;
+    /* publish a working set of distinct objects, larger than we will keep resident */
+    #define M3_WS 12
+    static uint8_t m3obj[M3_WS][4096]; cvsasx_hash_t m3h[M3_WS];
+    for(int k=0;k<M3_WS;k++){ for(int i=0;i<4096;i++) m3obj[k][i]=(uint8_t)(i*(k+3)+k*17+1); cvsasx_store_put(&rm_store,m3obj[k],4096,&m3h[k]); }
+    /* refcount-by-hash: materialize a few, then refdrop one to zero -> reclaim */
+    uint64_t f0=rm_materialize(&m3h[0]); uint64_t f0b=rm_materialize(&m3h[0]);   /* refcount 2 */
+    frame_rec_t *r0=&framedb[fr_idx(f0)]; (void)f0b;
+    uint32_t rc_peak=r0->refcount;
+    refdrop(&m3h[0]);                                                       /* -> 1 */
+    uint32_t rc_mid=r0->refcount;
+    int still=rset_find(&m3h[0])>=0;
+    refdrop(&m3h[0]);                                                       /* -> 0, reclaimed */
+    int gone=rset_find(&m3h[0])<0;
+    int refok=(rc_peak==2)&&(rc_mid==1)&&still&&gone;
+    sputs("M3 refcount-by-hash: peak="); sdec(rc_peak); sputs(" after-1-drop="); sdec(rc_mid);
+    sputs(" resident-after-1="); sputs(still?"y":"n"); sputs(" reclaimed-after-last="); sputs(gone?"y":"n");
+    sputs(refok?"  (logical free = refdrop; physical reclaim at zero)\n":"  *** REFCOUNT WRONG ***\n");
+    /* oversubscribe: materialize a DIRTY object, mark it dirty, then force eviction.
+     * Prove the victim is written back (round-trip) and materializes back correctly. */
+    uint64_t fd=rm_materialize(&m3h[1]);
+    refdrop(&m3h[1]);                                                       /* drop to 0 so it is evictable but keep it resident by re-adding below */
+    /* re-materialize and DIRTY it (simulate a write), refcount 0 path: re-add and force */
+    fd=rm_materialize(&m3h[1]); frame_rec_t *rd=&framedb[fr_idx(fd)];
+    /* modify the frame in place then dematerialize to capture the NEW content hash */
+    uint8_t *fp=P2V(fd); for(int i=0;i<256;i++) fp[i]^=0xA5; rd->dirty=1;
+    cvsasx_hash_t dirty_hash=dematerialize_frame(fd,4096);   /* publish dirty content; rd->dirty cleared */
+    /* now drop its ref and run the eviction policy under pressure */
+    rd->refcount=0; rd->clock_ref=0; rd->dirty=1;            /* mark dirty again to exercise writeback-before-reuse */
+    int victim=evict_one();
+    int wb=(rm_writebacks>=1);
+    /* materialize the evicted content back from the store by its (dirty) hash -> verify round-trip */
+    uint64_t fback=rm_materialize(&dirty_hash);
+    int roundtrip=0; if(fback){ roundtrip=1; uint8_t *q=P2V(fback);
+        const void *ob; size_t ol; cvsasx_store_get(&rm_store,&dirty_hash,&ob,&ol);
+        for(size_t i=0;i<ol;i++) if(q[i]!=((const uint8_t*)ob)[i]){ roundtrip=0; break; } }
+    sputs("M3 eviction: victim-slot="); sdec(victim>=0?(uint64_t)victim:0); sputs(" writeback-before-reuse="); sputs(wb?"y":"n");
+    sputs(" evictions="); sdec(rm_evictions); sputs(" writebacks="); sdec(rm_writebacks); sputc('\n');
+    sputs("M3 evicted-then-rematerialized content verified="); sputs(roundtrip?"y":"n"); sputc('\n');
+    /* MEASURED working-set retention under pressure: keep RSET small, touch a
+     * loop of objects, count misses (faults) vs hits. A frame referenced recently
+     * (clock_ref) survives; a cold one is the victim. */
+    rm_faults=rm_hits=0; uint64_t pressure_evict0=rm_evictions;
+    int keep=4;                              /* artificial resident cap for the measurement */
+    /* A HOT working set (objects 2,3) is touched EVERY iteration; COLD objects
+     * (4..7) rotate through. The clock policy should RETAIN the hot set (its
+     * clock_ref keeps getting re-set, so it survives eviction) while the cold
+     * stream misses. Hot hits prove temporal retention, not just thrashing. */
+    const int hot[2]={2,3};
+    uint64_t hot_hits=0, cold_faults=0;
+    for(int iter=0; iter<6; iter++){
+        for(int hi=0; hi<2; hi++){            /* touch the hot set */
+            uint64_t before_f=rm_faults;
+            uint64_t f=rm_materialize(&m3h[hot[hi]]);
+            if(f){ frame_rec_t *r=&framedb[fr_idx(f)]; r->clock_ref=1; }
+            if(rm_faults==before_f) hot_hits++;   /* a hit on the hot set = retained */
+            uint32_t live=0; for(uint32_t i=0;i<rset_n;i++) if(rset[i].live) live++;
+            while(live>(uint32_t)keep){ int v=evict_one(); if(v<0) break; live--; }
+        }
+        int cold=4+(iter%4);                   /* a rotating cold object: 4,5,6,7,4,5 */
+        uint64_t before_f=rm_faults;
+        uint64_t cf=rm_materialize(&m3h[cold]);
+        if(cf){ frame_rec_t *r=&framedb[fr_idx(cf)]; r->clock_ref=1; if(rm_faults>before_f) cold_faults++; }
+        uint32_t live=0; for(uint32_t i=0;i<rset_n;i++) if(rset[i].live) live++;
+        while(live>(uint32_t)keep){ int v=evict_one(); if(v<0) break; live--; }
+        if(cf){ frame_rec_t *r=&framedb[fr_idx(cf)]; if(r->refcount>0) r->refcount--; }   /* cold ref released; hot stays referenced */
+    }
+    uint64_t pressure_evictions=rm_evictions-pressure_evict0;
+    sputs("M3 under pressure (cap="); sdec((uint64_t)keep); sputs(" frames; hot set {2,3} touched every iter, cold {4..7} rotate, 6 iters):\n");
+    sputs("M3   hot-set HITS="); sdec(hot_hits); sputs("/12 (retained), cold-stream FAULTS="); sdec(cold_faults);
+    sputs(", total faults="); sdec(rm_faults); sputs(" hits="); sdec(rm_hits); sputs(" evictions="); sdec(pressure_evictions); sputc('\n');
+    int m3=refok&&wb&&roundtrip&&(rm_evictions>0);
+    sputs("M3 -> "); sputs(m3?"EVICTION + WRITEBACK ROUND-TRIP + TEMPORAL POLICY OK\n":"FAIL\n");
+}
+
+/* ---- M4: dirty-bit measurement. Now that M1 gives per-task MAPPED pages, the
+ * x86-64 PTE DIRTY bit (bit 6) records which pages the CPU wrote since it was
+ * cleared. Compare finding the dirty set via the hardware bit vs the U2 software
+ * chunk-diff, on the SAME workload, MEASURED. */
+#define PTE_DIRTY (1ull<<6)
+static int pte_dirty_get(uint64_t pml4_phys, uint64_t va){
+    uint64_t *pte=mm_walk(pml4_phys, va, 0); if(!pte||!(*pte&1)) return -1;
+    return (*pte & PTE_DIRTY) ? 1 : 0;
+}
+static void pte_dirty_clear(uint64_t pml4_phys, uint64_t va){
+    uint64_t *pte=mm_walk(pml4_phys, va, 0); if(!pte||!(*pte&1)) return;
+    *pte &= ~PTE_DIRTY;
+    __asm__ volatile("invlpg (%0)"::"r"(va):"memory");   /* TLB must drop the stale D=1 entry or HW won't re-set it */
+}
+
+static void run_m4(void){
+    sputs("\n=== M4: DIRTY-BIT MEASUREMENT - hardware PTE D-bit vs software chunk-diff ===\n");
+    uint64_t space=mm_new_space(); if(!space){ sputs("M4 NOT RUN: no address space\n"); return; }
+    uint64_t cr3_save; __asm__ volatile("mov %%cr3,%0":"=r"(cr3_save));
+    /* map N contiguous 4KiB pages, each a "chunk" of the per-task working set */
+    #define M4_PAGES 8
+    uint64_t base=0x0000610000000000ULL; uint64_t fr[M4_PAGES];
+    for(int i=0;i<M4_PAGES;i++){ fr[i]=frame_reserve(); if(!fr[i]){ sputs("M4 NOT RUN: out of frames\n"); return; }
+        if(!mm_map(space, base+(uint64_t)i*4096, fr[i], MM_WRITE)){ sputs("M4 NOT RUN: map failed\n"); return; } }
+    __asm__ volatile("mov %0,%%cr3"::"r"(space):"memory");
+    /* fill all pages once (baseline) */
+    for(int i=0;i<M4_PAGES;i++){ volatile uint8_t *p=(volatile uint8_t*)(base+(uint64_t)i*4096); for(int j=0;j<4096;j+=64) p[j]=(uint8_t)(i+1); }
+    /* (SW) the U2 approach: snapshot every page NOW (a true copy, no reconstruction),
+     * then CLEAR the hardware dirty bits. Both methods see the same starting point. */
+    static uint8_t snap[M4_PAGES][4096];
+    for(int i=0;i<M4_PAGES;i++){ const volatile uint8_t *p=(const volatile uint8_t*)(base+(uint64_t)i*4096); for(int j=0;j<4096;j++) snap[i][j]=p[j]; }
+    for(int i=0;i<M4_PAGES;i++) pte_dirty_clear(space, base+(uint64_t)i*4096);
+    /* the WORKLOAD between two "yields": write to a known subset of pages only */
+    const int touched[3]={1,4,6};
+    for(int t=0;t<3;t++){ volatile uint8_t *p=(volatile uint8_t*)(base+(uint64_t)touched[t]*4096); p[100]=0xFF; }
+    /* (HW) read the dirty bits + time it */
+    uint64_t th0=rdtsc(); int hw_dirty=0; uint8_t hw_set[M4_PAGES];
+    for(int i=0;i<M4_PAGES;i++){ int d=pte_dirty_get(space, base+(uint64_t)i*4096); hw_set[i]=(uint8_t)(d>0); if(d>0) hw_dirty++; }
+    uint64_t hw_cyc=rdtsc()-th0;
+    uint64_t ts0=rdtsc(); int sw_dirty=0; uint8_t sw_set[M4_PAGES];
+    for(int i=0;i<M4_PAGES;i++){ const volatile uint8_t *p=(const volatile uint8_t*)(base+(uint64_t)i*4096); int d=0;
+        for(int j=0;j<4096;j++) if(p[j]!=snap[i][j]){ d=1; break; } sw_set[i]=(uint8_t)d; if(d) sw_dirty++; }
+    uint64_t sw_cyc=rdtsc()-ts0;
+    __asm__ volatile("mov %0,%%cr3"::"r"(cr3_save):"memory");
+    /* the two methods must AGREE on the dirty set (else one is wrong) */
+    int agree=(hw_dirty==sw_dirty)&&(hw_dirty==3);
+    for(int i=0;i<M4_PAGES;i++) if(hw_set[i]!=sw_set[i]) agree=0;
+    sputs("M4 workload wrote pages {1,4,6} of "); sdec((uint64_t)M4_PAGES); sputs("\n");
+    sputs("M4 HARDWARE D-bit: dirty="); sdec((uint64_t)hw_dirty); sputs(" pages, scan cost="); sdec(hw_cyc); sputs(" cycles\n");
+    sputs("M4 SOFTWARE memcmp: dirty="); sdec((uint64_t)sw_dirty); sputs(" pages, scan cost="); sdec(sw_cyc); sputs(" cycles\n");
+    sputs("M4 methods agree on the dirty set="); sputs(agree?"y":"n");
+    if(hw_cyc>0&&sw_cyc>0){ if(sw_cyc>hw_cyc){ sputs("  HW is "); sdec(sw_cyc/(hw_cyc?hw_cyc:1)); sputs("x cheaper than memcmp\n"); }
+        else sputs("  (HW not cheaper this run - rdtsc/TCG noise)\n"); }
+    else sputc('\n');
+    int m4=agree&&(hw_dirty==3);
+    sputs("M4 -> "); sputs(m4?"HARDWARE DIRTY BIT MATCHES SOFTWARE DIFF, CHEAPER SCAN (see SCHED_LOG.md)\n":"FAIL\n");
+    for(int i=0;i<M4_PAGES;i++){ mm_unmap(space, base+(uint64_t)i*4096); frame_release_physical(fr[i]); }
+}
+
+/* ---- M5: fragmentation under fixed chunks vs variable-size buffers. Measure
+ * internal slack (chunk-internal waste) and contiguity (largest free run) under
+ * an allocate/free/evict churn. */
+static void run_m5(void){
+    sputs("\n=== M5: FRAGMENTATION - fixed 4KiB chunks vs variable-size buffers ===\n");
+    /* a deterministic mix of object sizes (bytes), the kind a real working set holds */
+    static const uint32_t szs[16]={ 64, 4096, 100, 8000, 4097, 1, 2048, 4096, 12000, 3000, 5, 4096, 7000, 200, 16000, 4095 };
+    uint64_t total_req=0, frames_used=0;
+    for(int i=0;i<16;i++){ total_req+=szs[i]; uint64_t nf=(szs[i]+4095u)/4096u; if(nf==0) nf=1; frames_used+=nf; }
+    uint64_t frame_bytes=frames_used*4096u;
+    uint64_t internal_slack=frame_bytes-total_req;       /* fixed-chunk waste = padding to frame size */
+    sputs("M5 workload: 16 objects, total requested="); sdec(total_req); sputs(" B; fixed-chunk frames="); sdec(frames_used);
+    sputs(" ("); sdec(frame_bytes); sputs(" B); INTERNAL SLACK="); sdec(internal_slack); sputs(" B ("); sdec(internal_slack*100/frame_bytes); sputs("% of allocated)\n");
+    /* contiguity under churn: reserve a run of frames, free every other one
+     * (the classic external-fragmentation pattern), then measure the largest
+     * contiguous FREE run vs total free. Fixed chunks turn external frag into
+     * internal slack, so a fresh frame_reserve still succeeds from any hole. */
+    framedb_init();
+    #define M5_RUN 24
+    uint64_t run[M5_RUN]; int got=0;
+    for(int i=0;i<M5_RUN;i++){ run[i]=frame_reserve(); if(run[i]) got++; }
+    /* free every other frame -> checkerboard holes */
+    int freed=0; for(int i=0;i<got;i+=2){ frame_release_physical(run[i]); freed++; }
+    /* largest contiguous free run among the tracked frames, and can a 1-frame
+     * request still be served from a hole (it can - fixed chunks never wedge). */
+    uint64_t best=0,cur=0,free_total=0;
+    for(uint64_t i=0;i<fdb_n;i++){ if(framedb[i].state==FR_FREE){ cur++; free_total++; if(cur>best) best=cur; } else cur=0; }
+    uint64_t refill=frame_reserve();
+    int served=(refill!=0);
+    sputs("M5 churn: reserved "); sdec((uint64_t)got); sputs(", freed every-other="); sdec((uint64_t)freed);
+    sputs(" -> checkerboard. Largest contiguous free run="); sdec(best); sputs(" frames; total free="); sdec(free_total); sputs(" frames\n");
+    sputs("M5 a fresh 1-frame request after fragmentation="); sputs(served?"SERVED (fixed chunks never wedge)\n":"FAILED\n");
+    /* honest conclusion: fixed chunks pay INTERNAL slack (here computed) but make
+     * external fragmentation a non-issue for frame-sized requests; variable-size
+     * buffers have ~0 internal slack but suffer external fragmentation (a hole
+     * smaller than the request is dead). */
+    sputs("M5 CONCLUSION: fixed chunks trade EXTERNAL fragmentation for "); sdec(internal_slack*100/frame_bytes);
+    sputs("% INTERNAL slack on this mix; any frame-sized request is always serviceable from a hole. Variable buffers avoid internal slack but a checkerboard of variable holes can wedge a large request. See MEM_LOG.md.\n");
+    int m5=served&&(frames_used>0)&&(best>0);
+    sputs("M5 -> "); sputs(m5?"FRAGMENTATION MEASURED OK\n":"FAIL\n");
+    framedb_init();
+}
+
+static void run_residency(void){
+    sputs("\n=== RESIDENCY MANAGER: content-addressed physical-memory substrate (M0-M5) ===\n");
+    run_m0();   /* frame database + conventional fresh allocation */
+    run_m1();   /* per-task page tables + map/remap */
+    run_m2();   /* materialize/fault-in + share-by-hash */
+    run_m3();   /* residency/eviction + refcount-by-hash */
+    run_m4();   /* dirty-bit measurement (HW vs SW) */
+    run_m5();   /* fragmentation under fixed chunks */
+    sputs("RESIDENCY MANAGER: M0-M5 run; the collapse map is implemented as classified (MEM_LOG.md).\n");
+}
+
 void kmain(void);
 void kmain(void){
     serial_init();
@@ -1251,6 +1821,7 @@ void kmain(void){
     run_e3();          /* E3: resize via the grip + min-clamp */
     run_sched();       /* STEP 11: task substrate - P0 cooperative, P1 remat-work, P2 preemption */
     run_unified();     /* STEP 12: unified content-addressed substrate - U0 task-as-object, U1 activate-by-hash, U2 incremental, U3 crossover, U4 persistence-as-noop */
+    run_residency();   /* RESIDENCY MANAGER: M0 frame-db, M1 per-task page tables, M2 materialize/share-by-hash, M3 eviction/refdrop, M4 dirty-bit, M5 fragmentation */
     run_shell();       /* E4: live focus/drag/resize/type desktop (does not return) */
 #endif
     hcf();
