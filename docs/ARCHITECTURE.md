@@ -263,6 +263,18 @@ round-robin placeholder. Today the register context and the private data page de
 page-table root stays resident, dematerializing the full page-table state is the open wider
 task-state object.
 
+The policy that decides when to dematerialize is rematerialization-aware. By default a descheduled
+process is kept resident, since resuming it is far cheaper. Dematerialization happens only when the
+residency manager signals memory pressure and the process is predicted to stay descheduled long
+enough to repay the rematerialize cost. The prediction uses cheap signals, a quantum preemption
+predicts a short absence and keeps the process resident, a block or a long sleep predicts a long
+absence and makes it a candidate, and repeated wakeups keep a hot process resident. The break-even
+duration is computed live from the measured resume cost rather than a guessed constant, so a process
+descheduled longer than the break-even nets a gain and a shorter one nets a loss. An anti-thrash
+backoff keeps a just-rematerialized process resident so it is not dematerialized again immediately.
+This is the local measured rule. It does not make scheduling free and it is not a unified scheduling
+model.
+
 ## Two-machine migration (kernel/nettest.c)
 
 Two emulator instances share memory through an ivshmem device, a PCI device whose second base

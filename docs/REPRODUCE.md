@@ -10,6 +10,15 @@ cd kernel
 bash build.sh
 ```
 
+The boot window defaults to 40 seconds, which prints through the early milestones. The later stages
+(the scheduler, residency manager, fault handler, userspace, loader, concurrency, and policy) print
+after that under the emulator's slower timing, so set a longer window to observe them all:
+
+```
+cd kernel
+BOOT_SECS=180 bash build.sh
+```
+
 The serial output includes the following self-test results.
 
 - Boot and long mode. The kernel reports the code segment and the long-mode bit, confirming

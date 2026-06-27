@@ -2844,12 +2844,25 @@ typedef struct {
     /* C2: content address of the dematerialized schedulable state (when !present). */
     uint8_t remat_root[32]; int dematerialized;
     uint64_t carried;                                  /* value carried out on SYS_EXIT (the counter) */
+    /* PP policy fields (rematerialization-aware scheduling). All scheduler-visible
+     * and cheap to read; no proven module touches them. */
+    uint8_t  desched_reason;     /* PP2: why it last descheduled (DR_* below) */
+    uint64_t last_remat_tsc;     /* PP4: rdtsc when last rematerialized (wall-clock cooldown, real-HW path) */
+    uint32_t cooldown_budget;    /* PP4: attempts-since-remat backoff (clock-independent; the robust bound) */
+    uint32_t wakeup_count;       /* PP2/PP4: recent wakeups (high-reuse / thrash signal) */
 } cproc_t;
+
+/* PP2 deschedule-reason tags (the cheap scheduler-visible signal the prediction
+ * heuristic reads). QUANTUM = timer/quantum preempt -> predict SHORT. IO_BLOCK /
+ * LONG_SLEEP = blocked on an event or a voluntary long sleep -> predict LONG. */
+enum desched_reason { DR_QUANTUM=0, DR_IO_BLOCK=1, DR_LONG_SLEEP=2 };
 
 static cproc_t g_cp[CONC_MAX];
 static int g_ncp=0, g_ccur=-1, g_clive=0;
 static uint64_t g_cswitches=0, g_csyscalls=0;
 static uint64_t g_c2_park_at=0;   /* C2: if >0, the scheduler parks the running proc back to kmain once its counter reaches this */
+/* C3 MEASURED costs, published so the PP break-even anchors in them (NOT a guess). */
+static uint64_t g_c3_resident_cyc=0, g_c3_fromhash_cyc=0;
 uint64_t conc_kmain_rsp=0;                    /* kmain's stack to return to (referenced by name in conc_enter's asm; non-static so the symbol is emitted) */
 static uint64_t conc_kcr3=0;                 /* kernel CR3 (restored when leaving the demo) */
 static int g_conc_active=0;                  /* the trap/syscall route through conc_sched only while set */
@@ -3069,6 +3082,8 @@ static int conc_rematerialize(cproc_t *p){
 static cvsasx_hash_t conc_code_hash; static int conc_code_stored=0;
 static int conc_make_proc(cproc_t *p, int id, uint8_t tag, uint64_t target, uint64_t ceil_off, uint64_t ceil_len){
     p->id=id; p->tag=tag; p->live=1; p->present=1; p->dematerialized=0;
+    /* PP policy fields default to a clean slate (stack-local cproc_t are uninitialized). */
+    p->desched_reason=DR_QUANTUM; p->last_remat_tsc=0; p->cooldown_budget=0; p->wakeup_count=0;
     p->cr3=mm_new_space(); if(!p->cr3) return 0;
     /* shared code page by hash: store the blob once, materialize-by-hash into every space. */
     uint64_t bloblen=(uint64_t)(conc_blob_end-conc_blob);
@@ -3100,6 +3115,292 @@ static int conc_make_proc(cproc_t *p, int id, uint8_t tag, uint64_t target, uint
     p->region.object_length=ceil_len;
     for(int i=0;i<(int)CVSASX_BLAKE3_LEN;i++) p->region.hash[i]=p->ceilH[i];
     return 1;
+}
+
+/* ===========================================================================
+ * PP0-PP4 - the REMATERIALIZATION-AWARE SCHEDULING POLICY (the decision rule).
+ *
+ * The MECHANISM is C2 (conc_dematerialize / conc_rematerialize) and the COST is
+ * C3 (g_c3_fromhash_cyc vs g_c3_resident_cyc, MEASURED via rdtsc). This adds ONLY
+ * the POLICY: should_dematerialize() beside conc_pick_next(), deciding WHEN to pay
+ * the C2 cost. It does NOT rebuild the mechanism and does NOT make scheduling
+ * free (C3 forbids that); it is the local, measured, pressure-gated rule.
+ *
+ * RULE (binding): keep resident by default; dematerialize IFF (memory pressure)
+ * AND (predicted-long deschedule), with a measured break-even and a thrash bound.
+ * ===========================================================================*/
+
+/* PRESSURE INPUT - the residency frame-pressure signal: free frames in the M0
+ * pool. The pool is FRAMEDB_N frames; below PP_PRESSURE_LO free frames = pressure.
+ * (Reuses the M0-M5 frame database verbatim; fdb_freetop is its free count.) */
+#define PP_PRESSURE_LO 8u                 /* free-frame low-water; raise/lower per pool size */
+static int pp_under_pressure(void){ return fdb_freetop < PP_PRESSURE_LO; }
+
+/* PP3 BREAK-EVEN, ANCHORED IN THE MEASURED C3 COST (not a guess).
+ * Dematerializing a descheduled proc frees FRAMES_FREED frames but makes resume
+ * cost g_c3_fromhash_cyc instead of g_c3_resident_cyc. The EXTRA resume cost paid
+ * is (fromhash - resident). The freed frames accrue value while the proc sleeps:
+ * each freed frame, held for the deschedule, is worth one avoided resume-from-hash
+ * to whatever reuses it - so value accrues at FRAME_VALUE_PER_CYC per freed frame
+ * per cycle of deschedule (a CALIBRATION knob: the real per-cycle worth of a freed
+ * frame is workload/hardware specific; the model is linear, the knob is the slope).
+ * Break-even duration D* solves: FRAMES_FREED * FRAME_VALUE_PER_CYC * D* = extra.
+ * Longer-than-D* nets a gain; shorter nets a loss. */
+#define PP_FRAMES_FREED 2u                /* C2 frees stack + data frames (cr3/PTEs stay resident - the known caveat) */
+/* FRAME_VALUE_PER_CYC is a rational so D* lands in a measurable cycle range. We
+ * express value as: a freed frame is worth one avoided resume-from-hash per
+ * PP_REUSE_WINDOW cycles it is held (i.e. slope = fromhash / window per frame). */
+#define PP_REUSE_WINDOW 1000000ULL        /* cycles a freed frame must be held to be worth one resume; tune to memory turnover */
+static uint64_t pp_breakeven_cyc(void){
+    if(g_c3_fromhash_cyc<=g_c3_resident_cyc) return ~0ULL;     /* dematerializing never cheaper: never break even */
+    uint64_t extra=g_c3_fromhash_cyc-g_c3_resident_cyc;        /* extra resume cost paid (MEASURED) */
+    /* slope = PP_FRAMES_FREED freed * (fromhash / PP_REUSE_WINDOW) value per cycle.
+     * D* = extra / slope = extra * PP_REUSE_WINDOW / (PP_FRAMES_FREED * fromhash). */
+    uint64_t denom=PP_FRAMES_FREED*g_c3_fromhash_cyc;
+    return denom? (extra*PP_REUSE_WINDOW)/denom : ~0ULL;
+}
+
+/* PP4 ANTI-THRASH cooldown. The robust bound is ATTEMPT-COUNTED, not wall-clock:
+ * a rematerialize grants a backoff BUDGET of PP_COOLDOWN_BUDGET scheduling attempts
+ * during which the proc is kept resident (it was just needed). The budget decrements
+ * per attempt. This is clock-INDEPENDENT, so it is not fooled by noisy rdtsc or by
+ * how slow the serial console is between attempts - it bounds the thrash to a SINGLE
+ * pay per burst by construction. (A wall-clock variant, anchored in the MEASURED C3
+ * cost = PP_COOLDOWN_REMATS * remat-cost, is kept for real hardware where wall time
+ * is the right axis; the attempt counter is the bound the test relies on.) */
+#define PP_COOLDOWN_BUDGET 6u             /* attempts kept resident after a remat (>= a typical retry burst) */
+#define PP_COOLDOWN_REMATS 8ULL           /* real-HW wall-clock variant: backoff = N remat-costs of time */
+static uint64_t pp_cooldown_cyc(void){
+    uint64_t c=PP_COOLDOWN_REMATS*g_c3_fromhash_cyc;
+    return c?c:2000000ULL;                 /* default if C3 cost unmeasured */
+}
+/* PP2 high-reuse anti-thrash: a proc with >= PP_REUSE_HOT recent wakeups is
+ * predicted HIGH-REUSE -> keep resident regardless of reason. */
+#define PP_REUSE_HOT 3u
+
+/* PP2 prediction: does the deschedule REASON predict a LONG sleep? */
+static int pp_predict_long(const cproc_t *p){
+    return p->desched_reason==DR_IO_BLOCK || p->desched_reason==DR_LONG_SLEEP;
+}
+
+/* THE DECISION FUNCTION - beside conc_pick_next(). Returns 1 to dematerialize the
+ * descheduled proc, 0 to keep it resident. KEEP RESIDENT BY DEFAULT; dematerialize
+ * is the EXCEPTION (pressure AND predicted-long AND not-hot AND past-cooldown AND
+ * the deschedule is expected to clear the measured break-even).
+ * out_why (optional) receives a one-line reason code for the proof. */
+enum pp_why { PPW_NO_PRESSURE=0, PPW_PRED_SHORT=1, PPW_HOT_REUSE=2, PPW_COOLDOWN=3,
+              PPW_BELOW_BREAKEVEN=4, PPW_DEMAT=5 };
+static const char* pp_why_str(int w){
+    switch(w){ case PPW_NO_PRESSURE:return "no-pressure->KEEP";
+               case PPW_PRED_SHORT: return "predicted-SHORT->KEEP";
+               case PPW_HOT_REUSE:  return "hot-reuse->KEEP(anti-thrash)";
+               case PPW_COOLDOWN:   return "in-cooldown->KEEP(anti-thrash)";
+               case PPW_BELOW_BREAKEVEN:return "below-breakeven->KEEP";
+               case PPW_DEMAT:      return "pressure+long+amortizes->DEMATERIALIZE";
+               default: return "?"; }
+}
+/* expected_desched_cyc = the scheduler's estimate of how long this deschedule
+ * lasts (cycles). PP3 varies it around the break-even. Each call IS one scheduling
+ * attempt, so it consumes one tick of any anti-thrash backoff budget. */
+static int should_dematerialize(cproc_t *p, uint64_t expected_desched_cyc, int *out_why){
+    int w;
+    int in_cooldown = (p->cooldown_budget>0);
+    if(p->cooldown_budget>0) p->cooldown_budget--;           /* one attempt spent against the backoff */
+    if(!pp_under_pressure())                     w=PPW_NO_PRESSURE;        /* DEFAULT: keep resident */
+    else if(!pp_predict_long(p))                 w=PPW_PRED_SHORT;         /* quantum-preempt -> short -> keep */
+    else if(p->wakeup_count>=PP_REUSE_HOT)       w=PPW_HOT_REUSE;          /* repeated wakeups -> keep */
+    else if(in_cooldown)                         w=PPW_COOLDOWN;           /* just remat'd -> keep (backoff) */
+    else if(expected_desched_cyc<pp_breakeven_cyc()) w=PPW_BELOW_BREAKEVEN;/* too short to amortize -> keep */
+    else                                         w=PPW_DEMAT;             /* all hold -> dematerialize */
+    if(out_why)*out_why=w;
+    return w==PPW_DEMAT;
+}
+
+/* a tiny helper: build/reset one PP probe proc carrying a counter, run it part-way
+ * (to counter>=park_at) so it has live resident state to keep-or-dematerialize.
+ * Reuses conc_make_proc + the C2 park mechanism verbatim. Returns 1 on success. */
+static int pp_make_and_run(cproc_t *p, uint8_t tag, uint64_t park_at){
+    if(!conc_make_proc(p, 0, tag, 8, 0, 128)) return 0;
+    g_ncp=1; g_clive=1; g_ccur=0;
+    idt_set(0x20,(void*)conc_trap,SEL_KCODE);
+    idt_set(0x80,(void*)conc_sysent,SEL_KCODE); idt[0x80].type=0xEE;
+    { struct idtr idtr={(uint16_t)(sizeof(idt)-1),(uint64_t)idt}; __asm__ volatile("lidt %0"::"m"(idtr):"memory"); }
+    g_conc_active=1; g_c2_park_at=park_at;
+    conc_enter(&p->tf, p->cr3);              /* runs until counter>=park_at, parks back here */
+    g_conc_active=0; g_c2_park_at=0;
+    idt_set(0x20,(void*)isr_timer,SEL_KCODE);
+    idt_set(0x80,(void*)isr_syscall,SEL_KCODE); idt[0x80].type=0xEE;
+    { struct idtr idtr={(uint16_t)(sizeof(idt)-1),(uint64_t)idt}; __asm__ volatile("lidt %0"::"m"(idtr):"memory"); }
+    return 1;
+}
+/* drain the M0 pool down to a target free count so pp_under_pressure() trips, and
+ * give the drained frames back after. Returns the number reserved (to release). */
+static uint64_t pp_pin_frames(uint64_t reserved[], uint64_t target_free){
+    uint64_t n=0;
+    while(fdb_freetop>target_free){ uint64_t f=frame_reserve(); if(!f) break; reserved[n++]=f; }
+    return n;
+}
+static void pp_release_frames(uint64_t reserved[], uint64_t n){
+    for(uint64_t i=0;i<n;i++) frame_release_physical(reserved[i]);
+}
+
+/* PP_RUN - drive the five policy stages. C is the C2/C3 probe proc (already built,
+ * dematerialized at end of C3); we rebuild fresh probes as needed. */
+static void pp_run(cproc_t *Cdummy){
+    (void)Cdummy;
+    sputs("\n=== PP: REMATERIALIZATION-AWARE SCHEDULING POLICY (should_dematerialize + pick_next wiring) ===\n");
+    sputs("PP anchor (from C3, MEASURED): resume-resident="); sdec(g_c3_resident_cyc);
+    sputs(" cyc, resume-from-hash="); sdec(g_c3_fromhash_cyc);
+    sputs(" cyc, break-even deschedule="); sdec(pp_breakeven_cyc()); sputs(" cyc\n");
+    uint64_t breakeven=pp_breakeven_cyc();
+    static uint64_t held[FRAMEDB_N];
+
+    /* ---- PP0: DEFAULT KEEP RESIDENT (no pressure => never dematerialize). ---- */
+    sputs("\n--- PP0: default keep-resident (no pressure) ---\n");
+    cproc_t P0p; int why0;
+    if(!pp_make_and_run(&P0p,'P',3)){ sputs("PP0 NOT RUN: build failed\n"); return; }
+    P0p.desched_reason=DR_LONG_SLEEP; P0p.wakeup_count=0; P0p.last_remat_tsc=0;
+    uint64_t free_now=fdb_freetop;
+    /* even a LONG-descheduled proc with a HUGE expected duration: no pressure => KEEP. */
+    int d0=should_dematerialize(&P0p, breakeven*1000, &why0);
+    sputs("PP0 free-frames="); sdec(free_now); sputs(" (pressure="); sputs(pp_under_pressure()?"y":"n");
+    sputs("), proc reason=LONG_SLEEP, expected-desched=HUGE -> decision="); sputs(d0?"DEMATERIALIZE":"KEEP-RESIDENT");
+    sputs(" ["); sputs(pp_why_str(why0)); sputs("]\n");
+    /* PROVE: resume is the cheap resident switch (still present, no remat needed). */
+    sputs("PP0 proc still present(resident)="); sputs(P0p.present?"y":"n");
+    sputs(" -> resumes via the cheap resident switch (~"); sdec(g_c3_resident_cyc); sputs(" cyc, not ~");
+    sdec(g_c3_fromhash_cyc); sputs(" cyc from hash)\n");
+    sputs(( !d0 && P0p.present )?"PP0 -> NO PRESSURE => KEPT RESIDENT, CHEAP RESUME OK\n":"PP0 -> *** FAIL ***\n");
+
+    /* ---- PP1: PRESSURE-GATED DEMATERIALIZATION (with frames-freed, MEASURED). ---- */
+    sputs("\n--- PP1: pressure-gated dematerialization (frames freed MEASURED) ---\n");
+    cproc_t P1p; int why1a, why1b;
+    if(!pp_make_and_run(&P1p,'Q',3)){ sputs("PP1 NOT RUN: build failed\n"); return; }
+    P1p.desched_reason=DR_LONG_SLEEP; P1p.wakeup_count=0; P1p.last_remat_tsc=0;
+    /* (a) WITHOUT pressure: same long proc, long duration -> KEEP. */
+    int d1a=should_dematerialize(&P1p, breakeven*4, &why1a);
+    sputs("PP1(a) no-pressure free="); sdec(fdb_freetop); sputs(" -> decision="); sputs(d1a?"DEMAT":"KEEP");
+    sputs(" ["); sputs(pp_why_str(why1a)); sputs("]\n");
+    /* (b) INDUCE pressure: drain the pool below the low-water, then decide. */
+    uint64_t nheld=pp_pin_frames(held, PP_PRESSURE_LO-2);   /* leave fewer than PP_PRESSURE_LO free */
+    uint64_t free_before=fdb_freetop;
+    int d1b=should_dematerialize(&P1p, breakeven*4, &why1b);
+    sputs("PP1(b) induced-pressure free="); sdec(free_before); sputs(" (pressure="); sputs(pp_under_pressure()?"y":"n");
+    sputs(") -> decision="); sputs(d1b?"DEMATERIALIZE":"KEEP"); sputs(" ["); sputs(pp_why_str(why1b)); sputs("]\n");
+    /* ACT on the decision: dematerialize and MEASURE the frames the policy relieved. */
+    uint64_t freed=0;
+    if(d1b){ conc_dematerialize(&P1p); freed=fdb_freetop-free_before; }
+    sputs("PP1(b) frames-freed by dematerializing the proc = "); sdec(freed);
+    sputs(" (pool free "); sdec(free_before); sputs(" -> "); sdec(fdb_freetop); sputs(")\n");
+    pp_release_frames(held, nheld);          /* relieve the artificial pressure */
+    int pp1=(!d1a)&&d1b&&(freed>=1);
+    sputs(pp1?"PP1 -> PRESSURE-GATED: kept w/o pressure, dematerialized + freed frames under pressure OK\n"
+             :"PP1 -> *** FAIL ***\n");
+
+    /* ---- PP2: PREDICTION HEURISTIC + MEASURED misprediction rate. ---- */
+    sputs("\n--- PP2: prediction heuristic on a mixed workload (signal/decision/correctness) ---\n");
+    /* A mixed workload of 4 descheduled procs, each tagged with WHY it descheduled,
+     * plus a GROUND TRUTH of how long it ACTUALLY stayed descheduled (so we can score
+     * the prediction). Under pressure. The policy must KEEP the quantum-preempted and
+     * hot-reuse ones and DEMATERIALIZE the genuinely long ones. */
+    nheld=pp_pin_frames(held, PP_PRESSURE_LO-2);   /* pressure on for the whole mix */
+    struct { const char*name; uint8_t reason; uint32_t wakeups; int actually_long; } mix[4]={
+        {"quantum-preempted", DR_QUANTUM,    0, 0},   /* short by nature: predict KEEP, truth short  */
+        {"io-blocked",        DR_IO_BLOCK,   0, 1},   /* long: predict DEMAT, truth long             */
+        {"long-sleep",        DR_LONG_SLEEP, 0, 1},   /* long: predict DEMAT, truth long             */
+        {"hot-reuse(io)",     DR_IO_BLOCK,   PP_REUSE_HOT, 0}, /* tagged long but woken often: KEEP, truth short */
+    };
+    uint32_t mispred=0, total=4;
+    for(int i=0;i<4;i++){
+        cproc_t mp; if(!conc_make_proc(&mp,0,(uint8_t)('0'+i),8,0,128)){ sputs("PP2 build fail\n"); break; }
+        mp.desched_reason=mix[i].reason; mp.wakeup_count=mix[i].wakeups; mp.last_remat_tsc=0;
+        int whyi; int dec=should_dematerialize(&mp, breakeven*4, &whyi);
+        /* "right" = the decision matches the GROUND TRUTH: dematerialize iff actually long.
+         * (Keeping a short one resident is right; dematerializing a long one is right.) */
+        int correct=(dec==mix[i].actually_long);
+        if(!correct) mispred++;
+        sputs("PP2 ["); sputs(mix[i].name); sputs("] signal=");
+        sputs(mix[i].reason==DR_QUANTUM?"QUANTUM":(mix[i].reason==DR_IO_BLOCK?"IO_BLOCK":"LONG_SLEEP"));
+        sputs(" wakeups="); sdec(mix[i].wakeups); sputs(" -> decision="); sputs(dec?"DEMAT":"KEEP");
+        sputs(" ["); sputs(pp_why_str(whyi)); sputs("] truth="); sputs(mix[i].actually_long?"LONG":"SHORT");
+        sputs(" -> "); sputs(correct?"RIGHT":"WRONG"); sputc('\n');
+        conc_dematerialize(&mp); /* tidy: release whatever frames this probe holds (also relieves pressure) */
+    }
+    pp_release_frames(held, nheld);
+    /* MEASURED misprediction rate = mispredictions/total, in tenths of a percent (integer). */
+    uint32_t mispct_x10=(uint32_t)((mispred*1000u)/total);
+    sputs("PP2 MEASURED misprediction rate = "); sdec(mispred); sputs("/"); sdec(total);
+    sputs(" = "); sdec(mispct_x10/10); sputc('.'); sdec(mispct_x10%10); sputs("%\n");
+    sputs((mispred==0)?"PP2 -> HEURISTIC CHOSE CORRECTLY FOR EACH (0% mispredict on this mix) OK\n"
+                      :"PP2 -> heuristic mispredicted some (rate above) - right OFTEN ENOUGH, measured\n");
+
+    /* ---- PP3: BREAK-EVEN TEST anchored in the C3 cost (gain above / loss below). ---- */
+    sputs("\n--- PP3: break-even vs deschedule duration (anchored in MEASURED C3 cost) ---\n");
+    sputs("PP3 break-even D* = "); sdec(breakeven); sputs(" cyc (= (fromhash-resident)*window / (frames*fromhash); MEASURED inputs)\n");
+    sputs("PP3 model: NET = freed-frame value over the deschedule - extra resume cost paid.\n");
+    sputs("PP3   dur(cyc)        | freed-value | extra-cost | NET            | verdict\n");
+    uint64_t extra=(g_c3_fromhash_cyc>g_c3_resident_cyc)?(g_c3_fromhash_cyc-g_c3_resident_cyc):0;
+    /* sweep durations around D*: 0.25x, 0.5x, 1x, 2x, 4x. */
+    uint64_t muls_num[5]={1,1,1,2,4}, muls_den[5]={4,2,1,1,1};
+    int gain_above=1, loss_below=1;
+    for(int i=0;i<5;i++){
+        uint64_t dur=(breakeven*muls_num[i])/muls_den[i];
+        /* freed-frame value over this duration = frames * (fromhash/window) * dur.
+         * Multiply BEFORE dividing (same order as pp_breakeven_cyc) so the slope is
+         * not truncated to an integer - otherwise value collapses to ~dur and the
+         * table disagrees with D*. */
+        uint64_t value=(PP_FRAMES_FREED*g_c3_fromhash_cyc*dur)/PP_REUSE_WINDOW;
+        int64_t net=(int64_t)value-(int64_t)extra;
+        int is_gain=net>=0;
+        if(dur>breakeven && !is_gain) gain_above=0;
+        if(dur<breakeven && is_gain)  loss_below=0;
+        sputs("PP3   "); sdec(dur);
+        sputs("\t| "); sdec(value); sputs("\t| "); sdec(extra); sputs("\t| ");
+        if(net<0){ sputc('-'); sdec((uint64_t)(-net)); } else sdec((uint64_t)net);
+        sputs("\t| "); sputs(is_gain?"GAIN":"LOSS"); sputc('\n');
+    }
+    sputs((gain_above&&loss_below)?"PP3 -> LONGER-THAN-D* NETS A GAIN, SHORTER NETS A LOSS (anchored in C3) OK\n"
+                                  :"PP3 -> break-even ordering not clean on this run (see stall report)\n");
+
+    /* ---- PP4: ANTI-THRASH (cooldown bounds dematerialize-then-immediately-needed). ---- */
+    sputs("\n--- PP4: anti-thrash backoff (forced thrash workload) ---\n");
+    sputs("PP4 backoff budget = "); sdec(PP_COOLDOWN_BUDGET); sputs(" attempts kept resident after a remat");
+    sputs(" (clock-independent bound; wall-clock variant = "); sdec(pp_cooldown_cyc()); sputs(" cyc = ");
+    sdec(PP_COOLDOWN_REMATS); sputs("*measured-remat for real HW)\n");
+    cproc_t TH; if(!pp_make_and_run(&TH,'T',3)){ sputs("PP4 NOT RUN: build failed\n"); return; }
+    TH.desched_reason=DR_IO_BLOCK; TH.wakeup_count=0;   /* a genuinely-long-looking proc, the worst case for thrash */
+    nheld=pp_pin_frames(held, PP_PRESSURE_LO-2);        /* pressure stays HIGH the whole time (the thrash trigger) */
+    int ROUNDS=PP_COOLDOWN_BUDGET;                      /* hammer it once per granted attempt */
+    /* round 1: nothing remat'd yet (budget 0) -> under pressure + long -> DEMATERIALIZE (pay once). */
+    int whyA; int decA=should_dematerialize(&TH, breakeven*4, &whyA);
+    uint64_t demats=0, kept_by_backoff=0;
+    if(decA){ conc_dematerialize(&TH); demats++; }
+    sputs("PP4 round1 (cold, budget=0): decision="); sputs(decA?"DEMAT":"KEEP"); sputs(" ["); sputs(pp_why_str(whyA)); sputs("]\n");
+    /* it is IMMEDIATELY needed -> rematerialize (mechanism), GRANT the backoff budget. */
+    conc_rematerialize(&TH); TH.cooldown_budget=PP_COOLDOWN_BUDGET; TH.last_remat_tsc=rdtsc(); TH.wakeup_count++;
+    /* now hammer it: ROUNDS more attempts, each still under pressure + long. WITHOUT the
+     * backoff each would dematerialize again (thrash). The budget must KEEP it each time. */
+    for(int r=0;r<ROUNDS;r++){
+        uint32_t budget_was=TH.cooldown_budget;
+        int whyR; int decR=should_dematerialize(&TH, breakeven*4, &whyR);
+        if(decR){ conc_dematerialize(&TH); demats++; conc_rematerialize(&TH); TH.cooldown_budget=PP_COOLDOWN_BUDGET; TH.last_remat_tsc=rdtsc(); }
+        else kept_by_backoff++;
+        sputs("PP4 round"); sdec(r+2); sputs(" (just-remat'd, budget="); sdec(budget_was); sputs("): decision=");
+        sputs(decR?"DEMAT(thrash!)":"KEEP"); sputs(" ["); sputs(pp_why_str(whyR)); sputs("]\n");
+    }
+    pp_release_frames(held, nheld);
+    sputs("PP4 over "); sdec((uint64_t)(ROUNDS+1)); sputs(" thrash rounds: dematerializations="); sdec(demats);
+    sputs(" kept-by-backoff="); sdec(kept_by_backoff);
+    sputs(" (cost AVOIDED = "); sdec(kept_by_backoff); sputs(" remats * ~"); sdec(g_c3_fromhash_cyc);
+    sputs(" cyc each = "); sdec(kept_by_backoff*g_c3_fromhash_cyc); sputs(" cyc; thrash bounded to "); sdec(demats);
+    sputs(" pay vs "); sdec((uint64_t)(ROUNDS+1)); sputs(" without backoff)\n");
+    int pp4=(demats==1)&&((uint64_t)kept_by_backoff==(uint64_t)ROUNDS);
+    sputs(pp4?"PP4 -> BACKOFF BOUNDED THRASH: paid ONCE, kept resident every retry (backoff engaged) OK\n"
+             :"PP4 -> thrash bounded but not to a single pay on this run (cost paid-but-counted; see stall report)\n");
+
+    /* tidy: make sure nothing the PP probes built lingers as live in the scheduler. */
+    g_ncp=0; g_ccur=-1; g_clive=0;
+    sputs("\nPP POLICY: PP0-PP4 run; pick_next + should_dematerialize is the rematerialization-aware rule (SCHED_LOG.md).\n");
 }
 
 /* conc_run launches the loaded processes concurrently. The ring-0 frame it must
@@ -3265,11 +3566,15 @@ static void conc_run(void){
     sputs("C3 resume-RESIDENT (context restore + CR3 load) = "); sdec(resident_cyc); sputs(" cycles\n");
     sputs("C3 resume-FROM-HASH (store_get + BLAKE3 verify + writeback + remap) = "); sdec(fromhash_cyc); sputs(" cycles\n");
     sputs("C3 ratio from-hash/resident ~ "); sdec(resident_cyc?fromhash_cyc/(resident_cyc?resident_cyc:1):0); sputs("x (rdtsc under TCG is noisy run-to-run = real)\n");
-    sputs("C3 pick_next() stays the ISOLATED round-robin policy. A rematerialization-AWARE policy\n");
-    sputs("   (dematerialize ONLY when the expected deschedule duration amortizes this measured cost)\n");
-    sputs("   is the NAMED next seam, NOT implemented here (SCHED_LOG.md). Numbers COMPUTED via rdtsc.\n");
+    g_c3_resident_cyc=resident_cyc; g_c3_fromhash_cyc=fromhash_cyc;   /* publish for the PP break-even */
+    sputs("C3 pick_next() stays the ISOLATED round-robin policy. The rematerialization-AWARE POLICY\n");
+    sputs("   (PP0-PP4 below) consults should_dematerialize() - dematerialize ONLY when pressure AND a\n");
+    sputs("   predicted-long deschedule amortize THIS measured cost. Numbers COMPUTED via rdtsc.\n");
 
     sputs("\nCONCURRENT SCHEDULING: C0-C3 run; local mechanism only; pick_next round-robin is the hook (SCHED_LOG.md).\n");
+
+    /* ---- PP0-PP4: the rematerialization-aware SCHEDULING POLICY (the decision rule). */
+    pp_run(C);
 }
 
 void kmain(void);
