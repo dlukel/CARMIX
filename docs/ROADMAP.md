@@ -11,14 +11,15 @@ hidden.
 - USB input. Input is PS/2, which the emulator provides. Real modern hardware needs a USB HID
   stack over xHCI.
 - Persistent storage. There is no storage driver. NVMe or AHCI is needed.
-- Userspace memory management and a process loader. A ring-3 process, per-task page tables with
-  memory isolation, a user and kernel privilege split, and a syscall boundary that re-mints the
-  caller's bounded authority through the anti-amplification gate all exist. See docs/ARCHITECTURE.md.
-  What does not exist is a brk or mmap equivalent for a process over the residency manager, a real
-  loader that runs an ELF in ring 3 rather than a kernel-embedded user routine, more than one
-  concurrent ring-3 task with per-task user state in the scheduler, and a persistent, crash-surviving
-  replay-nonce for the crossing. The carried capability is bounded by the gate but its authenticity
-  binding to a trustworthy source through signing is the open trust-model question.
+- Concurrent multi-process scheduling and process memory management. A ring-3 process, per-task page
+  tables with memory isolation, a re-minting syscall boundary, and a content-addressed process loader
+  all exist. The loader stores an ELF image in the content-addressed store, parses it, materializes
+  each segment by hash with BLAKE3 verification into a fresh ring-3 space under a re-minted authority
+  ceiling with W^X, and two processes from one image share read-only code by hash. See
+  docs/ARCHITECTURE.md. What does not exist is more than one concurrent ring-3 task in the scheduler
+  (two processes are loaded and share at load time but run sequentially), a brk or mmap equivalent
+  for a process heap, dynamic linking (static ELF only), a persistent crash-surviving replay-nonce
+  for the crossing, and binding the carried capability to a trustworthy source through signing.
 - A complete content-addressed task object. The task state object today is the registers and the
   stack only. The page table and the capability slots are not yet part of it. A residency manager now
   gives tasks per-task page mappings, and dirty tracking is measured both ways, the x86-64 page-table

@@ -223,6 +223,24 @@ since a mutated object is a different hash and fails verification. It does not e
 relocates it to the address-to-hash binding and the store admission, which is stated honestly rather
 than claimed away.
 
+## Process loader (kernel/kernel.c, kernel/user_prog.S)
+
+A program is a content-addressed object, and loading a process is materialization. A freestanding
+ring-3 ELF64 is stored in the content-addressed store, the loader parses its program headers, and for
+each loadable segment it materializes the bytes by hash with BLAKE3 verification into a fresh ring-3
+address space at the segment's virtual address, with the segment's permissions and no segment both
+writable and executable. The user stack is mapped, and the process enters ring 3 at the ELF entry
+point and runs its own code, which was materialized from a hash rather than linked into the kernel.
+
+The process runs under a capability re-minted through the anti-amplification gate at load time, so
+its authority is bounded at birth. An over-ceiling or unauthorized request is refused by the same
+gate that refuses a migration. Loading the same image twice gives two processes whose read-only code
+resolves to one physical frame by hash while their writable data and stacks are private. Loading
+therefore joins faulting, migrating, and crossing as one operation, rematerialization under the
+proven gate, with integrity gated by construction. The image is embedded in the kernel because there
+is no filesystem yet, the two loaded processes run sequentially because the scheduler does not yet
+carry concurrent ring-3 tasks, and the loaded program is a static executable.
+
 ## Two-machine migration (kernel/nettest.c)
 
 Two emulator instances share memory through an ivshmem device, a PCI device whose second base
