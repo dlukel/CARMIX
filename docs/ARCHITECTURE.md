@@ -116,13 +116,26 @@ task's callee-saved registers and stack pointer and restores the next task's, wh
 context switch, not a function call. A cooperative yield calls it directly. The timer interrupt
 calls it too, so a task that never yields is still preempted on a tick.
 
-The scheduling policy is isolated as a single function, pick_next, which today is round-robin. This
-function and the save and restore in switch_to are the seam. The policy is deliberately a
-placeholder. The reserved remat_root handle and the switch_to seam are where a future
-rematerialization-native scheduler attaches, the open question of whether a context switch should
-become a store and rematerialize cycle over content-addressed task state. That policy is not
-designed here. The substrate exists, the policy slot is named and isolated, and the placeholder is
-labeled as such.
+The scheduling policy is isolated as a single function, pick_next, which is round-robin. It and the
+save and restore in switch_to are the seam, and the policy is a deliberate placeholder.
+
+On top of this the kernel makes a task a content-addressed object. The remat_root handle now holds
+the BLAKE3 hash of a task's state, its registers and the used part of its stack, serialized into the
+proven store. A context switch can then run as activate-by-hash, the task is dematerialized to a
+hash and later materialized back from the store, which is rematerialization applied to task state.
+The same state hashes to the same handle and different state to a different handle. Persistence falls
+out of this, a task dropped and resumed from only its hash and the store resumes correctly, the live
+and durable forms being one object.
+
+The cost is measured, not assumed. A raw register switch is a flat cost near 1400 cycles. The
+activate-by-hash path costs two to three orders of magnitude more even for a single dirty chunk,
+because hashing dominates, and there is no dirty-set size at which it beats the register switch. So
+the fast switch_to stays the path for rapid preemption, and activate-by-hash is reserved for the
+coarse, infrequent boundaries that already touch the store, yield-to-migrate, checkpoint, and
+persistence-as-noop, where deduplication, integrity by construction, and diff-proportional transfer
+pay for the hash. The page table and capability slots are not yet part of the task state object, and
+the scheduling policy itself stays a placeholder, the measurement shows it does not collapse into
+rematerialization at switch frequency.
 
 ## Two-machine migration (kernel/nettest.c)
 

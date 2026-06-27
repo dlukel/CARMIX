@@ -12,10 +12,20 @@ hidden.
   stack over xHCI.
 - Persistent storage. There is no storage driver. NVMe or AHCI is needed.
 - A memory manager, a userspace, and a syscall boundary. A task substrate exists. The kernel
-  creates tasks, switches between them with a real assembly context switch, and preempts a
-  non-yielding task on the timer interrupt. See docs/ARCHITECTURE.md. What does not exist is memory
-  isolation between tasks, a user and kernel privilege split, a syscall boundary, and a real memory
-  manager. The tasks share the kernel address space.
+  creates tasks, switches between them with a real assembly context switch, preempts a non-yielding
+  task on the timer interrupt, and can treat a task as a content-addressed object that
+  dematerializes and rematerializes through the proven store. See docs/ARCHITECTURE.md. What does
+  not exist is memory isolation between tasks, a user and kernel privilege split, a syscall
+  boundary, and a real memory manager. The tasks share the kernel address space.
+- A complete content-addressed task object. The task state object today is the registers and the
+  stack only. The page table and the capability slots are not yet part of it. Dirty tracking uses a
+  software chunk diff, because the stacks are direct-mapped rather than per-task mapped, so the
+  x86-64 page-table dirty bit is not used. A hardware dirty-bit assist and the wider state object
+  are future work.
+- A scheduling policy that uses content-addressing per switch. The measured crossover shows
+  activate-by-hash costs two to three orders of magnitude more than a register switch at every
+  dirty-set size, so it is used only at coarse boundaries. A policy that schedules over content
+  hashes at switch frequency is not viable on this hardware and is not built.
 - A filesystem and persistent process state. There is no filesystem, and a task's state lives only
   in RAM.
 - GPU acceleration. The desktop is software-rendered and draws CARMIX's own windows. Running

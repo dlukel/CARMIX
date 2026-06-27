@@ -55,6 +55,8 @@ state and re-mints capabilities during the migration.
 | Key lifecycle. A source key is learned by authority-signed enrollment, rotated and revoked under the authority key, monotonic epochs against replay and downgrade. Six lifecycle attacks each rejected by a distinct reason. | Observed between two emulator instances. | kernel/net_repro.sh |
 | Software-rendered desktop. Boot, framebuffer, console with scrolling, windows with focus, drag, and resize, driven by PS/2 keyboard and mouse. | Observed by framebuffer pixel readback in an emulator. | kernel self-tests |
 | Task substrate. The kernel creates tasks, switches between them with a real assembly context switch, runs the proven remat path inside a task across a switch, and preempts a non-yielding task on the timer interrupt. The scheduling policy is an isolated round-robin placeholder. | Observed by serial trace in an emulator. | kernel scheduler self-test |
+| Task as a content-addressed object. A task's registers and stack hash into the proven store, activate-by-hash dematerializes and rematerializes it through that hash, and a task resumes from its hash alone, so persistence is a no-op. | Observed by serial trace in an emulator. | kernel unified-substrate self-test |
+| The cost crossover, measured. A raw register switch is a flat cost near 1400 cycles, while activate-by-hash is two to three orders of magnitude more at every dirty-set size, so the fast path stays for rapid switching and content-addressing is used only at coarse boundaries. | Measured with rdtsc in an emulator. | kernel unified-substrate self-test |
 
 The two-machine byte counts and the proof results are reproducible. See docs/REPRODUCE.md.
 

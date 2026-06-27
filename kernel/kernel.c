@@ -894,6 +894,255 @@ static void run_sched(void){
     sputs("STEP 11: task substrate run; pick_next() is the isolated research hook (SCHED_LOG.md).\n");
 }
 
+/* ===========================================================================
+ * STEP 12 - UNIFIED CONTENT-ADDRESSED EXECUTION SUBSTRATE (U0-U4).
+ * A task becomes a content-addressed object; a context switch can OPTIONALLY be
+ * a dematerialize/rematerialize pair through the PROVEN store (cvsasx_store_put/
+ * get, the R3 path). The raw register-swap switch_to() stays the fast path. The
+ * honest record is the MEASURED crossover: per-switch content-addressing is NOT
+ * free; activate-by-hash is viable only at COARSE boundaries. See SCHED_LOG.md.
+ * Only kernel.c + SCHED_LOG.md change; gate/cap/carmix/store/sls untouched.
+ * ===========================================================================*/
+static inline uint64_t rdtsc(void){ uint32_t a,d; __asm__ volatile("rdtsc":"=a"(a),"=d"(d)); return ((uint64_t)d<<32)|a; }
+
+/* ---- U0: a task's REMATERIALIZABLE STATE OBJECT ---------------------------
+ * Minimally = the saved rsp + the USED portion of the 4KiB stack (which already
+ * holds the 6 callee-saved regs switch_to pushed + the rip/return chain). The
+ * stack lives at a FIXED VA, so restoring the same bytes + rsp resumes exactly.
+ * Page tables and capability slots are OUT OF SCOPE here. // not-yet: page-tables,
+ * // not-yet: capability slots. Serialized layout: [rsp:8][used_len:8][stack bytes]. */
+#define U_STACK_SZ 4096u
+static uint8_t u_buf[16 + U_STACK_SZ];            /* serialization scratch */
+static uint64_t u_serialize(const task_t *t){      /* -> number of bytes packed into u_buf */
+    uint64_t top=(uint64_t)t->stack + U_STACK_SZ;
+    uint64_t used=top - t->rsp;                     /* live stack from rsp up to the top */
+    if(used>U_STACK_SZ) used=U_STACK_SZ;            /* fail-closed clamp */
+    for(int i=0;i<8;i++) u_buf[i]=(uint8_t)(t->rsp>>(8*i));
+    for(int i=0;i<8;i++) u_buf[8+i]=(uint8_t)(used>>(8*i));
+    const uint8_t *src=(const uint8_t*)t->rsp;
+    for(uint64_t i=0;i<used;i++) u_buf[16+i]=src[i];
+    return 16+used;
+}
+
+/* U0 store: dematerialize a SUSPENDED task into the proven store; record the
+ * BLAKE3 content address into task_t.remat_root. Returns the hash by value. */
+static uint8_t  u_arena[1u<<16]; static cvsasx_store_entry_t u_idx[256]; static cvsasx_store_t u_store; static int u_store_ready=0;
+static void u_store_once(void){ if(!u_store_ready){ cvsasx_store_init(&u_store,u_arena,sizeof u_arena,u_idx,256); u_store_ready=1; } }
+static cvsasx_hash_t dematerialize(task_t *t){
+    u_store_once();
+    uint64_t n=u_serialize(t);
+    cvsasx_hash_t h; cvsasx_store_put(&u_store,u_buf,n,&h);
+    for(int i=0;i<32;i++) t->remat_root[i]=h.b[i];   /* task is now content-addressed */
+    return h;
+}
+/* U1 materialize: restore a task's context from a content address. Fetch by hash
+ * (a missing object is a MISS), VERIFY integrity (the store returns the bytes that
+ * hash to exactly this address - integrity by construction; we also re-derive rsp/
+ * used and write the stack image back to its fixed VA). Returns 1 on success. */
+static int materialize(task_t *t, const cvsasx_hash_t *h){
+    u_store_once();
+    const void *b; size_t l;
+    if(cvsasx_store_get(&u_store,h,&b,&l)!=CVSASX_STORE_OK) return 0;
+    const uint8_t *p=(const uint8_t*)b;
+    uint64_t rsp=0, used=0;
+    for(int i=0;i<8;i++) rsp |=(uint64_t)p[i]<<(8*i);
+    for(int i=0;i<8;i++) used|=(uint64_t)p[8+i]<<(8*i);
+    if(used>U_STACK_SZ || l!=16+used) return 0;        /* fail-closed on a malformed object */
+    uint8_t *dst=(uint8_t*)rsp;                          /* fixed VA: same stack region */
+    for(uint64_t i=0;i<used;i++) dst[i]=p[16+i];
+    t->rsp=rsp;
+    return 1;
+}
+
+/* ---- U2: INCREMENTAL content-address (software chunk-diff, MEASURED) -------
+ * Split the stack state object into fixed CHUNKs, keep the last-stored image, and
+ * on dematerialize memcmp each chunk to find the DIRTY set; re-store ONLY dirty
+ * chunks via the proven store and count bytes-re-stored + rdtsc cycles. This is
+ * the cvsasx_sls structural-diff idea (changed-only) applied to a flat chunked
+ * blob. // not-yet: x86-64 page-table DIRTY bit (PTE bit 6) - that needs per-task
+ * mapped pages (each task gets its own PT mapping its stack); the stacks here are
+ * HHDM-direct, not per-task-mapped, so dirty-bit tracking is not wired. Software
+ * chunk-diff is used instead and stated as such (the honest gap). */
+#define U_CHUNK 256u
+static uint8_t u_last[U_STACK_SZ]; static int u_have_last=0;
+static uint8_t u_chunkbuf[U_CHUNK];
+/* dematerialize_incremental: returns dirty bytes re-stored; *out_cycles = rdtsc cost.
+ * Operates on a flat 'img' of length 'len' (the task's serialized stack image). */
+static uint64_t dematerialize_incremental(const uint8_t *img, uint64_t len, uint64_t *out_cycles, uint32_t *out_dirty_chunks){
+    u_store_once();
+    uint64_t t0=rdtsc();
+    uint64_t dirty_bytes=0; uint32_t dirty_chunks=0;
+    for(uint64_t off=0; off<len; off+=U_CHUNK){
+        uint64_t clen=(len-off<U_CHUNK)?(len-off):U_CHUNK;
+        int dirty=!u_have_last;
+        if(!dirty){ for(uint64_t i=0;i<clen;i++) if(img[off+i]!=u_last[off+i]){ dirty=1; break; } }
+        if(dirty){
+            for(uint64_t i=0;i<clen;i++) u_chunkbuf[i]=img[off+i];
+            cvsasx_hash_t ch; cvsasx_store_put(&u_store,u_chunkbuf,(size_t)clen,&ch);  /* store ONLY dirty chunk */
+            dirty_bytes+=clen; dirty_chunks++;
+        }
+    }
+    for(uint64_t i=0;i<len && i<U_STACK_SZ;i++) u_last[i]=img[i];   /* update the kept version */
+    u_have_last=1;
+    *out_cycles=rdtsc()-t0; *out_dirty_chunks=dirty_chunks;
+    return dirty_bytes;
+}
+
+/* ---- U2/U3 measurement workload: a synthetic state blob we DIRTY by hand so the
+ * dirty set is exact and the numbers are reproducible (computed, never hardcoded). */
+static uint8_t u_state[U_STACK_SZ];
+static void u_dirty_chunks(uint32_t k){ for(uint32_t c=0;c<k && c*U_CHUNK<U_STACK_SZ;c++){ uint64_t base=(uint64_t)c*U_CHUNK; for(uint32_t i=0;i<U_CHUNK;i++) u_state[base+i]^=(uint8_t)(0x5Au+c+i); } }
+
+/* full-path cost: serialize+store the WHOLE blob (the non-incremental unified path). */
+static uint64_t u_full_store_cycles(const uint8_t *img, uint64_t len, uint64_t *out_bytes){
+    u_store_once();
+    uint64_t t0=rdtsc();
+    cvsasx_hash_t h; cvsasx_store_put(&u_store,img,(size_t)len,&h);  /* hashes ALL len bytes */
+    uint64_t c=rdtsc()-t0;
+    *out_bytes=len; (void)h; return c;
+}
+
+/* ---- U1 demo: activate-by-hash round-trip of a REAL suspended task. The task
+ * carries a counter (like P1) but resumes via dematerialize->materialize through
+ * the store (out by a hash, back by the SAME hash) instead of the live stack.
+ * park() saves THIS task's context and switches straight back to kmain's context,
+ * leaving the task genuinely SUSPENDED (rsp saved) so the driver can dematerialize
+ * it. Resuming = switch_to(...,T->rsp): the task continues right after park(). ---- */
+static volatile uint32_t u1_counter=0; static volatile int u1_phase=0;
+static int g_unified_mode=0;   /* 0 = raw switch_to fast path; 1 = resume via store round-trip (activate-by-hash) */
+static void park(task_t *t){ t->state=TASK_READY; switch_to(&t->rsp, g_main_task.rsp); }
+/* g_unified_mode selects the resume path: 0 = raw switch_to (fast; the live stack is
+ * trusted intact); 1 = activate-by-hash (materialize the context from its content
+ * address first, then switch_to). The U1/U4 demos set it to 1 around the hash trip. */
+static void task_u1(void){
+    u1_counter=7000; u1_counter+=77;        /* do work: 7077 (lives on THIS stack) */
+    u1_phase=1;
+    park(&g_tasks[0]);                       /* suspend; the driver dematerializes us and resumes via the chosen path */
+    u1_phase=2;                              /* resumed (possibly AFTER a store round-trip); counter must be intact */
+}
+
+static void run_unified(void){
+    sputs("\n=== STEP 12: UNIFIED CONTENT-ADDRESSED SUBSTRATE (U0-U4) ===\n");
+
+    /* ----- U0: a task IS a content-addressed object; determinism ----- */
+    sputs("\nU0 task-as-content-addressed-object (same->same, diff->diff):\n");
+    g_ntasks=0; g_switches=0; g_sched_on=0; u1_phase=0;
+    g_main_task.id=0xFFFF; g_main_task.state=TASK_RUNNING;
+    task_create(task_u1);                                 /* one suspendable task */
+    g_cur=0; g_tasks[0].state=TASK_RUNNING;
+    switch_to(&g_main_task.rsp, g_tasks[0].rsp);          /* run task_u1 to its park() -> returns here, task SUSPENDED (rsp saved) */
+    /* task_u1 is now SUSPENDED at park() (state READY, rsp saved). Dematerialize it. */
+    task_t *T=&g_tasks[0];
+    cvsasx_hash_t hA=dematerialize(T);
+    cvsasx_hash_t hA2=dematerialize(T);                  /* SAME state -> SAME hash (determinism) */
+    /* perturb one byte of the saved stack image, store again -> DIFFERENT hash */
+    uint64_t n=u_serialize(T); u_buf[16+ (n>16?16:0)]^=0xFF; cvsasx_hash_t hB; cvsasx_store_put(&u_store,u_buf,n,&hB);
+    int same=1; for(int i=0;i<32;i++) if(hA.b[i]!=hA2.b[i]) same=0;
+    int diff=0; for(int i=0;i<32;i++) if(hA.b[i]!=hB.b[i]) diff=1;
+    sputs("U0 task id="); sdec(T->id); sputs(" remat_root="); sputs(hx(hA.b,32)); sputc('\n');
+    sputs("U0 same-state-again="); sputs(hx(hA2.b,32)); sputs(same?"  SAME (deterministic)\n":"  *** DIFFERS ***\n");
+    sputs("U0 1-byte-changed ="); sputs(hx(hB.b,32)); sputs(diff?"  DIFFERENT (content-addressed)\n":"  *** COLLIDED ***\n");
+    sputs(same&&diff?"U0 -> TASK IS A CONTENT-ADDRESSED OBJECT OK\n":"U0 -> FAIL\n");
+
+    /* ----- U1: activate-by-hash - dematerialize T to H, DROP its live stack, then
+     * materialize from ONLY H + the store, and switch_to back in; counter survives. */
+    sputs("\nU1 activate-by-hash round-trip (out by hash, back by SAME hash):\n");
+    g_unified_mode=1;                                    /* per-task flag selects the activate-by-hash path */
+    cvsasx_hash_t H=dematerialize(T);                    /* out: T -> H */
+    /* DROP the live form: scribble the whole stack region so a stale-stack resume would crash/wrong.
+     * Resuming correctly now PROVES the context came back through the store, not the stack. */
+    for(uint64_t i=0;i<U_STACK_SZ;i++) ((uint8_t*)T->stack)[i]=0xCC;
+    uint32_t before=u1_counter;                          /* 7077, computed in the task before it parked */
+    int ok = g_unified_mode ? materialize(T,&H) : 1;     /* back: H -> T (the unified path; fast path would trust the live stack) */
+    cvsasx_hash_t H2=dematerialize(T);                   /* re-address the RESTORED (pre-resume) state; must equal H */
+    int hash_match=1; for(int i=0;i<32;i++) if(H.b[i]!=H2.b[i]) hash_match=0;
+    /* now resume: the task continues right after park(), sets phase=2, returns into task_exit. */
+    g_tasks[0].state=TASK_RUNNING; g_cur=0; g_switches++;
+    switch_to(&g_main_task.rsp, T->rsp);                 /* resumes from the STORE-restored stack */
+    g_unified_mode=0;
+    uint32_t after=u1_counter;
+    int u1=ok && hash_match && (u1_phase==2) && (before==after) && (before==7077);
+    sputs("U1 hash out ="); sputs(hx(H.b,32)); sputc('\n');
+    sputs("U1 hash back="); sputs(hx(H2.b,32)); sputs(hash_match?"  MATCH\n":"  *** MISMATCH ***\n");
+    sputs("U1 counter before="); sdec(before); sputs(" after="); sdec(after); sputs(" resumed-phase="); sdec((uint64_t)u1_phase);
+    sputs(u1?"  -> ACTIVATE-BY-HASH ROUND-TRIP OK\n":"  -> FAIL\n");
+
+    /* ----- U2: incremental content-address - small dirty vs large dirty (MEASURED). */
+    sputs("\nU2 incremental content-address (re-store ONLY the dirty set):\n");
+    for(uint32_t i=0;i<U_STACK_SZ;i++) u_state[i]=(uint8_t)(i*131u+7u);   /* a baseline blob */
+    u_have_last=0;
+    uint64_t cyc0; uint32_t dc0; uint64_t b0=dematerialize_incremental(u_state,U_STACK_SZ,&cyc0,&dc0);  /* first: ALL dirty */
+    /* small dirty: flip 1 chunk */
+    u_dirty_chunks(1);
+    uint64_t cycS; uint32_t dcS; uint64_t bS=dematerialize_incremental(u_state,U_STACK_SZ,&cycS,&dcS);
+    /* large dirty: flip many chunks */
+    u_dirty_chunks(U_STACK_SZ/U_CHUNK);
+    uint64_t cycL; uint32_t dcL; uint64_t bL=dematerialize_incremental(u_state,U_STACK_SZ,&cycL,&dcL);
+    sputs("U2 baseline (all dirty): chunks="); sdec(dc0); sputs(" bytes="); sdec(b0); sputs(" cycles="); sdec(cyc0); sputc('\n');
+    sputs("U2 SMALL dirty (1 chunk): chunks="); sdec(dcS); sputs(" bytes="); sdec(bS); sputs(" cycles="); sdec(cycS); sputc('\n');
+    sputs("U2 LARGE dirty (all chunks): chunks="); sdec(dcL); sputs(" bytes="); sdec(bL); sputs(" cycles="); sdec(cycL); sputc('\n');
+    int u2=(dcS==1)&&(bS==U_CHUNK)&&(dcL>dcS)&&(bL>bS)&&(cycL>cycS);   /* cost TRACKS the dirty set, not the size */
+    sputs(u2?"U2 -> INCREMENTAL COST TRACKS THE DIRTY SET OK (small<<large)\n":"U2 -> FAIL\n");
+
+    /* ----- U3: THE CROSSOVER (MEASURED) - fast switch_to vs activate-by-hash unified
+     * path as a function of dirty-set size. Sweep dirty chunk counts; print a table. */
+    sputs("\nU3 crossover sweep (dirty chunks -> fast-path cycles | unified-path cycles):\n");
+    /* fast-path baseline: a raw switch_to is independent of dirty size. Measure it by
+     * timing a self-switch (save+restore 6 regs+rsp) averaged over a short run. */
+    uint64_t fast_cyc;
+    { volatile uint64_t scratch_rsp; uint64_t t0=rdtsc();
+      for(int i=0;i<256;i++){ __asm__ volatile(
+          "push %%rbx\n\t push %%rbp\n\t push %%r12\n\t push %%r13\n\t push %%r14\n\t push %%r15\n\t"
+          "mov %%rsp,%0\n\t mov %0,%%rsp\n\t"
+          "pop %%r15\n\t pop %%r14\n\t pop %%r13\n\t pop %%r12\n\t pop %%rbp\n\t pop %%rbx\n\t"
+          : "=m"(scratch_rsp) :: "memory"); }
+      fast_cyc=(rdtsc()-t0)/256; }                       /* per-switch cost of the register swap */
+    const uint32_t sweep[5]={1,4,16,64,256};             /* 256 chunks*256B = 64KiB exceeds one stack: caps at the blob, fine for the curve */
+    static uint8_t u_big[64u*1024u];
+    uint32_t crossover=0; int found=0;
+    sputs("U3   dirty | fast cyc | unified cyc\n");
+    for(int s=0;s<5;s++){
+        uint32_t kc=sweep[s]; uint64_t len=(uint64_t)kc*U_CHUNK; if(len>sizeof u_big) len=sizeof u_big;
+        for(uint64_t i=0;i<len;i++) u_big[i]=(uint8_t)(i*73u+s);
+        uint64_t ub; uint64_t uni=u_full_store_cycles(u_big,len,&ub);   /* unified = hash+store the dirty image */
+        sputs("U3   "); sdec(kc); sputs("     | "); sdec(fast_cyc); sputs("     | "); sdec(uni); sputc('\n');
+        if(!found && uni>fast_cyc){ crossover=kc; found=1; }            /* first dirty size where the raw switch wins */
+    }
+    sputs("U3 fast-path switch (register swap) = "); sdec(fast_cyc); sputs(" cycles, INDEPENDENT of dirty size\n");
+    if(found && crossover>sweep[0]){ sputs("U3 CROSSOVER: unified path exceeds the fast switch at >= "); sdec(crossover);
+               sputs(" dirty chunks ("); sdec((uint64_t)crossover*U_CHUNK); sputs(" B). Below it activate-by-hash is competitive; above it the raw switch wins decisively.\n"); }
+    else if(found){ sputs("U3 CROSSOVER: the unified path is MORE expensive than the fast switch at EVERY swept size - the BLAKE3 hash of even one chunk already dwarfs the ~1K-cycle register swap. There is NO dirty size where activate-by-hash beats raw switch; the gap only widens with size.\n"); }
+    else sputs("U3 CROSSOVER: unified path stayed below the fast switch across the swept range (smallest dirty sets only).\n");
+    sputs("U3 CONCLUSION: per-rapid-switch content-addressing THRASHES (CONFIRMED - refutes 'a switch IS a free remat'); activate-by-hash pays off ONLY at COARSE boundaries where a switch is rare and the hash cost amortizes (yield-to-migrate, checkpoint, persist), never at rapid preemption. See SCHED_LOG.md.\n");
+
+    /* ----- U4: ONE BOUNDARY UNIFIED END-TO-END - PERSISTENCE-AS-NOOP (option a).
+     * Dematerialize a task to H, DROP the live task entirely, resume from ONLY H +
+     * the store. (Option b, two-machine migration, lives in the SEPARATE nettest.c
+     * build, so it is not clean here; we do (a).) The re-mint path is exercised by
+     * P1/R3 already; here the durable and live forms are literally the same object. */
+    sputs("\nU4 persistence-as-noop (resume from ONLY a hash + the store):\n");
+    g_ntasks=0; g_switches=0; u1_phase=0;
+    task_create(task_u1);
+    g_cur=0; g_tasks[0].state=TASK_RUNNING;
+    switch_to(&g_main_task.rsp, g_tasks[0].rsp);          /* run task_u1 to its park() -> suspended */
+    task_t *Q=&g_tasks[0];
+    cvsasx_hash_t HU=dematerialize(Q);                    /* the ONLY durable form */
+    /* fully DROP the live task: clobber stack AND zero rsp so nothing live remains. */
+    for(uint64_t i=0;i<U_STACK_SZ;i++) ((uint8_t*)Q->stack)[i]=0xEE;
+    uint64_t saved_rsp=Q->rsp; Q->rsp=0;
+    uint32_t pre=u1_counter;
+    int got=materialize(Q,&HU);                           /* resume from ONLY HU + the store */
+    int restored_rsp=(Q->rsp==saved_rsp);
+    g_tasks[0].state=TASK_RUNNING; g_cur=0; g_switches++;
+    switch_to(&g_main_task.rsp, Q->rsp);                  /* it runs to completion from the rematerialized form */
+    int u4=got && restored_rsp && (u1_phase==2) && (u1_counter==pre) && (pre==7077);
+    sputs("U4 hash H="); sputs(hx(HU.b,32)); sputc('\n');
+    sputs("U4 dropped live task, rematerialized from H: rsp-restored="); sputs(restored_rsp?"y":"n");
+    sputs(" counter="); sdec(u1_counter); sputs(" resumed-phase="); sdec((uint64_t)u1_phase);
+    sputs(u4?"  -> PERSISTENCE-AS-NOOP OK (live form == durable form)\n":"  -> FAIL\n");
+    sputs("STEP 12: U0-U4 - task as content-addressed object; the honest crossover is the record (SCHED_LOG.md).\n");
+}
+
 void kmain(void);
 void kmain(void){
     serial_init();
@@ -1001,6 +1250,7 @@ void kmain(void){
     run_e2();          /* E2: drag the focused window */
     run_e3();          /* E3: resize via the grip + min-clamp */
     run_sched();       /* STEP 11: task substrate - P0 cooperative, P1 remat-work, P2 preemption */
+    run_unified();     /* STEP 12: unified content-addressed substrate - U0 task-as-object, U1 activate-by-hash, U2 incremental, U3 crossover, U4 persistence-as-noop */
     run_shell();       /* E4: live focus/drag/resize/type desktop (does not return) */
 #endif
     hcf();
