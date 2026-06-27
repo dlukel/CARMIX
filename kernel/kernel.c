@@ -113,8 +113,18 @@ static void fault_dump(int vec, uint64_t err, struct iframe *f){
 }
 __attribute__((interrupt)) static void isr_ud(struct iframe *f){ fault_dump(6,0,f); }
 __attribute__((interrupt)) static void isr_gp(struct iframe *f, uint64_t e){ fault_dump(13,e,f); }
+/* The REMATERIALIZING FAULT HANDLER (F0-F5): #PF is now RESUMABLE. The
+ * __attribute__((interrupt)) convention already saves all GPRs and ends with iretq;
+ * RETURNING from this ISR resumes the faulting instruction. pf_service classifies the
+ * fault, resolves vaddr->hash, materializes+verifies, and maps; on success we just
+ * return (resume). On a fail-closed verdict (protection, no binding, store miss, verify
+ * mismatch) we dump+halt - fail-loud, never resume with bad/absent bytes. */
+static int pf_service(uint64_t cr2, uint64_t err, uint64_t rip);   /* defined below, near run_fault */
 __attribute__((interrupt)) static void isr_pf(struct iframe *f, uint64_t e){
-    uint64_t cr2; __asm__ volatile("mov %%cr2,%0":"=r"(cr2)); sputs("  (#PF cr2="); sx64(cr2); sputs(")\n"); fault_dump(14,e,f); }
+    uint64_t cr2; __asm__ volatile("mov %%cr2,%0":"=r"(cr2));
+    if(pf_service(cr2, e, f->rip)) return;   /* SERVICED: iretq (implicit) -> faulting insn re-executes */
+    sputs("  (#PF NOT serviced - fail-closed)\n"); fault_dump(14,e,f);   /* fail-loud, halt */
+}
 /* AUDIT A6 fix: #DF (8) and a catch-all over the 0-31 CPU-exception range, split by the
  * error-code-pushing vectors, so a stray/nested exception DUMPS instead of silently
  * triple-faulting. not implemented: an IST/TSS stack for #DF (a kernel-stack fault still escalates
@@ -1388,7 +1398,10 @@ static int rset_add(const cvsasx_hash_t *h, uint64_t frame){
 
 /* MEASURED counters for the research questions (computed, never hardcoded). */
 static uint64_t rm_bytes_materialized, rm_bytes_saved_dedup, rm_materialize_cycles, rm_dedup_cycles;
-static uint64_t rm_evictions, rm_writebacks, rm_faults, rm_hits;
+static uint64_t rm_evictions, rm_writebacks;
+/* rm_faults/rm_hits are mutated inside rm_materialize, which now runs from the #PF ISR
+ * (pf_service) and is read in mainline (F3): volatile so the compiler re-reads, not caches. */
+static volatile uint64_t rm_faults, rm_hits;
 
 /* rm_materialize(hash) -> frame: the binding "materialize(hash)->frame" COLLAPSED
  * fault-in (rm_ prefix avoids the STEP 12 task-level materialize()). If the hash is
@@ -1702,6 +1715,322 @@ static void run_m5(void){
     framedb_init();
 }
 
+/* ===========================================================================
+ * REMATERIALIZING FAULT HANDLER (F0-F5) - completes the demand-paging path the
+ * residency manager (M2) left as an explicit call. A stray access to a not-resident
+ * object TRAPS via #PF (vector 14), the handler services the miss by VERIFIED
+ * materialize-by-hash from the proven store (rm_materialize), installs the mapping
+ * (mm_map), and the faulting instruction RESUMES with correct data.
+ *
+ * BINDING DESIGN LAW (the fault-in report), implemented as classified:
+ *   trap entry on #PF         -> IRREDUCIBLE HARDWARE: vector-14 IDT entry, CR2,
+ *                                error code, resume via iretq. The __attribute__
+ *                                ((interrupt)) ISR already saves all GPRs and emits
+ *                                iretq; RETURNING from it resumes the faulting insn.
+ *   fault classification      -> PARTIALLY COLLAPSES: not-present (err bit0==0) is a
+ *                                MISS to service; protection (bit0==1) is NOT a miss.
+ *   locate object for fault   -> vaddr->hash RESOLUTION (the new piece; A and B
+ *                                below, measured with rdtsc).
+ *   fetch page contents       -> materialize-by-hash: rm_materialize (fetch + VERIFY
+ *                                BLAKE3). Store miss / verify fail is FAIL-CLOSED.
+ *   validate fetched contents -> STRENGTHENED: rm_materialize re-hashes the loaded
+ *                                bytes; BLAKE3(loaded)==hash gates the resume.
+ *   install mapping           -> mm_map into the CURRENT address space before resume.
+ *   resume                    -> iretq to the faulting instruction (re-executes, now
+ *                                mapped, succeeds).
+ *
+ * HANDLER SAFETY: the handler's code, stack, and ALL binding metadata live in normal
+ * kernel/HHDM memory, which is direct-mapped and inherently resident. The ONLY
+ * not-present pages are the test demand-paged regions. pf_assert_resident() proves
+ * this BEFORE arming the fault path, so servicing a miss cannot itself fault.
+ * See kernel/FAULT_LOG.md. Numbers are COMPUTED via rdtsc, never hardcoded.
+ * ===========================================================================*/
+
+/* ---- BINDING A: side table keyed by vaddr range -> hash. One linear lookup per
+ * miss. Bounded, no alloc, resident in kernel .bss. */
+#define PF_BIND_A_MAX 16u
+typedef struct { uint64_t va_lo, va_hi; cvsasx_hash_t hash; int live; } pf_bindA_t;
+static pf_bindA_t pf_bindA[PF_BIND_A_MAX]; static uint32_t pf_bindA_n;
+static void pf_bindA_add(uint64_t va_lo, uint64_t va_hi, const cvsasx_hash_t *h){
+    if(pf_bindA_n<PF_BIND_A_MAX){ pf_bindA[pf_bindA_n].va_lo=va_lo; pf_bindA[pf_bindA_n].va_hi=va_hi;
+        pf_bindA[pf_bindA_n].hash=*h; pf_bindA[pf_bindA_n].live=1; pf_bindA_n++; } }
+static const cvsasx_hash_t *pf_bindA_lookup(uint64_t va){
+    for(uint32_t i=0;i<pf_bindA_n;i++) if(pf_bindA[i].live && va>=pf_bindA[i].va_lo && va<pf_bindA[i].va_hi)
+        return &pf_bindA[i].hash;
+    return 0;
+}
+
+/* ---- BINDING B: not-present-PTE -> descriptor indirection. A not-present PTE
+ * (bit 0 == 0) leaves bits 1..62 free to hardware; we stash a descriptor index
+ * there ((idx<<1)|PF_B_TAG) with bit 0 CLEAR (still not-present). The descriptor
+ * table holds the hash. Handler does mm_walk -> read PTE -> extract idx -> one
+ * extra deref for the hash. Keeps handler/store metadata separate from the PTE. */
+#define PF_BIND_B_MAX 16u
+#define PF_B_TAG  0x800ULL   /* bit 11 (sw-available in a not-present PTE) marks a B-descriptor PTE */
+typedef struct { cvsasx_hash_t hash; int live; } pf_bindB_t;
+static pf_bindB_t pf_bindB[PF_BIND_B_MAX]; static uint32_t pf_bindB_n;
+/* encode a not-present PTE that points at descriptor idx (bit0 clear => #PF on access) */
+static uint64_t pf_bindB_pte(uint32_t idx){ return ((uint64_t)idx<<12) | PF_B_TAG; }  /* idx in bits 12+, tag bit 11, bit0=0 */
+static int pf_bindB_is(uint64_t pte){ return (pte&1)==0 && (pte&PF_B_TAG); }          /* not-present AND tagged */
+static uint32_t pf_bindB_idx(uint64_t pte){ return (uint32_t)(pte>>12); }
+static uint32_t pf_bindB_add(const cvsasx_hash_t *h){
+    if(pf_bindB_n>=PF_BIND_B_MAX) return 0xffffffffu;
+    pf_bindB[pf_bindB_n].hash=*h; pf_bindB[pf_bindB_n].live=1; return pf_bindB_n++;
+}
+
+/* The active address space the fault path services into (the running CR3). Set from
+ * the current CR3 before arming. The handler maps into THIS space and re-executes. */
+static uint64_t pf_space;
+
+/* re-entrancy guard + counters. pf_in_handler catches a fault DURING fault handling
+ * (re-entry): the handler set it on entry; if it is already set we are nested. */
+static volatile int pf_in_handler;
+static volatile uint64_t pf_nested_seen;
+/* mutated in pf_service (#PF ISR), read in mainline F4: volatile so reads re-fetch. */
+static volatile uint64_t pf_svc_cyc_A, pf_svc_cyc_B; static volatile uint32_t pf_svc_n_A, pf_svc_n_B;
+static volatile int pf_last_serviced;   /* 1 if last #PF was serviced (resumed), 0 if fail-closed */
+static volatile uint64_t pf_last_frame; /* frame the last service installed (for F3 dedup proof) */
+
+/* pf_service(cr2, err, rip): the C core of the rematerializing fault handler.
+ * Returns 1 to RESUME (mapping installed), 0 to FAIL-CLOSED (caller dumps+halts).
+ * Classifies first, resolves vaddr->hash via A or B, materializes+verifies, maps. */
+static int pf_service(uint64_t cr2, uint64_t err, uint64_t rip){
+    if(pf_in_handler){ pf_nested_seen++; return 0; }   /* RE-ENTRANCY: a fault during fault handling */
+    pf_in_handler=1;
+    int present = err & 1;                              /* bit0: 1 => protection, 0 => not-present */
+    int write   = (err>>1)&1, user=(err>>2)&1;
+    sputs("  #PF @vaddr="); sx64(cr2); sputs(" rip="); sx64(rip);
+    sputs(" err="); sx64(err); sputs(" ["); sputs(present?"PRESENT/protection":"not-present/MISS");
+    sputs(write?",write":",read"); sputs(user?",user":",kernel"); sputs("]\n");
+    if(present){                                        /* protection fault is NOT a miss: do not service */
+        sputs("  -> classified PROTECTION (present=1): NOT a miss, not serviced.\n");
+        pf_in_handler=0; pf_last_serviced=0; return 0;
+    }
+    uint64_t va_pg = cr2 & ~0xfffULL;
+    /* resolve vaddr->hash. Try BINDING B first (PTE-encoded), else BINDING A (side table). */
+    const cvsasx_hash_t *h=0; const char *via=0; uint64_t t0=rdtsc();
+    uint64_t *pte = mm_walk(pf_space, va_pg, 0);
+    if(pte && pf_bindB_is(*pte)){
+        uint32_t idx=pf_bindB_idx(*pte);
+        if(idx<pf_bindB_n && pf_bindB[idx].live){ h=&pf_bindB[idx].hash; via="B"; }
+    }
+    if(!h){ const cvsasx_hash_t *ha=pf_bindA_lookup(cr2); if(ha){ h=ha; via="A"; } }
+    if(!h){
+        sputs("  -> no vaddr->hash binding for this address: FAIL-CLOSED (no fabricated mapping).\n");
+        pf_in_handler=0; pf_last_serviced=0; return 0;
+    }
+    sputs("  -> resolved via BINDING "); sputs(via); sputs(" to hash ");
+    for(int i=0;i<6;i++){ int d=h->b[i]; sputc("0123456789abcdef"[(d>>4)&0xf]); sputc("0123456789abcdef"[d&0xf]); }
+    sputs("..\n");
+    /* materialize-by-hash: rm_materialize fetches from the proven store AND re-hashes
+     * the loaded bytes (BLAKE3(loaded)==hash) before returning a frame. 0 = fail-closed. */
+    uint64_t frame = rm_materialize(h);
+    if(!frame){
+        sputs("  -> materialize FAILED (store miss or BLAKE3 verify mismatch): FAIL-CLOSED, no map, no resume.\n");
+        pf_in_handler=0; pf_last_serviced=0; return 0;
+    }
+    /* install the mapping in the running space (read-only: content-addressed frames
+     * are shared read-only by hash; a write would need copy-on-write, out of scope). */
+    if(!mm_map(pf_space, va_pg, frame, user?MM_USER:0)){
+        sputs("  -> mm_map FAILED: FAIL-CLOSED.\n");
+        pf_in_handler=0; pf_last_serviced=0; return 0;
+    }
+    uint64_t cyc=rdtsc()-t0;
+    if(via[0]=='A'){ pf_svc_cyc_A+=cyc; pf_svc_n_A++; } else { pf_svc_cyc_B+=cyc; pf_svc_n_B++; }
+    sputs("  -> materialized+verified -> frame#"); sdec(fr_idx(frame));
+    sputs(" mapped @"); sx64(va_pg); sputs(" (refcount=");
+    sdec(framedb[fr_idx(frame)].refcount); sputs(") service="); sdec(cyc); sputs(" cyc -> RESUME.\n");
+    pf_last_serviced=1; pf_last_frame=frame; pf_in_handler=0;
+    return 1;
+}
+
+/* install a NOT-PRESENT page in pf_space so a touch faults. Walks/creates the tables
+ * (resident kernel memory) but leaves the leaf PTE not-present. For binding B, the
+ * PTE carries the descriptor index; for binding A the PTE is plain not-present (0). */
+static void pf_arm_notpresent(uint64_t va, uint64_t pte_val){
+    uint64_t *pte = mm_walk(pf_space, va & ~0xfffULL, 1);
+    if(pte) *pte = pte_val;   /* bit0 stays clear => #PF on access */
+    __asm__ volatile("invlpg (%0)"::"r"(va):"memory");
+}
+
+/* publish a 4KiB object into the residency store, return its hash (the durable form). */
+static cvsasx_hash_t pf_publish(const uint8_t *buf){
+    rm_store_once(); cvsasx_hash_t h; cvsasx_store_put(&rm_store,buf,4096,&h); return h;
+}
+
+static void run_fault(void){
+    sputs("\n=== REMATERIALIZING FAULT HANDLER: demand-paging via #PF + materialize-by-hash (F0-F5) ===\n");
+    rm_store_once();
+    /* fresh residency state so frame numbers are predictable for the proofs */
+    framedb_init(); rset_n=0; for(uint32_t i=0;i<RSET_MAX;i++) rset[i].live=0;
+    pf_bindA_n=0; pf_bindB_n=0; pf_in_handler=0; pf_nested_seen=0;
+    pf_svc_cyc_A=pf_svc_cyc_B=0; pf_svc_n_A=pf_svc_n_B=0;
+    /* the fault path services into the CURRENT address space (the running CR3) */
+    __asm__ volatile("mov %%cr3,%0":"=r"(pf_space)); pf_space &= ~0xfffULL;
+
+    /* ---- F0: handler safety - PIN/ASSERT-RESIDENT the handler's metadata, then a
+     * deliberate PROTECTION fault proves classification (present=1 => NOT a miss). */
+    sputs("\n-- F0: #PF handler + handler safety (pin assert, protection-fault classification) --\n");
+    /* assert every address the handler dereferences resolves in pf_space (is resident).
+     * If any did NOT, servicing a miss could itself fault (nested). */
+    uint64_t pin[] = { (uint64_t)pf_bindA, (uint64_t)pf_bindB, (uint64_t)rset, (uint64_t)framedb,
+                       (uint64_t)&rm_store, (uint64_t)rm_arena, (uint64_t)&pf_in_handler };
+    int all_resident=1;
+    for(unsigned i=0;i<sizeof pin/sizeof pin[0];i++){ if(!mm_resolve(pf_space, pin[i])){ all_resident=0;
+        sputs("  *** PIN FAIL: handler metadata @"); sx64(pin[i]); sputs(" is NOT resident ***\n"); } }
+    sputs("  pinned (asserted resident): bindA, bindB, rset, framedb, rm_store, rm_arena, guard -> ");
+    sputs(all_resident?"ALL RESIDENT (handler cannot self-fault on its own metadata)\n":"*** NOT ALL RESIDENT ***\n");
+    /* A LIVE protection fault is genuinely unserviceable (remat cannot resolve a write to a
+     * read-only frame), so the real fail-closed handler would dump+halt and end the demo.
+     * To OBSERVE the classification branch without halting the boot, drive pf_service directly
+     * with the exact (CR2, error code) a protection fault presents: a real read-only frame,
+     * present=1 in the error code. The classification serial line is the F0 proof; on the live
+     * path isr_pf routes the same code, returns 0, and dumps+halts (correct fail-closed). */
+    uint64_t pva=0x0000710000000000ULL;
+    uint64_t pf_frame=frame_reserve(); mm_map(pf_space, pva, pf_frame, 0 /* read-only */);
+    int rprot = pf_service(pva, 0x3 /* present(bit0)|write(bit1) */, 0xdead);
+    int f0=all_resident&&(rprot==0);
+    sputs("  pf_service(protection err=0x3) returned "); sdec((uint64_t)rprot);
+    sputs(rprot? "  *** WRONG: serviced a protection fault ***\n"
+              : "  -> NOT serviced (present=1 classified as protection, NOT a miss)\n");
+    sputs("F0 -> "); sputs(f0?"#PF HANDLER + SAFETY (pin + protection-classification) OK\n":"FAIL\n");
+    frame_release_physical(pf_frame); mm_unmap(pf_space, pva);
+
+    /* ---- F1: rematerializing fault-in via BINDING A. Publish an object, bind its
+     * vaddr range -> hash in A, arm a not-present mapping, TOUCH it. The #PF fires
+     * (not-present), the handler resolves via A, materializes+verifies, maps, RESUMES. */
+    sputs("\n-- F1: rematerializing fault-in via BINDING A (automatic demand paging) --\n");
+    static uint8_t objA[4096]; for(int i=0;i<4096;i++) objA[i]=(uint8_t)(i*13u+7u);
+    cvsasx_hash_t hA = pf_publish(objA);
+    uint64_t vaA=0x0000720000000000ULL;
+    pf_bindA_add(vaA, vaA+4096, &hA);
+    pf_arm_notpresent(vaA, 0 /* plain not-present; A resolves by address */);
+    sputs("  armed not-present @"); sx64(vaA); sputs(" bound (via A) to objA's hash. Touching it...\n");
+    uint64_t gotA = *(volatile uint64_t*)vaA;     /* <-- this faults, gets serviced, resumes */
+    uint64_t expA; for(int i=0;i<8;i++) ((uint8_t*)&expA)[i]=objA[i];
+    int f1=(pf_last_serviced==1)&&(gotA==expA);
+    sputs("  read-after-fault @vaA = "); sx64(gotA); sputs(" expected "); sx64(expA);
+    sputs(f1?"  -> CORRECT VALUE, DEMAND-PAGED IN\n":"  -> *** MISMATCH ***\n");
+    sputs("F1 -> "); sputs(f1?"REMATERIALIZING FAULT-IN (BINDING A) OK\n":"FAIL\n");
+
+    /* ---- F2: FAIL-CLOSED on verification failure. Bind a vaddr to a hash whose
+     * stored bytes are CORRUPTED so BLAKE3(loaded) != hash. The handler must NOT map,
+     * NOT resume with bad bytes, and report loudly. We call pf_service directly (a real
+     * faulting touch would halt the boot when the handler returns 0). */
+    sputs("\n-- F2: fail-closed on verification failure (corrupt store entry) --\n");
+    static uint8_t objBad[4096]; for(int i=0;i<4096;i++) objBad[i]=(uint8_t)(i*3u+1u);
+    cvsasx_hash_t hBad = pf_publish(objBad);
+    /* corrupt the stored bytes for hBad in the arena so a fetch returns tampered content.
+     * We find the object in the store and flip a byte; the hash (the address) is unchanged. */
+    { const void *b; size_t l; if(cvsasx_store_get(&rm_store,&hBad,&b,&l)==CVSASX_STORE_OK){
+        ((uint8_t*)b)[10] ^= 0xFF;   /* TAMPER: loaded bytes will no longer hash to hBad */ } }
+    uint64_t vaBad=0x0000730000000000ULL;
+    pf_bindA_add(vaBad, vaBad+4096, &hBad);
+    pf_arm_notpresent(vaBad, 0);
+    int before_map = (mm_resolve(pf_space, vaBad)!=0);
+    int r2 = pf_service(vaBad, 0x0 /* not-present read */, 0xbad);
+    int after_map = (mm_resolve(pf_space, vaBad)!=0);
+    int f2=(r2==0)&&(!after_map)&&(before_map==0);
+    sputs("  pf_service(corrupt) returned "); sdec((uint64_t)r2);
+    sputs(", mapping installed="); sputs(after_map?"y":"n");
+    sputs(f2?"  -> REJECTED AT FAULT BOUNDARY (no map, no resume, loud)\n":"  -> *** FAIL-OPEN ***\n");
+    sputs("F2 -> "); sputs(f2?"FAIL-CLOSED ON VERIFY FAILURE OK\n":"FAIL\n");
+    mm_unmap(pf_space, vaBad);
+
+    /* ---- F3: DEDUP-AT-FAULT. Two distinct vaddrs bound to the SAME hash. First miss
+     * materializes; second miss resolves to a refcount bump on the already-resident
+     * frame (share-by-hash), no second store fetch. */
+    sputs("\n-- F3: dedup-at-fault (two vaddrs, one hash -> shared frame, refcount++) --\n");
+    static uint8_t objS[4096]; for(int i=0;i<4096;i++) objS[i]=(uint8_t)(i*23u+9u);
+    cvsasx_hash_t hS = pf_publish(objS);
+    uint64_t vaS1=0x0000740000000000ULL, vaS2=0x0000750000000000ULL;
+    pf_bindA_add(vaS1, vaS1+4096, &hS);
+    pf_bindA_add(vaS2, vaS2+4096, &hS);
+    pf_arm_notpresent(vaS1, 0); pf_arm_notpresent(vaS2, 0);
+    uint64_t faults_before = rm_faults, hits_before = rm_hits;
+    (void)*(volatile uint64_t*)vaS1;             /* first miss: materialize */
+    uint64_t frame1 = pf_last_frame; uint32_t rc1 = framedb[fr_idx(frame1)].refcount;
+    uint64_t faults_mid = rm_faults;
+    (void)*(volatile uint64_t*)vaS2;             /* second miss: SAME hash -> share */
+    uint64_t frame2 = pf_last_frame; uint32_t rc2 = framedb[fr_idx(frame2)].refcount;
+    uint64_t faults_after = rm_faults, hits_after = rm_hits;
+    int fetched_once = (faults_mid==faults_before+1) && (faults_after==faults_mid);  /* exactly ONE store fetch */
+    int shared = (frame2==frame1) && (rc2==rc1+1) && (hits_after==hits_before+1);
+    sputs("  vaS1 -> frame#"); sdec(fr_idx(frame1)); sputs(" rc="); sdec(rc1);
+    sputs("; vaS2 -> frame#"); sdec(fr_idx(frame2)); sputs(" rc="); sdec(rc2);
+    sputs("  same-frame="); sputs(frame2==frame1?"y":"n"); sputs(" store-fetches="); sdec(faults_after-faults_before);
+    sputs((shared&&fetched_once)?"  -> SHARED, ONE FETCH, REFCOUNT BUMPED\n":"  -> *** NOT DEDUPED ***\n");
+    sputs("F3 -> "); sputs((shared&&fetched_once)?"DEDUP-AT-FAULT OK\n":"FAIL\n");
+
+    /* ---- F4: BINDING B + MEASURED COMPARISON. Route a second region's faults through
+     * binding B (PTE-encoded descriptor). Measure fault-service latency (rdtsc) for A vs
+     * B on the SAME workload (N faults each, fresh objects), print the comparison. */
+    sputs("\n-- F4: binding B (PTE->descriptor) + MEASURED A-vs-B fault-service latency --\n");
+    #define PF_N 8
+    /* workload A: PF_N distinct objects, each via binding A */
+    static uint8_t wobj[2*PF_N][4096];
+    uint64_t vbaseA=0x0000760000000000ULL, vbaseB=0x00007A0000000000ULL;
+    pf_svc_cyc_A=pf_svc_cyc_B=0; pf_svc_n_A=pf_svc_n_B=0;
+    for(int k=0;k<PF_N;k++){ for(int i=0;i<4096;i++) wobj[k][i]=(uint8_t)(i*(k+31)+k*7+1);
+        cvsasx_hash_t h=pf_publish(wobj[k]); uint64_t va=vbaseA+(uint64_t)k*0x100000000ULL;
+        pf_bindA_add(va, va+4096, &h); pf_arm_notpresent(va, 0);
+        (void)*(volatile uint64_t*)va; }      /* fault -> serviced via A, timed inside pf_service */
+    for(int k=0;k<PF_N;k++){ for(int i=0;i<4096;i++) wobj[PF_N+k][i]=(uint8_t)(i*(k+47)+k*11+3);
+        cvsasx_hash_t h=pf_publish(wobj[PF_N+k]); uint32_t idx=pf_bindB_add(&h);
+        uint64_t va=vbaseB+(uint64_t)k*0x100000000ULL;
+        pf_arm_notpresent(va, pf_bindB_pte(idx)); /* PTE carries the descriptor index */
+        (void)*(volatile uint64_t*)va; }      /* fault -> serviced via B, timed inside pf_service */
+    uint64_t avgA = pf_svc_n_A? pf_svc_cyc_A/pf_svc_n_A : 0;
+    uint64_t avgB = pf_svc_n_B? pf_svc_cyc_B/pf_svc_n_B : 0;
+    sputs("  +-----------+--------+-----------------+\n");
+    sputs("  | binding   | faults | cyc/fault (avg) |\n");
+    sputs("  +-----------+--------+-----------------+\n");
+    sputs("  | A side-tbl|   "); sdec(pf_svc_n_A); sputs("    |      "); sdec(avgA); sputs("       |\n");
+    sputs("  | B PTE-desc|   "); sdec(pf_svc_n_B); sputs("    |      "); sdec(avgB); sputs("       |\n");
+    sputs("  +-----------+--------+-----------------+\n");
+    if(avgA&&avgB){
+        if(avgA<avgB){ sputs("  CONCLUSION: A is cheaper by "); sdec(avgB-avgA); sputs(" cyc/fault ("); sdec((avgB-avgA)*100/avgB); sputs("%).\n"); }
+        else if(avgB<avgA){ sputs("  CONCLUSION: B is cheaper by "); sdec(avgA-avgB); sputs(" cyc/fault ("); sdec((avgA-avgB)*100/avgA); sputs("%).\n"); }
+        else sputs("  CONCLUSION: A and B measured equal this run (rdtsc/TCG noise).\n");
+    } else sputs("  CONCLUSION: no measurement (a binding serviced 0 faults).\n");
+    sputs("  (Both resolve the same hash + share the same materialize/verify cost; the delta is ONLY the\n");
+    sputs("   resolution step: A does a linear range scan, B does an mm_walk + one descriptor deref.)\n");
+    int f4=(pf_svc_n_A==PF_N)&&(pf_svc_n_B==PF_N);
+    sputs("F4 -> "); sputs(f4?"BINDING B + MEASURED A-vs-B OK\n":"FAIL\n");
+
+    /* ---- F5: RE-ENTRANCY / NESTED-FAULT PROBE. The handler's metadata is pinned
+     * (F0), so a normal miss cannot self-fault. We PROBE the re-entrancy GUARD: invoke
+     * pf_service while pf_in_handler is set (the state a nested fault would present) and
+     * show it is detected and refused, not silently re-entered. */
+    sputs("\n-- F5: re-entrancy / nested-fault probe --\n");
+    /* (a) pinning prevents a nested fault: re-assert the metadata is still resident */
+    int still_pinned=1;
+    for(unsigned i=0;i<sizeof pin/sizeof pin[0];i++) if(!mm_resolve(pf_space, pin[i])) still_pinned=0;
+    sputs("  (a) handler metadata still resident (pinned): "); sputs(still_pinned?"y -> a miss cannot self-fault on metadata\n":"n *** \n");
+    /* (b) the re-entrancy guard: simulate a fault arriving WHILE the handler runs */
+    uint64_t nested_before = pf_nested_seen;
+    pf_in_handler=1;                                  /* pretend we are mid-service */
+    int rN = pf_service(vaA, 0x0, 0xee0);             /* a "nested" #PF arrives */
+    pf_in_handler=0;
+    int detected=(rN==0)&&(pf_nested_seen==nested_before+1);
+    sputs("  (b) a #PF arriving during handling: detected by the guard="); sputs(detected?"y":"n");
+    sputs(" (pf_service returned "); sdec((uint64_t)rN); sputs(", refused re-entry)\n");
+    /* (c) the PRECISE re-entrancy gap that remains, named exactly (a valid deliverable). */
+    sputs("  (c) PRECISE STALL named: the guard makes re-entry FAIL-CLOSED, not RECOVERABLE.\n");
+    sputs("      Gap: if a real second #PF arrived mid-service (e.g. the handler touched a\n");
+    sputs("      not-yet-pinned page), the guard returns 0 -> isr_pf would dump+halt the inner\n");
+    sputs("      fault. We prevent the gap by PINNING all handler metadata in resident/HHDM\n");
+    sputs("      memory (F0), so the only not-present pages are the demand-paged test regions\n");
+    sputs("      and the handler never touches one. The unhandled upgrade path (recoverable\n");
+    sputs("      nested faults) needs an IST/TSS stack for the inner fault + a per-fault\n");
+    sputs("      service context stack instead of the single pf_in_handler flag.\n");
+    int f5=still_pinned&&detected;
+    sputs("F5 -> "); sputs(f5?"RE-ENTRANCY GUARDED + PRECISE GAP NAMED OK\n":"FAIL\n");
+
+    sputs("\nREMATERIALIZING FAULT HANDLER: F0-F5 run; binding design law implemented as classified (FAULT_LOG.md).\n");
+    framedb_init();   /* clean database for run_shell */
+}
+
 static void run_residency(void){
     sputs("\n=== RESIDENCY MANAGER: content-addressed physical-memory substrate (M0-M5) ===\n");
     run_m0();   /* frame database + conventional fresh allocation */
@@ -1822,6 +2151,7 @@ void kmain(void){
     run_sched();       /* STEP 11: task substrate - P0 cooperative, P1 remat-work, P2 preemption */
     run_unified();     /* STEP 12: unified content-addressed substrate - U0 task-as-object, U1 activate-by-hash, U2 incremental, U3 crossover, U4 persistence-as-noop */
     run_residency();   /* RESIDENCY MANAGER: M0 frame-db, M1 per-task page tables, M2 materialize/share-by-hash, M3 eviction/refdrop, M4 dirty-bit, M5 fragmentation */
+    run_fault();       /* REMATERIALIZING FAULT HANDLER: F0 #PF+safety, F1 fault-in via A, F2 fail-closed on verify, F3 dedup-at-fault, F4 binding B + measured A-vs-B, F5 re-entrancy probe */
     run_shell();       /* E4: live focus/drag/resize/type desktop (does not return) */
 #endif
     hcf();

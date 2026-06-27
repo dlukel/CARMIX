@@ -22,9 +22,12 @@ hidden.
   gives tasks per-task page mappings, and dirty tracking is measured both ways, the x86-64 page-table
   dirty bit and the software chunk diff agree on the dirty set and the hardware scan is six to seven
   times cheaper. See docs/ARCHITECTURE.md. The wider state object remains future work.
-- Page-fault-driven fault-in. The residency manager materializes a frame from a hash on an explicit
-  call. Routing a miss through the page-fault vector needs the fault handler made resumable, which is
-  the next step, so demand paging is not yet automatic on a stray access.
+- Recoverable nested faults. Demand paging is now automatic. A not-present access traps through the
+  page-fault vector, the handler materializes the object by hash with BLAKE3 verification and
+  resumes, and a verification failure fails closed. See docs/ARCHITECTURE.md. The handler's own
+  memory is resident so servicing a miss does not itself fault, but a fault during fault handling
+  fails closed rather than recovering. Making nested faults recoverable needs a separate interrupt
+  stack and a per-fault service context, which is not built.
 - A scheduling policy that uses content-addressing per switch. The measured crossover shows
   activate-by-hash costs two to three orders of magnitude more than a register switch at every
   dirty-set size, so it is used only at coarse boundaries. A policy that schedules over content

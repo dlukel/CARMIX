@@ -169,9 +169,32 @@ The findings were measured in the emulator and vary run to run because they are 
 - Fixed chunks trade external fragmentation for internal slack, near 29 percent on the measured mix,
   and a frame-sized request stays serviceable.
 
-Fault-in is wired as an explicit materialize call. Routing a miss through the page-fault vector would
-require making the fault handler resumable, which is the next step. The page table and the capability
-slots are not yet part of the content-addressed task state object.
+The page table and the capability slots are not yet part of the content-addressed task state object.
+
+## Rematerializing fault handler (kernel/kernel.c)
+
+Demand paging is automatic. A not-present access traps through the page-fault vector, the handler
+classifies the fault (a protection fault is not a miss), resolves the faulting address to a content
+hash, materializes the object from the store with BLAKE3 verification, installs the mapping, and
+returns so the faulting instruction re-executes and now succeeds. A miss is a verified
+materialize-by-hash.
+
+Fail-closed is enforced at the fault boundary. If the loaded bytes do not hash to the expected hash,
+the handler installs no mapping and does not resume, it fails loud. Two virtual addresses bound to
+the same hash share one resident frame, so deduplication happens on the fault path, not only on an
+explicit call.
+
+The one new decision, how a faulting address resolves to a hash, was settled by measurement. Two
+bindings are built, a side table keyed by address range and a not-present page-table entry that
+points at a descriptor, and their fault-service latency was measured head to head. The result is a
+null finding. The binding choice does not move fault-service latency, because the cost is dominated by
+the materialize and the BLAKE3 verification, a page copy plus a full hash, and the resolution step
+sits in the measurement noise.
+
+The handler's own code, stack, and binding metadata are resident, so servicing a miss does not itself
+fault. Recoverable nested faults are not supported. A fault during fault handling fails closed rather
+than recovering, and making it recoverable needs a separate interrupt stack and a per-fault service
+context, which is named as future work.
 
 ## Two-machine migration (kernel/nettest.c)
 
