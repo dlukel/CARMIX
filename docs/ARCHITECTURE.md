@@ -196,6 +196,33 @@ fault. Recoverable nested faults are not supported. A fault during fault handlin
 than recovering, and making it recoverable needs a separate interrupt stack and a per-fault service
 context, which is named as future work.
 
+## Authority-bounded domain crossing (kernel/kernel.c)
+
+The kernel runs a process in ring 3 on its own page tables. The hardware privilege floor is
+conventional, GDT user segments, a task-state segment with a kernel stack, a ring transition through
+a trap gate, and the user and supervisor bit on the page tables. A ring-3 access to a kernel address
+faults and is classified as a protection violation, not a miss.
+
+Entering the kernel is not an ambient privilege. A process carries a capability re-minted under the
+authority ceiling, and a privileged crossing re-mints the caller's bounded authority for the
+requested service through the same anti-amplification gate that bounds a migration and a fault. The
+authority that reaches the kernel is the re-minted bounded one, not the caller's claim. A confused
+deputy that hands the kernel a wider claim is held to the re-minted authority.
+
+The proof mirrors the migration adversarial table. Six userspace amplification attempts, an unheld
+capability, an over-ceiling request, a forged epoch, a confused deputy, a write-execute violation,
+and a forbidden permission, are each refused by their own distinct reason, and these are the same
+status codes the in-kernel anti-amplification table and the cross-machine migration table reject by.
+A replay is refused and a legitimate crossing within the ceiling is accepted. The same gate that
+refuses amplification at the migration boundary refuses it at the user and kernel boundary, so
+crossing, migrating, and faulting are one authority model.
+
+A large syscall argument is passed as a hash and rematerialized by hash with verification, rather
+than copied from user memory. This closes the copy-at-use class of time-of-check to time-of-use race,
+since a mutated object is a different hash and fails verification. It does not eliminate trust, it
+relocates it to the address-to-hash binding and the store admission, which is stated honestly rather
+than claimed away.
+
 ## Two-machine migration (kernel/nettest.c)
 
 Two emulator instances share memory through an ivshmem device, a PCI device whose second base

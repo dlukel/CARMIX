@@ -59,6 +59,7 @@ state and re-mints capabilities during the migration.
 | The cost crossover, measured. A raw register switch is a flat cost near 1400 cycles, while activate-by-hash is two to three orders of magnitude more at every dirty-set size, so the fast path stays for rapid switching and content-addressing is used only at coarse boundaries. | Measured with rdtsc in an emulator. | kernel unified-substrate self-test |
 | Residency manager. Physical memory is a content-addressed cache over the store. Fault-in materializes a frame from a hash and verifies it, identical content is shared by hash as one frame, eviction writes a dirty victim back to the store, and the hardware page-table dirty bit is measured against the software diff (it agrees and is six to seven times cheaper). | Observed and measured in an emulator. | kernel residency self-test |
 | Rematerializing fault handler. A not-present access traps through the page-fault vector and is serviced by a BLAKE3-verified materialize-by-hash that gates resume. Content that fails verification is refused at the fault boundary, and identical content is shared on the fault path. | Observed by serial trace in an emulator. | kernel fault-handler self-test |
+| Authority-bounded user and kernel crossing. A ring-3 process enters the kernel through a re-mint of its bounded capability under the same anti-amplification gate that bounds migration and faults. Six userspace amplification attempts are each refused by their own distinct reason, the same status codes the migration table uses. | Observed by serial trace in an emulator. | kernel userspace self-test |
 
 The two-machine byte counts and the proof results are reproducible. See docs/REPRODUCE.md.
 
@@ -70,7 +71,9 @@ in full in docs/ROADMAP.md.
 - Real hardware. Everything here runs in QEMU. The bootable image runs the same path on a real
   machine from a USB stick, but that has not been verified on physical hardware.
 - USB input. Input is PS/2, which the emulator provides. Modern hardware needs a USB HID stack.
-- Persistent storage, a filesystem, a process model, and a userspace.
+- Persistent storage and a filesystem. The store is in RAM. A process model, a ring-3 userspace, and
+  a re-minting syscall boundary exist, but a process loader, per-process memory management, and more
+  than one concurrent userspace task do not. See docs/ROADMAP.md.
 - GPU acceleration. The desktop is software-rendered. It draws CARMIX's own windows. It does not
   run third-party graphical applications, which would require the vendor GPU driver stack.
 - The root of trust for keys. The key lifecycle, enrollment, rotation, revocation, and monotonic

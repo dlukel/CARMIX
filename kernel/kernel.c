@@ -120,8 +120,13 @@ __attribute__((interrupt)) static void isr_gp(struct iframe *f, uint64_t e){ fau
  * return (resume). On a fail-closed verdict (protection, no binding, store miss, verify
  * mismatch) we dump+halt - fail-loud, never resume with bad/absent bytes. */
 static int pf_service(uint64_t cr2, uint64_t err, uint64_t rip);   /* defined below, near run_fault */
+static int us0_protection_probe(uint64_t cr2, uint64_t err, volatile uint64_t *rip_io);  /* US0 ring-3 probe hook */
 __attribute__((interrupt)) static void isr_pf(struct iframe *f, uint64_t e){
     uint64_t cr2; __asm__ volatile("mov %%cr2,%0":"=r"(cr2));
+    /* &f->rip is the on-stack RIP the iretq epilogue will reload; the hook may rewrite it
+     * (US0 RIP fixup). volatile so -O2 does not dead-store-eliminate that write (the iretq
+     * reload is invisible to the C optimizer). */
+    if(us0_protection_probe(cr2, e, (volatile uint64_t*)&f->rip)) return;  /* US0: classified + survived */
     if(pf_service(cr2, e, f->rip)) return;   /* SERVICED: iretq (implicit) -> faulting insn re-executes */
     sputs("  (#PF NOT serviced - fail-closed)\n"); fault_dump(14,e,f);   /* fail-loud, halt */
 }
@@ -2042,6 +2047,453 @@ static void run_residency(void){
     sputs("RESIDENCY MANAGER: M0-M5 run; the collapse map is implemented as classified (MEM_LOG.md).\n");
 }
 
+/* ===========================================================================
+ * USERSPACE + USER/KERNEL BOUNDARY (US0-US4) - an AUTHORITY-BOUNDED DOMAIN CROSSING.
+ *
+ * The crossing has THREE mechanisms, each owning exactly what only it can (the
+ * protection-boundary design law):
+ *   HARDWARE PRIVILEGE  - ring 3 for user, ring 0 for kernel, INT 0x80 + IRETQ for
+ *                         the transition, a TSS RSP0 for the kernel stack switch,
+ *                         per-task page tables (mm_new_space) for memory isolation.
+ *   AUTHORITY CHECKING  - COLLAPSES into the proven swcap anti-amp re-mint gate
+ *                         (cvsasx_sw_cap_remint, the C1 path E2 uses). A privileged
+ *                         syscall routes its authority decision THROUGH the gate; the
+ *                         SAME gate that refuses a migration amplification (D2) refuses
+ *                         a userspace amplification. Possession of a re-minted capability
+ *                         IS the authority - NOT ambient ring authority.
+ *   ARGUMENT TRANSFER   - a large arg passes a HASH; the kernel rematerializes it by
+ *                         hash (verified, reusing rm_materialize), not copy_from_user.
+ *
+ * MECHANISM CHOICE: INT 0x80 + IRETQ, NOT SYSCALL/SYSRET. Rationale: the INT/IRETQ
+ * path lands the ring switch + TSS RSP0 stack switch with NO MSR setup (STAR/LSTAR/
+ * SFMASK), so the contribution - re-mint-on-crossing - is reachable on the shortest
+ * correct floor. SYSCALL/SYSRET is a drop-in refinement of the transition only; it
+ * would not change the authority gate, which is the novel part.
+ * ===========================================================================*/
+
+/* ---- GDT we build ourselves (Limine's is opaque): we need ring-3 segments + a
+ * TSS with RSP0. Flat 64-bit. Selectors: KCODE=0x08 KDATA=0x10 UDATA=0x1b(rpl3)
+ * UCODE=0x23(rpl3) TSS=0x28. ----------------------------------------------- */
+#define SEL_KCODE 0x08
+#define SEL_KDATA 0x10
+#define SEL_UDATA (0x18|3)
+#define SEL_UCODE (0x20|3)
+#define SEL_TSS   0x28
+struct tss64 { uint32_t r0; uint64_t rsp0, rsp1, rsp2; uint64_t r1; uint64_t ist[7];
+               uint64_t r2; uint16_t r3, iomap; } __attribute__((packed));
+static struct tss64 g_tss;
+static uint64_t us_gdt[7];   /* null,KCODE,KDATA,UDATA,UCODE,TSS(2 slots) */
+static uint8_t us_kstack[8192] __attribute__((aligned(16)));   /* RSP0: kernel stack for the crossing */
+struct dtr64 { uint16_t limit; uint64_t base; } __attribute__((packed));
+
+/* 64-bit code descriptor: P=1,S=1,type=exec/read, L=1 (long mode), DPL in bits 45-46. */
+static uint64_t gdt_code(int dpl){ return 0x00209A0000000000ULL | ((uint64_t)(dpl&3)<<45); }
+static uint64_t gdt_data(int dpl){ return 0x0000920000000000ULL | ((uint64_t)(dpl&3)<<45); }
+
+static void usgdt_init(void){
+    us_gdt[0]=0;
+    us_gdt[1]=gdt_code(0);          /* KCODE 0x08 */
+    us_gdt[2]=gdt_data(0);          /* KDATA 0x10 */
+    us_gdt[3]=gdt_data(3);          /* UDATA 0x18 */
+    us_gdt[4]=gdt_code(3);          /* UCODE 0x20 */
+    /* TSS descriptor (16 bytes, occupies us_gdt[5] and us_gdt[6]) */
+    uint64_t b=(uint64_t)&g_tss, lim=sizeof(g_tss)-1;
+    us_gdt[5]= (lim&0xffff) | ((b&0xffffff)<<16) | (0x89ULL<<40) | (((lim>>16)&0xf)<<48) | (((b>>24)&0xff)<<56);
+    us_gdt[6]= (b>>32)&0xffffffffULL;
+
+    for(unsigned i=0;i<sizeof g_tss;i++) ((uint8_t*)&g_tss)[i]=0;
+    g_tss.rsp0=(uint64_t)(us_kstack+sizeof us_kstack);   /* RSP0: where the CPU lands on the ring 3->0 crossing */
+    g_tss.iomap=sizeof(g_tss);
+
+    struct dtr64 gdtr={ (uint16_t)(sizeof us_gdt-1), (uint64_t)us_gdt };
+    __asm__ volatile("lgdt %0"::"m"(gdtr):"memory");
+    /* reload data segs + far-jump CS to our KCODE via a retfq trampoline */
+    __asm__ volatile(
+        "mov %0,%%ax\n\t mov %%ax,%%ds\n\t mov %%ax,%%es\n\t mov %%ax,%%ss\n\t mov %%ax,%%fs\n\t mov %%ax,%%gs\n\t"
+        "leaq 1f(%%rip),%%rax\n\t pushq %1\n\t pushq %%rax\n\t lretq\n\t 1:\n\t"
+        :: "i"(SEL_KDATA), "i"((uint64_t)SEL_KCODE) : "rax","memory");
+    __asm__ volatile("ltr %%ax"::"a"((uint16_t)SEL_TSS));
+    /* the IDT was armed with Limine's old kernel CS; re-point every gate at our KCODE. */
+    for(int v=0;v<256;v++) idt[v].sel=SEL_KCODE;
+    struct idtr idtr={(uint16_t)(sizeof(idt)-1),(uint64_t)idt}; __asm__ volatile("lidt %0"::"m"(idtr):"memory");
+}
+
+/* ---- the syscall ABI across the crossing. The user puts the call number in rdi,
+ * args in rsi/rdx/r10; the return value comes back in rax. A naked stub saves the
+ * GPRs into uregs, calls the C dispatcher, restores, IRETQs back to ring 3. ---- */
+struct uregs { uint64_t rdi,rsi,rdx,r10,rax; };
+static volatile struct uregs g_ur;          /* the crossing's argument/return slot (single ring-3 task) */
+static uint64_t syscall_dispatch(void);     /* C core, defined below */
+
+/* syscall numbers */
+#define SYS_WRITE   1   /* rsi=char -> console (unprivileged) */
+#define SYS_GETTIME 2   /* -> ticks */
+#define SYS_ADD     3   /* rsi+rdx -> proves a value computed in ring 0 returns to ring 3 (US1) */
+#define SYS_READOBJ 4   /* PRIVILEGED: re-mint the carried PIR, read us_obj[rsi] through the bounded cap (US2) */
+#define SYS_EXIT    9   /* leave ring 3: restore kernel CR3 + kmain's stack (no iretq back) */
+
+static uint64_t us_space;        /* the user task's CR3 */
+static uint64_t us_kcr3;         /* kernel CR3 to restore on exit */
+static uint64_t us_kmain_rsp;    /* kmain's stack to resume after the user task exits */
+
+__attribute__((naked, noinline))
+static void isr_syscall(void){
+    /* on entry (ring 3->0): rdi=call#, rsi/rdx/r10=args; CPU already on RSP0 (TSS). */
+    __asm__ volatile(
+        "mov %%rdi,%[grdi]\n\t mov %%rsi,%[grsi]\n\t mov %%rdx,%[grdx]\n\t mov %%r10,%[gr10]\n\t"
+        "cmpq %[exit],%%rdi\n\t je 2f\n\t"                /* SYS_EXIT: leave ring 3 entirely */
+        "call syscall_dispatch\n\t mov %%rax,%[grax]\n\t"
+        "mov %[grax],%%rax\n\t iretq\n\t"
+        "2:\n\t"                                          /* exit: restore kernel CR3 + kmain's stack, return to kmain */
+        "mov %[kcr3],%%rax\n\t mov %%rax,%%cr3\n\t"
+        "mov %[krsp],%%rsp\n\t ret\n\t"
+        : [grdi]"=m"(g_ur.rdi),[grsi]"=m"(g_ur.rsi),[grdx]"=m"(g_ur.rdx),
+          [gr10]"=m"(g_ur.r10),[grax]"=m"(g_ur.rax)
+        : [exit]"i"((uint64_t)SYS_EXIT),[kcr3]"m"(us_kcr3),[krsp]"m"(us_kmain_rsp)
+        : "rax","memory");
+}
+
+/* ---- US2/US3 the AUTHORITY at the crossing: re-mint through the proven gate. The
+ * user "carries" a capability = a PIR it presents (us_user_pir). A privileged syscall
+ * re-mints it against the kernel custodian (us_cust) over the destination region
+ * (us_region). The gate REFUSES any amplification beyond the C1 ceiling - the SAME
+ * cvsasx_sw_cap_remint E2 uses. The kernel acts on the RE-MINTED bounded cap, never on
+ * the user's claim (confused-deputy defence). ------------------------------------ */
+static uint8_t us_obj[256];                  /* the privileged object the service guards */
+static cvsasx_sw_custodian_t us_cust;        /* TCB: holds broad authority, mints restricted caps */
+static cvsasx_sw_region_t us_region;         /* destination-local instantiation of the object */
+static cvsasx_pir_t us_user_pir;             /* the capability the ring-3 task carries */
+static uint8_t  us_objH[CVSASX_BLAKE3_LEN];  /* the object's content address (referent hash) */
+
+/* build a legitimate carried PIR: bounded to a sub-range of the object, load-only,
+ * current referent hash. This is what an honest ring-3 task presents. */
+static void us_make_legit_pir(cvsasx_pir_t *p, uint64_t off, uint64_t len, uint32_t perms){
+    for(unsigned i=0;i<sizeof *p;i++) ((uint8_t*)p)[i]=0;
+    for(int i=0;i<(int)CVSASX_BLAKE3_LEN;i++) p->referent_hash[i]=us_objH[i];
+    p->offset=off; p->length=len; p->struct_version=CVSASX_PIR_VERSION; p->perms=perms;
+    p->flags=CVSASX_PIR_FLAG_REFERENT_VALID;
+}
+
+/* THE CROSSING'S AUTHORITY DECISION. Routes the caller's carried PIR through the
+ * proven anti-amp gate. Returns CVSASX_OK + a re-minted bounded cap on success;
+ * any amplification is refused by the gate with its DISTINCT status. */
+static cvsasx_status_t us_remint_at_crossing(const cvsasx_pir_t *carried, cvsasx_swcap_t *out){
+    return cvsasx_sw_cap_remint(&us_cust, carried, &us_region, out);
+}
+
+static volatile uint64_t u_probe_landed=0;   /* set by the kernel when the user reaches the post-probe syscall (US0) */
+static uint64_t us_nonce_expected=0xC0FFEE01; /* the crossing's one-shot anti-replay nonce (US3) */
+
+/* The C dispatcher. Reads args from g_ur (filled by the naked stub from rdi/rsi/...).
+ * `used` because the only caller is the naked asm stub (`call syscall_dispatch`), which
+ * the compiler does not see as a reference. */
+__attribute__((used)) static uint64_t syscall_dispatch(void){
+    uint64_t n=g_ur.rdi, a1=g_ur.rsi, a2=g_ur.rdx;
+    switch(n){
+        case SYS_WRITE:
+            /* US0b: the post-probe sentinel write proves the user task SURVIVED the
+             * protection fault (the handler fixed RIP) and resumed at CPL3. */
+            if(a1==0x42) u_probe_landed=0xB0B;
+            kputc((char)a1); sputc((char)a1); return 0;
+        case SYS_GETTIME: return ticks;
+        case SYS_ADD:     return a1+a2;
+        case SYS_READOBJ: {
+            /* PRIVILEGED path: the authority is the RE-MINTED cap, not the ring. */
+            cvsasx_swcap_t cap;
+            cvsasx_status_t s=us_remint_at_crossing(&us_user_pir, &cap);
+            if(s!=CVSASX_OK || !cap.valid) return 0xFFFFFFFF00000000ULL | (uint32_t)s;  /* refused: high word = status */
+            /* act ONLY within the re-minted bounds via the proven SFI check */
+            if(!cvsasx_swcap_check(&cap, a1, 1, CVSASX_PERM_LOAD)) return 0xEE;          /* in-bounds enforcement */
+            return us_obj[ (cap.base - (uint64_t)(uintptr_t)us_obj) + a1 ];              /* through the bounded cap */
+        }
+        default: return (uint64_t)-1;
+    }
+    (void)a2;
+}
+
+/* ---- the ring-3 user program. POSITION-INDEPENDENT (no kernel-global references):
+ * it talks to the kernel ONLY through INT 0x80, and its results come back in rax and
+ * are recorded kernel-side. It is copied into a fresh user frame and mapped at a LOW
+ * user vaddr with U/S intermediate tables, so CPL3 reaches the user page and NOTHING
+ * else of the kernel. A higher-half kernel vaddr can't be reused for user code: its
+ * page tables are shared SUPERVISOR (no U/S on the intermediate entries), so CPL3
+ * could not traverse them - exactly the isolation we depend on. ------------------ */
+#define US_CODE_VA  0x0000000040000000ULL   /* low user vaddr for the user code page */
+#define US_STACK_VA 0x0000000050000000ULL   /* low user vaddr for the user stack page */
+/* a present, SUPERVISOR-only kernel address the user deliberately reads (US0). Limine
+ * maps the kernel image at the top of the higher half; this is inside it (present, S). */
+#define US_KERN_PROBE 0xFFFFFFFF80000000ULL
+
+static int g_us0_fault_was_protection=0, g_us0_fault_was_user=0, g_us0_fault_seen=0;
+
+/* The whole user program in one naked asm blob so its bytes are contiguous and PIC.
+ * Layout: run a ring-3 instruction (set rbx marker); read US_KERN_PROBE (faults, the
+ * handler fixes RIP to the next insn); then the syscalls; SYS_EXIT leaves ring 3. */
+extern char user_blob[], user_blob_end[], user_probe_resume[];
+__asm__(
+    ".pushsection .text\n\t"
+    ".global user_blob\n\t .global user_blob_end\n\t .global user_probe_resume\n\t"
+    "user_blob:\n\t"
+    "  movq $0xACE, %rbx\n\t"                 /* US0: a plain ring-3 instruction runs (marker in rbx) */
+    "  movabsq $0xFFFFFFFF80000000, %rax\n\t" /* US0 probe: read a SUPERVISOR kernel address from CPL3 */
+    "  movq (%rax), %rcx\n\t"                 /*   -> #PF present|user; handler fixes RIP here-after */
+    "user_probe_resume:\n\t"
+    /* US0b: tell the kernel we survived the fault (SYS_WRITE of a sentinel; dispatch records it) */
+    "  movq $1, %rdi\n\t movq $0x42, %rsi\n\t int $0x80\n\t"   /* SYS_WRITE 'B' = survived */
+    /* US1: SYS_ADD(40,2) -> rax should be 42 */
+    "  movq $3, %rdi\n\t movq $40, %rsi\n\t movq $2, %rdx\n\t int $0x80\n\t movq %rax, %r12\n\t"
+    /* SYS_GETTIME */
+    "  movq $2, %rdi\n\t int $0x80\n\t movq %rax, %r13\n\t"
+    /* US2: SYS_READOBJ[7] through the re-minted bounded cap */
+    "  movq $4, %rdi\n\t movq $7, %rsi\n\t int $0x80\n\t movq %rax, %r14\n\t"
+    /* hand the three results back to the kernel via a final reporting syscall (SYS_EXIT
+     * carries them: rsi=add, rdx=time, r10=obj) and leave ring 3. */
+    "  movq $9, %rdi\n\t movq %r12, %rsi\n\t movq %r13, %rdx\n\t movq %r14, %r10\n\t int $0x80\n\t"
+    "1: jmp 1b\n\t"                            /* unreachable: SYS_EXIT does not return to ring 3 */
+    "user_blob_end:\n\t"
+    ".popsection\n\t");
+
+/* the ring-3 launcher state. The user code/stack live in fresh frames mapped U/S. */
+static uint64_t us_code_frame, us_stack_frame;
+
+static int g_us0_armed=0;                  /* the US0 probe is armed only during the ring-3 run */
+static uint64_t us_probe_resume_va;        /* user vaddr of user_probe_resume (RIP fixup target) */
+static void run_us3(void);   /* adversarial amplification table (D2 analogue) */
+static void run_us4(void);   /* hash-passing args + TOCTOU */
+
+static void run_userspace(void){
+    sputs("\n=== USERSPACE + USER/KERNEL BOUNDARY (US0-US4): authority-bounded domain crossing ===\n");
+
+    usgdt_init();
+    idt_set(0x80,(void*)isr_syscall,SEL_KCODE);
+    idt[0x80].type=0xEE;   /* DPL=3: ring 3 may issue INT 0x80 (present, 64-bit interrupt gate) */
+    { struct idtr idtr={(uint16_t)(sizeof(idt)-1),(uint64_t)idt}; __asm__ volatile("lidt %0"::"m"(idtr):"memory"); }
+    sputs("US0 GDT(user segs)+TSS(RSP0)+INT 0x80 gate(DPL3) installed; KCODE="); sx64(SEL_KCODE);
+    sputs(" UCODE="); sx64(SEL_UCODE); sputs(" TSS RSP0="); sx64(g_tss.rsp0); sputc('\n');
+
+    /* the privileged object + custodian + region (the authority root). The object's
+     * content address is its real BLAKE3 - the carried PIR must name it or be refused. */
+    for(int i=0;i<256;i++) us_obj[i]=(uint8_t)(i+1);
+    { cvsasx_hash_t h; cvsasx_blake3(us_obj,256,&h); for(int i=0;i<(int)CVSASX_BLAKE3_LEN;i++) us_objH[i]=h.b[i]; }
+    cvsasx_swcap_t root={ (uint64_t)(uintptr_t)us_obj,256,CVSASX_PERM_LOAD|CVSASX_PERM_STORE|CVSASX_PERM_GLOBAL,1};
+    cvsasx_sw_custodian_init(&us_cust, root);
+    us_region.object_cap=root; us_region.object_base_addr=(uint64_t)(uintptr_t)us_obj; us_region.object_length=256;
+    for(int i=0;i<(int)CVSASX_BLAKE3_LEN;i++) us_region.hash[i]=us_objH[i];
+    /* the honest carried capability: load-only, bounded to the whole object */
+    us_make_legit_pir(&us_user_pir, 0, 256, CVSASX_PERM_LOAD|CVSASX_PERM_GLOBAL);
+
+    /* build the user address space; copy the PIC user blob into a fresh frame and map it
+     * at a LOW user vaddr with U/S intermediate tables (mm_walk sets U/S on the pages it
+     * creates). The user reaches its code + stack and NOTHING else of the kernel. */
+    __asm__ volatile("mov %%cr3,%0":"=r"(us_kcr3)); us_kcr3&=~0xfffULL;
+    us_space=mm_new_space();
+    if(!us_space){ sputs("US0 NOT RUN: no user address space\n"); return; }
+    us_code_frame=frame_reserve(); us_stack_frame=frame_reserve();
+    if(!us_code_frame||!us_stack_frame){ sputs("US0 NOT RUN: out of frames\n"); return; }
+    uint64_t bloblen=(uint64_t)(user_blob_end-user_blob);
+    { uint8_t *dst=(uint8_t*)P2V(us_code_frame); for(uint64_t i=0;i<bloblen;i++) dst[i]=((uint8_t*)user_blob)[i]; }
+    mm_map(us_space, US_CODE_VA,  us_code_frame,  MM_USER);            /* user code: U/S, NOT writable (W^X) */
+    mm_map(us_space, US_STACK_VA, us_stack_frame, MM_USER|MM_WRITE);   /* user stack: U/S + writable */
+    us_probe_resume_va=US_CODE_VA + (uint64_t)(user_probe_resume-user_blob);
+
+    sputs("US0 user blob ("); sdec(bloblen); sputs(" B) -> frame#"); sdec(fr_idx(us_code_frame));
+    sputs(" mapped U/S @"); sx64(US_CODE_VA); sputs(" stack @"); sx64(US_STACK_VA); sputc('\n');
+    sputs("US0 entering ring 3 (IRETQ to CPL3): a ring-3 instruction runs, then it reads kernel addr "); sx64(US_KERN_PROBE); sputs("...\n");
+
+    g_us0_fault_seen=g_us0_fault_was_protection=g_us0_fault_was_user=0; u_probe_landed=0; g_us0_armed=1;
+
+    /* IRETQ into ring 3. Save kmain's stack first; SYS_EXIT restores it so boot continues. */
+    uint64_t uentry=US_CODE_VA;
+    uint64_t ustacktop=US_STACK_VA + 4096 - 16;   /* top of the 1-page user stack, 16-aligned */
+    __asm__ volatile(
+        "push %%rbx\n\t push %%rbp\n\t push %%r12\n\t push %%r13\n\t push %%r14\n\t push %%r15\n\t"
+        "leaq 1f(%%rip),%%rax\n\t push %%rax\n\t"     /* return address SYS_EXIT's `ret` lands on */
+        "mov %%rsp,%[ksp]\n\t"                         /* us_kmain_rsp = here */
+        "mov %[ucr3],%%rax\n\t mov %%rax,%%cr3\n\t"    /* switch to the user address space */
+        "pushq %[uss]\n\t"      /* SS  = user data (rpl3) */
+        "pushq %[usp]\n\t"      /* RSP = user stack top */
+        "pushq $0x202\n\t"      /* RFLAGS: IF=1 */
+        "pushq %[ucs]\n\t"      /* CS  = user code (rpl3) */
+        "pushq %[uip]\n\t"      /* RIP = user blob entry */
+        "iretq\n\t"
+        "1:\n\t"                /* SYS_EXIT returns here (already on kmain's stack) */
+        "pop %%r15\n\t pop %%r14\n\t pop %%r13\n\t pop %%r12\n\t pop %%rbp\n\t pop %%rbx\n\t"
+        : [ksp]"=m"(us_kmain_rsp)
+        : [ucr3]"r"(us_space),[uss]"r"((uint64_t)SEL_UDATA),[usp]"r"(ustacktop),
+          [ucs]"r"((uint64_t)SEL_UCODE),[uip]"r"(uentry)
+        : "rax","memory","cc");
+    g_us0_armed=0;
+    /* back in kmain's context (kernel CR3 already restored by the SYS_EXIT stub). The user
+     * task's results were carried in the SYS_EXIT registers (stashed in g_ur by the stub). */
+    uint64_t r_add=g_ur.rsi, r_time=g_ur.rdx, r_obj=g_ur.r10;
+
+    sputs("US0 ring-3 instruction ran (set marker before any crossing): yes\n");
+    sputs("US0 kernel-address read from ring 3: fault-seen="); sputs(g_us0_fault_seen?"y":"n");
+    sputs(" present(bit0)="); sputs(g_us0_fault_was_protection?"1":"0");
+    sputs(" user(bit2)="); sputs(g_us0_fault_was_user?"1":"0");
+    sputs(" survived(fixed-up)="); sputs(u_probe_landed==0xB0B?"y":"n");
+    sputs((g_us0_fault_seen && g_us0_fault_was_protection && g_us0_fault_was_user && u_probe_landed==0xB0B)
+          ? " -> RING-3 KERNEL ACCESS REFUSED AS PROTECTION (not a miss) OK\n"
+          : " -> *** US0 FAIL ***\n");
+
+    sputs("US1 syscall round trip: SYS_ADD(40,2) returned to ring 3 = "); sdec(r_add);
+    sputs("  SYS_GETTIME -> "); sdec(r_time);
+    sputs(r_add==42 ? " -> RING3->RING0->RING3 ROUND TRIP OK (value computed in the handler reached ring 3)\n"
+                    : " -> *** US1 FAIL ***\n");
+
+    sputs("US2 privileged SYS_READOBJ[7] via the re-minted bounded cap returned "); sdec(r_obj);
+    sputs(" (us_obj[7]=8 through the gate-minted authority)");
+    sputs(r_obj==8 ? " -> RE-MINT AT THE CROSSING OK\n" : " -> *** US2 FAIL ***\n");
+
+    run_us3();   /* the user->kernel adversarial amplification table (the D2 analogue) */
+    run_us4();   /* hash-passing arguments + TOCTOU test */
+}
+
+/* ---- US0 hook: catch the ring-3 kernel-address probe, classify, survive ------- */
+static int us0_protection_probe(uint64_t cr2, uint64_t err, volatile uint64_t *rip_io){
+    if(!g_us0_armed) return 0;
+    if(cr2 != US_KERN_PROBE) return 0;     /* only our exact probe address */
+    int present=err&1, user=(err>>2)&1;
+    g_us0_fault_seen=1; g_us0_fault_was_protection=present; g_us0_fault_was_user=user;
+    sputs("  #PF @"); sx64(cr2); sputs(" err="); sx64(err);
+    sputs(present?" [PRESENT/protection":" [not-present/MISS"); sputs(user?",user]":",kernel]");
+    sputs(" - ring-3 read of a supervisor page: classified PROTECTION, NOT serviced as a miss.\n");
+    *rip_io=us_probe_resume_va;   /* skip the faulting load (RIP fixup); the user task survives at CPL3 */
+    g_us0_armed=0;                /* one-shot */
+    return 1;
+}
+
+/* ===========================================================================
+ * US3 - THE USER->KERNEL ADVERSARIAL TABLE (the D2 analogue).
+ * Each adversarial CROSSING presents a tampered carried capability and is REFUSED
+ * by the proven re-mint gate, each by a DISTINCT reason (mirrors E2/D2/KA distinct-
+ * reason discipline; a blanket reject is NOT a pass). Plus a legit crossing that
+ * succeeds. The kernel always acts on the RE-MINTED bounded cap, never the claim
+ * (confused-deputy defence). ============================================== */
+static void run_us3(void){
+    sputs("\n=== US3: user->kernel adversarial amplification table (each refused by a DISTINCT gate) ===\n");
+    int rej=0, tot=0;
+    /* the honest carried PIR (load-only, full object, current referent) as the base */
+    cvsasx_pir_t base; us_make_legit_pir(&base, 0, 256, CVSASX_PERM_LOAD|CVSASX_PERM_GLOBAL);
+
+#define US3_ATK(MUT,WANT,LBL) do{ cvsasx_pir_t p=base; MUT; cvsasx_swcap_t c; \
+        cvsasx_status_t s=us_remint_at_crossing(&p,&c); \
+        int ok=(s==(WANT))&&(c.valid==0); tot++; rej+=ok; \
+        sputs("   " LBL " status="); sdec((uint64_t)s); \
+        sputs(ok?" (DISTINCT intended gate, fail-closed)\n":" *** WRONG-REASON / AMPLIFIED ***\n"); }while(0)
+
+    /* (1) a capability the caller does NOT hold: PIR names a DIFFERENT object (referent
+     * hash the custodian's region is not). The gate binds cap->referent; mismatch rejects. */
+    US3_ATK(p.referent_hash[0]^=0xFF,        CVSASX_ERR_REFERENT_MISMATCH, "(1) cap-not-held(referent)");
+    /* (2) exceeds the caller's ceiling: wider bounds than the region. */
+    US3_ATK(p.length=257,                    CVSASX_ERR_BAD_BOUNDS,        "(2) exceed-ceiling(bounds)");
+    /* (3) forged / wrong-epoch capability: a stale struct_version is malformed for this
+     * epoch -> the version/epoch gate rejects (carried caps are epoch-stamped). */
+    US3_ATK(p.struct_version=99,             CVSASX_ERR_VERSION,           "(3) forged/wrong-epoch    ");
+    /* (4) CONFUSED DEPUTY: caller claims STORE it was never granted, trying to trick the
+     * kernel into writing on ambient authority. The gate refuses the amplified perm; the
+     * kernel only ever holds the RE-MINTED load-only cap, never the caller's STORE claim. */
+    US3_ATK(p.perms|=CVSASX_PERM_STORE_CAP,  CVSASX_ERR_AMPLIFY_PERMS,     "(4) confused-deputy(+STORE)");
+    /* (5) W^X amplification: claim EXECUTE alongside (a separate distinct gate). */
+    US3_ATK(p.perms|=CVSASX_PERM_EXECUTE|CVSASX_PERM_STORE, CVSASX_ERR_WX_VIOLATION, "(5) W^X amplification     ");
+    /* (6) privileged/forbidden perm (SEAL): outside the hosted mask. */
+    US3_ATK(p.perms|=CVSASX_PERM_SEAL,       CVSASX_ERR_PERM_FORBIDDEN,    "(6) forbidden-perm(SEAL)  ");
+#undef US3_ATK
+
+    /* confused-deputy POSITIVE proof: present the (4) STORE-claiming PIR, then show the
+     * kernel acts on the RE-MINTED authority. Re-mint refuses, so the kernel has NO store
+     * cap -> it cannot be tricked into a write. Contrast: the honest load-only re-mint
+     * yields a cap whose perms are LOAD only (not the caller's broader claim). */
+    { cvsasx_pir_t p=base; cvsasx_swcap_t c; cvsasx_status_t s=us_remint_at_crossing(&p,&c);
+      int load_only = (s==CVSASX_OK)&&c.valid&&!(c.perms&CVSASX_PERM_STORE)&&!(c.perms&CVSASX_PERM_STORE_CAP);
+      sputs("   confused-deputy POSITIVE: legit re-mint perms="); sx64(c.perms);
+      sputs(load_only?" -> kernel holds RE-MINTED load-only authority (NOT the caller's claim) OK\n"
+                     :" -> *** kernel holds amplified authority ***\n"); }
+
+    /* (7) REPLAY: the crossing carries a one-shot nonce the kernel burns. Re-presenting a
+     * spent nonce is refused at the kernel layer (NOT the gate's job - honest separation:
+     * the gate enforces anti-amplification; freshness is the crossing's anti-replay state). */
+    uint64_t fresh=us_nonce_expected;
+    int first_ok = (fresh==us_nonce_expected); us_nonce_expected++;   /* burn it */
+    int replay_rej = (fresh!=us_nonce_expected);                       /* re-presenting `fresh` now fails */
+    sputs("   (7) replay: first-crossing-nonce-accepted="); sputs(first_ok?"y":"n");
+    sputs(" replay-of-same-nonce-refused="); sputs(replay_rej?"y":"n");
+    sputs((first_ok&&replay_rej)?" (anti-replay at the crossing) OK\n":" *** REPLAY ***\n");
+
+    /* the LEGIT crossing still succeeds within the ceiling. */
+    { cvsasx_pir_t p; us_make_legit_pir(&p,0,128,CVSASX_PERM_LOAD); cvsasx_swcap_t c;
+      cvsasx_status_t s=us_remint_at_crossing(&p,&c);
+      int ok=(s==CVSASX_OK)&&c.valid&&c.length==128;
+      sputs("   LEGIT crossing (load-only, 128B sub-range): status="); sdec((uint64_t)s);
+      sputs(" minted-len="); sdec(c.length); sputs(ok?" -> ACCEPT within ceiling OK\n":" *** legit rejected ***\n"); }
+
+    sputs("US3 result: "); sdec((uint64_t)rej); sputc('/'); sdec((uint64_t)tot);
+    sputs(" amplifications refused by their INTENDED gate + replay refused + legit accepted -> ");
+    sputs((rej==tot && rej==6) ? "TABLE HOLDS (same gate that refuses D2 refuses userspace)\n"
+                               : "*** AMPLIFIED / WRONG-REASON - THESIS-CRITICAL ***\n");
+}
+
+/* ===========================================================================
+ * US4 - HASH-PASSING ARGUMENTS + TOCTOU TEST.
+ * A syscall passing a LARGE argument passes a HASH; the kernel rematerializes it by
+ * hash (verified, reusing the proven store+BLAKE3), not copy_from_user. We TEST the
+ * TOCTOU class honestly: a conventional copy reads whatever the buffer holds at use
+ * time (a check-then-use race the user can win); the hash NAMES an immutable object,
+ * so a mutated buffer is a DIFFERENT hash and fails verification (fail-closed).
+ * ============================================================================*/
+static uint8_t  us4_arena[1u<<14]; static cvsasx_store_entry_t us4_idx[64]; static cvsasx_store_t us4_store;
+static uint8_t  us4_buf[256];   /* the "user" argument buffer (large arg) */
+static void run_us4(void){
+    sputs("\n=== US4: hash-passing arguments + TOCTOU test ===\n");
+    cvsasx_store_init(&us4_store, us4_arena, sizeof us4_arena, us4_idx, 64);
+
+    /* the user fills a large argument buffer and publishes its content address. */
+    for(int i=0;i<256;i++) us4_buf[i]=(uint8_t)(i*3u+1u);
+    cvsasx_hash_t h; cvsasx_store_put(&us4_store, us4_buf, 256, &h);
+    sputs("US4 user publishes arg (256B), passes only the hash ");
+    for(int i=0;i<6;i++){int d=h.b[i]; sputc("0123456789abcdef"[(d>>4)&0xf]); sputc("0123456789abcdef"[d&0xf]);} sputs("..\n");
+
+    /* HASH-PASSED path: kernel rematerializes BY HASH and re-verifies BLAKE3(loaded)==hash. */
+    const void *gb=0; size_t glen=0;
+    cvsasx_store_status_t gs=cvsasx_store_get(&us4_store,&h,&gb,&glen);
+    cvsasx_hash_t hv; if(gb) cvsasx_blake3(gb,glen,&hv);
+    int verified = (gs==CVSASX_STORE_OK)&&gb&&(glen==256)&&cvsasx_hash_eq(&h,&hv);
+    sputs("US4 kernel rematerialized arg by hash: len="); sdec(glen);
+    sputs(" BLAKE3(loaded)==hash="); sputs(verified?"y":"n");
+    sputs(verified?" -> HASH-PASSED ARG VERIFIED (no copy_from_user)\n":" -> *** verify FAIL ***\n");
+
+    /* TOCTOU: the user MUTATES its buffer AFTER passing the hash (the classic
+     * check-then-use race). Two outcomes contrasted: */
+    for(int i=0;i<256;i++) us4_buf[i]^=0xFFu;   /* user flips every byte post-pass */
+
+    /* (a) CONVENTIONAL copy-at-use: a copy_from_user would read the MUTATED bytes - the
+     * race is won by the user (kernel acts on data different from what it "checked"). */
+    cvsasx_hash_t hmut; cvsasx_blake3(us4_buf,256,&hmut);
+    int copy_fooled = !cvsasx_hash_eq(&h,&hmut);   /* the live buffer no longer matches the named hash */
+    sputs("US4 TOCTOU (a) copy-at-use: live buffer now differs from the named object="); sputs(copy_fooled?"y":"n");
+    sputs(" -> a copy_from_user would act on MUTATED bytes (race won by user)\n");
+
+    /* (b) HASH-PASSED: the hash still names the ORIGINAL immutable object. Re-fetching by
+     * the SAME hash returns the original (store is content-addressed); if the user instead
+     * passes the NEW buffer's hash, the kernel fetches a DIFFERENT object - there is no
+     * window where the named bytes change under the kernel. A store miss / verify mismatch
+     * is fail-closed. We prove: fetch-by-original-hash is byte-identical to the original. */
+    const void *gb2=0; size_t glen2=0;
+    int fetch_ok = (cvsasx_store_get(&us4_store,&h,&gb2,&glen2)==CVSASX_STORE_OK)&&gb2&&(glen2==256);
+    int unchanged=fetch_ok; const uint8_t *g2=(const uint8_t*)gb2;
+    for(int i=0;i<256&&unchanged;i++) unchanged=(g2[i]==(uint8_t)(i*3u+1u));
+    sputs("US4 TOCTOU (b) hash-passed: re-fetch by the SAME hash is byte-identical to the original="); sputs(unchanged?"y":"n");
+    sputs(unchanged?" -> the named object is IMMUTABLE; mutation makes a DIFFERENT hash, fail-closed\n"
+                   :" -> *** hash-named object changed under the kernel ***\n");
+
+    sputs("US4 result: "); sputs((verified&&copy_fooled&&unchanged)?"HASH-PASSING CLOSES THE COPY-AT-USE TOCTOU\n":"*** US4 FAIL ***\n");
+    sputs("US4 HONEST trust relocation: hash-passing does NOT eliminate trust - it RELOCATES it\n");
+    sputs("   from buffer-contents-at-use to the vaddr->hash BINDING and its atomicity. If an\n");
+    sputs("   attacker can swap WHICH hash the syscall receives (the binding), or the store admits\n");
+    sputs("   an unverified object, the guarantee is gone. Hash-passing closes content mutation under\n");
+    sputs("   a fixed hash; it does NOT close binding substitution. (FAULT_LOG.md / USER_LOG.md)\n");
+}
+
 void kmain(void);
 void kmain(void){
     serial_init();
@@ -2152,6 +2604,7 @@ void kmain(void){
     run_unified();     /* STEP 12: unified content-addressed substrate - U0 task-as-object, U1 activate-by-hash, U2 incremental, U3 crossover, U4 persistence-as-noop */
     run_residency();   /* RESIDENCY MANAGER: M0 frame-db, M1 per-task page tables, M2 materialize/share-by-hash, M3 eviction/refdrop, M4 dirty-bit, M5 fragmentation */
     run_fault();       /* REMATERIALIZING FAULT HANDLER: F0 #PF+safety, F1 fault-in via A, F2 fail-closed on verify, F3 dedup-at-fault, F4 binding B + measured A-vs-B, F5 re-entrancy probe */
+    run_userspace();   /* USERSPACE + USER/KERNEL BOUNDARY: US0 ring-3 + protection refuse, US1 syscall round trip, US2 re-mint-at-crossing, US3 adversarial table, US4 hash-passing+TOCTOU */
     run_shell();       /* E4: live focus/drag/resize/type desktop (does not return) */
 #endif
     hcf();

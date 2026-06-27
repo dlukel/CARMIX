@@ -11,12 +11,14 @@ hidden.
 - USB input. Input is PS/2, which the emulator provides. Real modern hardware needs a USB HID
   stack over xHCI.
 - Persistent storage. There is no storage driver. NVMe or AHCI is needed.
-- A memory manager, a userspace, and a syscall boundary. A task substrate exists. The kernel
-  creates tasks, switches between them with a real assembly context switch, preempts a non-yielding
-  task on the timer interrupt, and can treat a task as a content-addressed object that
-  dematerializes and rematerializes through the proven store. See docs/ARCHITECTURE.md. What does
-  not exist is memory isolation between tasks, a user and kernel privilege split, a syscall
-  boundary, and a real memory manager. The tasks share the kernel address space.
+- Userspace memory management and a process loader. A ring-3 process, per-task page tables with
+  memory isolation, a user and kernel privilege split, and a syscall boundary that re-mints the
+  caller's bounded authority through the anti-amplification gate all exist. See docs/ARCHITECTURE.md.
+  What does not exist is a brk or mmap equivalent for a process over the residency manager, a real
+  loader that runs an ELF in ring 3 rather than a kernel-embedded user routine, more than one
+  concurrent ring-3 task with per-task user state in the scheduler, and a persistent, crash-surviving
+  replay-nonce for the crossing. The carried capability is bounded by the gate but its authenticity
+  binding to a trustworthy source through signing is the open trust-model question.
 - A complete content-addressed task object. The task state object today is the registers and the
   stack only. The page table and the capability slots are not yet part of it. A residency manager now
   gives tasks per-task page mappings, and dirty tracking is measured both ways, the x86-64 page-table
