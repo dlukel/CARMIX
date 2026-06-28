@@ -198,7 +198,8 @@ gate/     WebAssembly load-time safety checker and stack-machine executor
 carmix/   software capability backend that enforces the model with no capability hardware
 kernel/   the bootable x86-64 kernel, desktop, and the two-machine authorization harness
 proofs/   the Coq sources and a one-command verify
-docs/     architecture, the contribution, proofs, security model, build, reproduce, roadmap
+paper/    the interim whitepaper, LaTeX source and the built PDF
+docs/     architecture, theory, proofs, security model, glossary, build, reproduce, roadmap
 ```
 
 ## License and contributing
