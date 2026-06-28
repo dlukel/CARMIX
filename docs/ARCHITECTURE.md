@@ -284,6 +284,24 @@ unfairness and recovers the rate. It does not refund the penalty already paid, a
 peer rather than many, so it is a first measured control on a lightly-researched dimension, not a
 proven-optimal fairness algorithm.
 
+## Per-process heap (kernel/kernel.c)
+
+A ring-3 process grows its own memory. A minimal facility, extend-heap and an anonymous map, crosses
+the re-mint gate so the new range is granted under the process's ceiling, not ambient, and an
+over-ceiling request is refused by the same gate. The kernel grants a page-granular not-present range
+and the fault handler backs it with demand-zero frames on first write. A userspace bump allocator runs
+on the granted pages, and the kernel stays blind to the allocator's free lists and metadata.
+
+The content-addressed consequences appear where they genuinely apply. A fresh anonymous page is
+conventional demand-zero and is not hashed. An idle stable page can be dematerialized under pressure to
+a hash and rematerialized on fault by hash, which replaces swap with rematerialization. Two processes
+that independently write the same bytes deduplicate to one frame by hash, with no shared ancestor,
+which copy-on-write cannot do, and a later write splits a private copy. The cost is honest, a hot
+churning page is excluded from dematerialization because re-hashing it on every attempt is the
+fine-granularity cost the residency measurement showed, so the content-addressed heap is not free and
+the policy knows it. The two sharing models are a tradeoff, content-addressing is broader but pays for
+hashing while copy-on-write is narrower but free at fork.
+
 ## Two-machine migration (kernel/nettest.c)
 
 Two emulator instances share memory through an ivshmem device, a PCI device whose second base

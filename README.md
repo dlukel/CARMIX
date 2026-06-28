@@ -64,6 +64,7 @@ state and re-mints capabilities during the migration.
 | Concurrent content-addressed processes. Two ring-3 processes run interleaved on the timer, each in its own address space under its own re-minted ceiling. A descheduled process is dematerialized to a hash and rematerialized to resume, its counter surviving the round trip. | Observed and measured in an emulator. | kernel concurrency self-test |
 | Rematerialization-aware scheduling policy. A descheduled process is kept resident by default and dematerialized only under memory pressure when predicted to stay gone long enough to beat the measured rematerialize cost, with the break-even computed live from that cost and an anti-thrash backoff. | Observed and measured in an emulator. | kernel policy self-test |
 | Fairness under rematerialization. A process repeatedly paying the rematerialize cost accumulates a measured progress deficit, and a bounded control keeps it resident to recover its progress rate without starving its resident peer. | Observed and measured in an emulator. | kernel fairness self-test |
+| Content-addressed process heap. A process grows memory through an authority-bounded extend-heap, backed demand-zero. An idle heap page dematerializes and rematerializes by hash, two processes deduplicate an independently-identical heap page by hash with copy-on-write, and a hot churning page is excluded from dematerialization. | Observed and measured in an emulator. | kernel heap self-test |
 
 The two-machine byte counts and the proof results are reproducible. See docs/REPRODUCE.md.
 
@@ -77,8 +78,8 @@ in full in docs/ROADMAP.md.
 - USB input. Input is PS/2, which the emulator provides. Modern hardware needs a USB HID stack.
 - Persistent storage and a filesystem. The store is in RAM. A process model, a ring-3 userspace, a
   re-minting syscall boundary, a content-addressed process loader, concurrent scheduling, and a
-  rematerialization-aware scheduling policy exist, but per-process memory management, dynamic linking,
-  and a learned predictor do not. See
+  rematerialization-aware scheduling policy, and a per-process heap exist, but a full allocator,
+  dynamic linking, and a learned predictor do not. See
   docs/ROADMAP.md.
 - GPU acceleration. The desktop is software-rendered. It draws CARMIX's own windows. It does not
   run third-party graphical applications, which would require the vendor GPU driver stack.

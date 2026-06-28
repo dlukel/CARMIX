@@ -18,3 +18,7 @@ serial_*.log
 *.out
 *.tmp
 build/
+*.aux
+*.toc
+*.cache
+.lia.cache

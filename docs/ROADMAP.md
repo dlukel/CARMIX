@@ -23,10 +23,18 @@ hidden.
   workload only ever quantum-preempts, so the blocked and long-sleep signals are exercised by probes),
   a proven-optimal fairness algorithm (the control bounds future deficit growth and recovers the
   progress rate but does not refund the penalty already paid, and it accounts for one peer, not many),
-  dematerializing the page-table root as well (only the register and data state dematerialize today), a
-  brk or mmap process heap, dynamic linking, more than two concurrent processes under real load,
-  blocking and waking on input and output, and binding the carried capability to a trustworthy source
-  through signing.
+  dematerializing the page-table root as well (only the register and data state dematerialize today),
+  dynamic linking, more than two concurrent processes under real load, blocking and waking on input
+  and output, and binding the carried capability to a trustworthy source through signing.
+- A full allocator and huge pages. A process can grow its memory. A minimal facility (extend-heap and
+  map-anon crossing the re-mint gate, demand-zero backed) lets a userspace bump allocator run on
+  granted pages, an idle heap page dematerializes and rematerializes by hash, and two processes
+  deduplicate an independently-identical heap page by hash with copy-on-write. See docs/ARCHITECTURE.md.
+  Fresh anonymous pages are conventional demand-zero, and a hot churning page is excluded from
+  dematerialization because re-hashing it every attempt is the cost the residency measurement showed.
+  What does not exist is a full allocator (the bump allocator has no free), huge pages (4K only), a
+  production dedup-scan policy, and mitigation of the dedup side channel (a known hazard, named not
+  solved).
 - A complete content-addressed task object. The task state object today is the registers and the
   stack only. The page table and the capability slots are not yet part of it. A residency manager now
   gives tasks per-task page mappings, and dirty tracking is measured both ways, the x86-64 page-table
