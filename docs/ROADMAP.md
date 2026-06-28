@@ -11,15 +11,20 @@ hidden.
 - USB input. Input is PS/2, which the emulator provides. Real modern hardware needs a USB HID
   stack over xHCI.
 - Persistent storage. There is no storage driver. NVMe or AHCI is needed.
-- A learned predictor and fairness control. A rematerialization-aware scheduling policy exists. It
-  keeps a descheduled process resident by default and dematerializes only under memory pressure when
-  the process is predicted to stay descheduled long enough to beat the measured rematerialize cost,
-  with a break-even computed live from that cost and an anti-thrash backoff. See docs/ARCHITECTURE.md.
-  What does not exist is a learned predictor (the heuristic uses cheap fixed signals, and the live
-  two-process workload only ever quantum-preempts, so the blocked and long-sleep signals are
-  exercised by probes), a fairness control (the per-process penalty is measured but not regulated),
-  dematerializing the page-table root as well (only the register and data state dematerialize today),
-  a brk or mmap process heap, dynamic linking, more than two concurrent processes under real load,
+- A learned predictor and a proven-optimal fairness algorithm. A rematerialization-aware scheduling
+  policy exists, and a fairness control over the rematerialization penalty exists. The policy keeps a
+  descheduled process resident by default and dematerializes only under memory pressure when the
+  process is predicted to stay descheduled long enough to beat the measured rematerialize cost, with a
+  break-even computed live from that cost and an anti-thrash backoff. The fairness control measures the
+  per-process progress deficit a repeatedly-rematerialized process accumulates and biases the policy to
+  keep a deficit-carrying process resident so it stops paying the penalty and its progress rate
+  recovers, bounded so it never starves the resident peer. See docs/ARCHITECTURE.md. What does not
+  exist is a learned predictor (the heuristic uses cheap fixed signals, and the live two-process
+  workload only ever quantum-preempts, so the blocked and long-sleep signals are exercised by probes),
+  a proven-optimal fairness algorithm (the control bounds future deficit growth and recovers the
+  progress rate but does not refund the penalty already paid, and it accounts for one peer, not many),
+  dematerializing the page-table root as well (only the register and data state dematerialize today), a
+  brk or mmap process heap, dynamic linking, more than two concurrent processes under real load,
   blocking and waking on input and output, and binding the carried capability to a trustworthy source
   through signing.
 - A complete content-addressed task object. The task state object today is the registers and the

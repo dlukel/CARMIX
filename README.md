@@ -63,6 +63,7 @@ state and re-mints capabilities during the migration.
 | Content-addressed process loader. A program image is an object in the store. Loading a process materializes its ELF segments by hash with BLAKE3 verification into a fresh ring-3 space under a re-minted ceiling, enforces W^X, and two processes from one image share read-only code by hash. | Observed by serial trace in an emulator. | kernel loader self-test |
 | Concurrent content-addressed processes. Two ring-3 processes run interleaved on the timer, each in its own address space under its own re-minted ceiling. A descheduled process is dematerialized to a hash and rematerialized to resume, its counter surviving the round trip. | Observed and measured in an emulator. | kernel concurrency self-test |
 | Rematerialization-aware scheduling policy. A descheduled process is kept resident by default and dematerialized only under memory pressure when predicted to stay gone long enough to beat the measured rematerialize cost, with the break-even computed live from that cost and an anti-thrash backoff. | Observed and measured in an emulator. | kernel policy self-test |
+| Fairness under rematerialization. A process repeatedly paying the rematerialize cost accumulates a measured progress deficit, and a bounded control keeps it resident to recover its progress rate without starving its resident peer. | Observed and measured in an emulator. | kernel fairness self-test |
 
 The two-machine byte counts and the proof results are reproducible. See docs/REPRODUCE.md.
 

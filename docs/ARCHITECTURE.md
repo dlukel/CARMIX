@@ -275,6 +275,15 @@ backoff keeps a just-rematerialized process resident so it is not dematerialized
 This is the local measured rule. It does not make scheduling free and it is not a unified scheduling
 model.
 
+A fairness control sits on top of the policy. A process that is repeatedly dematerialized pays the
+rematerialize cost on each return, so over equal scheduling turns it makes less progress than an
+always-resident peer, a measured per-process deficit. The control detects the deficit and biases the
+policy to keep the deficit-carrying process resident, which removes the penalty source so its progress
+rate recovers, bounded by a cap so it never starves the peer or overshoots. This bounds future
+unfairness and recovers the rate. It does not refund the penalty already paid, and it accounts for one
+peer rather than many, so it is a first measured control on a lightly-researched dimension, not a
+proven-optimal fairness algorithm.
+
 ## Two-machine migration (kernel/nettest.c)
 
 Two emulator instances share memory through an ivshmem device, a PCI device whose second base

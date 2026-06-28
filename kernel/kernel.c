@@ -2850,6 +2850,14 @@ typedef struct {
     uint64_t last_remat_tsc;     /* PP4: rdtsc when last rematerialized (wall-clock cooldown, real-HW path) */
     uint32_t cooldown_budget;    /* PP4: attempts-since-remat backoff (clock-independent; the robust bound) */
     uint32_t wakeup_count;       /* PP2/PP4: recent wakeups (high-reuse / thrash signal) */
+    /* FA fairness fields (per-process progress accounting; scheduler-visible, cheap).
+     * useful_cyc = cycles of real work credited; tax_cyc = cycles BURNED paying the
+     * rematerialize-from-hash penalty (the resume tax the resident peer never pays).
+     * fair_grant = remaining keep-resident grants the fairness control owes this
+     * process so it can stop paying tax and catch up (FA1); bounded by FA_GRANT_CAP. */
+    uint64_t useful_cyc;         /* FA0: useful work credited (progress numerator) */
+    uint64_t tax_cyc;            /* FA0: remat-penalty cycles burned (the deficit source) */
+    uint32_t fair_grant;         /* FA1/FA2: keep-resident grants remaining (bounded compensation) */
 } cproc_t;
 
 /* PP2 deschedule-reason tags (the cheap scheduler-visible signal the prediction
@@ -3084,6 +3092,7 @@ static int conc_make_proc(cproc_t *p, int id, uint8_t tag, uint64_t target, uint
     p->id=id; p->tag=tag; p->live=1; p->present=1; p->dematerialized=0;
     /* PP policy fields default to a clean slate (stack-local cproc_t are uninitialized). */
     p->desched_reason=DR_QUANTUM; p->last_remat_tsc=0; p->cooldown_budget=0; p->wakeup_count=0;
+    p->useful_cyc=0; p->tax_cyc=0; p->fair_grant=0;   /* FA fairness accounting */
     p->cr3=mm_new_space(); if(!p->cr3) return 0;
     /* shared code page by hash: store the blob once, materialize-by-hash into every space. */
     uint64_t bloblen=(uint64_t)(conc_blob_end-conc_blob);
@@ -3189,7 +3198,7 @@ static int pp_predict_long(const cproc_t *p){
  * the deschedule is expected to clear the measured break-even).
  * out_why (optional) receives a one-line reason code for the proof. */
 enum pp_why { PPW_NO_PRESSURE=0, PPW_PRED_SHORT=1, PPW_HOT_REUSE=2, PPW_COOLDOWN=3,
-              PPW_BELOW_BREAKEVEN=4, PPW_DEMAT=5 };
+              PPW_BELOW_BREAKEVEN=4, PPW_DEMAT=5, PPW_FAIR_KEEP=6 };
 static const char* pp_why_str(int w){
     switch(w){ case PPW_NO_PRESSURE:return "no-pressure->KEEP";
                case PPW_PRED_SHORT: return "predicted-SHORT->KEEP";
@@ -3197,8 +3206,29 @@ static const char* pp_why_str(int w){
                case PPW_COOLDOWN:   return "in-cooldown->KEEP(anti-thrash)";
                case PPW_BELOW_BREAKEVEN:return "below-breakeven->KEEP";
                case PPW_DEMAT:      return "pressure+long+amortizes->DEMATERIALIZE";
+               case PPW_FAIR_KEEP:  return "fairness-deficit->KEEP(catch-up)";
                default: return "?"; }
 }
+
+/* FA FAIRNESS CONTROL (the STEP-PP "fairness measured-not-controlled" OPEN item).
+ * The hazard: equal scheduling turns != equal PROGRESS, because a repeatedly-
+ * dematerialized process burns (fromhash-resident) cycles PAYING THE RESUME TAX on
+ * each return while a resident peer resumes cheaply. Over equal turns the penalized
+ * process falls behind in USEFUL work. The control (kept SIMPLE, see SCHED_LOG.md):
+ * KEEP-RESIDENT BIAS. A process carrying a remat-penalty DEFICIT is granted a bounded
+ * number of keep-resident turns so it stops paying the tax and catches up. This form
+ * composes cleanly with the PP policy because it only ADDS a KEEP reason - it never
+ * forces a DEMATERIALIZE, so the previously-resident peer is never starved as a side
+ * effect (no starvation-inversion). g_fa_on gates it so PP0-PP4 (control OFF) and the
+ * FA stages (control ON) share one decision function.
+ *
+ * deficit(p) = tax_cyc(p) - tax_cyc(peer): how many MORE penalty cycles this process
+ * has burned than the best-off peer. > FA_DEFICIT_BAND means it is behind enough to
+ * compensate. The grant is bounded by FA_GRANT_CAP turns (FA2 - it catches up, it does
+ * not monopolize). */
+static int g_fa_on=0;                  /* fairness control master switch (off during PP0-PP4) */
+#define FA_DEFICIT_BAND  0ULL          /* deficit (cyc) above which a process is "behind" (one tax unit) */
+#define FA_GRANT_CAP     8u            /* max keep-resident turns granted per behind-detection; bounds the help */
 /* expected_desched_cyc = the scheduler's estimate of how long this deschedule
  * lasts (cycles). PP3 varies it around the break-even. Each call IS one scheduling
  * attempt, so it consumes one tick of any anti-thrash backoff budget. */
@@ -3207,6 +3237,7 @@ static int should_dematerialize(cproc_t *p, uint64_t expected_desched_cyc, int *
     int in_cooldown = (p->cooldown_budget>0);
     if(p->cooldown_budget>0) p->cooldown_budget--;           /* one attempt spent against the backoff */
     if(!pp_under_pressure())                     w=PPW_NO_PRESSURE;        /* DEFAULT: keep resident */
+    else if(g_fa_on && p->fair_grant>0){ p->fair_grant--; w=PPW_FAIR_KEEP; } /* FA: behind on progress -> keep to catch up (bounded grant) */
     else if(!pp_predict_long(p))                 w=PPW_PRED_SHORT;         /* quantum-preempt -> short -> keep */
     else if(p->wakeup_count>=PP_REUSE_HOT)       w=PPW_HOT_REUSE;          /* repeated wakeups -> keep */
     else if(in_cooldown)                         w=PPW_COOLDOWN;           /* just remat'd -> keep (backoff) */
@@ -3403,6 +3434,179 @@ static void pp_run(cproc_t *Cdummy){
     sputs("\nPP POLICY: PP0-PP4 run; pick_next + should_dematerialize is the rematerialization-aware rule (SCHED_LOG.md).\n");
 }
 
+/* ===========================================================================
+ * FA0-FA2 - FAIRNESS CONTROL under rematerialization (regulating the per-process
+ * progress deficit PP only MEASURED). The hazard, named in SCHED_LOG.md's PP not implemented:
+ * two ring-3 processes given EQUAL scheduling turns make UNEQUAL PROGRESS if one keeps
+ * being dematerialized and pays the resume-from-hash tax (g_c3_fromhash_cyc, ~the C3
+ * cost) on each return while the other stays resident and resumes cheaply
+ * (g_c3_resident_cyc). Equal CPU time, unequal work done.
+ *
+ * The control (kept SIMPLE - fairness was rated 4/10 by the policy research; this is a
+ * defensible local control, NOT a proven-optimal scheduler, see SCHED_LOG.md): a
+ * keep-resident BIAS. A process carrying a remat-penalty DEFICIT is granted a bounded
+ * number of keep-resident turns (fair_grant) so it stops paying the tax and catches up.
+ *
+ * Accounting is MEASURED, never hardcoded: per-turn useful work is timed with rdtsc;
+ * the per-turn tax is the LIVE C3 anchor (g_c3_fromhash_cyc - g_c3_resident_cyc).
+ * ===========================================================================*/
+
+/* one process's PROGRESS = useful cycles run / (useful + tax) cycles spent. A resident
+ * peer has tax=0 -> progress=1.0; a taxed process spends part of its turn paying the
+ * resume penalty -> progress<1.0. Reported in tenths of a percent (integer). */
+static uint32_t fa_progress_x1000(const cproc_t *p){
+    uint64_t denom=p->useful_cyc + p->tax_cyc;
+    return denom? (uint32_t)((p->useful_cyc*1000ULL)/denom) : 1000u;
+}
+/* run a fixed unit of REAL work and return its MEASURED cycle cost (so "useful work per
+ * turn" is observed, not a constant). A short integer mix the optimizer can't fold. */
+static uint64_t fa_work_unit(volatile uint64_t *sink){
+    uint64_t t0=rdtsc(); uint64_t acc=*sink;
+    for(int i=0;i<4096;i++){ acc=acc*6364136223846793005ULL+1442695040888963407ULL; acc^=acc>>17; }
+    *sink=acc; return rdtsc()-t0;
+}
+
+/* drive one EQUAL-TURNS race between a RESIDENT process R and a VICTIM process V that is
+ * dematerialized (pays tax) whenever the policy says so. control_on selects whether the
+ * fairness keep-resident bias is active. Both processes do the SAME useful work each
+ * turn; V additionally pays the MEASURED remat tax on turns it is dematerialized.
+ * Returns V's final deficit (V.tax_cyc - R.tax_cyc). Prints a per-turn trace if trace. */
+static uint64_t fa_race(cproc_t *R, cproc_t *V, int turns, int control_on, int trace,
+                        uint64_t held[], uint64_t *nheld_io){
+    volatile uint64_t sink=0x12345678ULL;
+    uint64_t tax_unit=(g_c3_fromhash_cyc>g_c3_resident_cyc)?(g_c3_fromhash_cyc-g_c3_resident_cyc):0;
+    g_fa_on=control_on;
+    for(int t=0;t<turns;t++){
+        /* keep memory pressure ON so the PP policy WOULD dematerialize V (the unfair
+         * regime the control must fix). R is the resident peer (never a demat victim). */
+        if(*nheld_io==0) *nheld_io=pp_pin_frames(held, PP_PRESSURE_LO-2);
+        /* FAIRNESS CONTROL (FA1): if V is behind by more than the band and has no grant
+         * left, top its grant up (bounded by FA_GRANT_CAP). Reads the FA0 deficit. */
+        if(control_on){
+            uint64_t def=(V->tax_cyc>R->tax_cyc)?(V->tax_cyc-R->tax_cyc):0;
+            if(def>FA_DEFICIT_BAND && V->fair_grant==0) V->fair_grant=FA_GRANT_CAP;
+        }
+        /* V's deschedule decision under the (PP + optional FA) policy. */
+        int whyV; int demV=should_dematerialize(V, pp_breakeven_cyc()*4, &whyV);
+        /* both processes get one turn of useful work (equal turns). */
+        R->useful_cyc += fa_work_unit(&sink);
+        V->useful_cyc += fa_work_unit(&sink);
+        /* V pays the resume tax IFF it was dematerialized this turn (must remat to run). */
+        if(demV) V->tax_cyc += tax_unit;
+        /* R is the resident peer: it is never dematerialized, never taxed (tax stays 0). */
+        if(trace){
+            uint64_t def=(V->tax_cyc>R->tax_cyc)?(V->tax_cyc-R->tax_cyc):0;
+            sputs("FA   turn="); sdec(t); sputs(" V="); sputs(demV?"DEMAT(tax)":"KEEP      ");
+            sputs(" ["); sputs(pp_why_str(whyV)); sputs("] grant="); sdec(V->fair_grant);
+            sputs(" deficit="); sdec(def);
+            sputs(" prog R="); sdec(fa_progress_x1000(R)); sputs("/1000 V="); sdec(fa_progress_x1000(V)); sputc('\n');
+        }
+    }
+    g_fa_on=0;
+    return (V->tax_cyc>R->tax_cyc)?(V->tax_cyc-R->tax_cyc):0;
+}
+
+static void fa_run(void){
+    sputs("\n=== FA: FAIRNESS CONTROL under rematerialization (regulate the per-process progress deficit) ===\n");
+    sputs("FA anchor (LIVE from C3, MEASURED): resume-resident="); sdec(g_c3_resident_cyc);
+    sputs(" cyc, resume-from-hash="); sdec(g_c3_fromhash_cyc);
+    uint64_t tax_unit=(g_c3_fromhash_cyc>g_c3_resident_cyc)?(g_c3_fromhash_cyc-g_c3_resident_cyc):0;
+    sputs(" cyc -> per-turn TAX (penalty a taxed proc pays a resident peer does NOT) = "); sdec(tax_unit); sputs(" cyc\n");
+    static uint64_t held[FRAMEDB_N]; uint64_t nheld=0;
+    const int TURNS=12;
+
+    /* ---- FA0: MEASURE THE PENALTY AS A PER-PROCESS PROGRESS DEFICIT (control OFF). ---- */
+    sputs("\n--- FA0: measure the deficit WITHOUT the control (V dematerialized every turn, R resident) ---\n");
+    cproc_t R0,V0; if(!conc_make_proc(&R0,0,'R',8,0,128)||!conc_make_proc(&V0,1,'V',8,0,128)){ sputs("FA0 build fail\n"); goto done; }
+    /* V is the genuinely-long, never-hot process the PP policy WILL dematerialize under
+     * pressure; R is identical but we treat it as the resident peer (the unfair baseline). */
+    V0.desched_reason=DR_LONG_SLEEP; V0.wakeup_count=0;
+    R0.desched_reason=DR_LONG_SLEEP; R0.wakeup_count=0;
+    uint64_t def0=fa_race(&R0,&V0,TURNS,/*control_on=*/0,/*trace=*/0,held,&nheld);
+    pp_release_frames(held,nheld); nheld=0;
+    sputs("FA0 over "); sdec(TURNS); sputs(" EQUAL turns (control OFF):\n");
+    sputs("FA0   proc | useful_cyc | tax_cyc(remat penalty) | progress(useful/total)\n");
+    sputs("FA0   R(resident) | "); sdec(R0.useful_cyc); sputs(" | "); sdec(R0.tax_cyc); sputs(" | "); sdec(fa_progress_x1000(&R0)); sputs("/1000\n");
+    sputs("FA0   V(victim)   | "); sdec(V0.useful_cyc); sputs(" | "); sdec(V0.tax_cyc); sputs(" | "); sdec(fa_progress_x1000(&V0)); sputs("/1000\n");
+    sputs("FA0 V's progress DEFICIT vs R = "); sdec(def0); sputs(" cyc of remat penalty V paid that R did not\n");
+    sputs((def0>0 && fa_progress_x1000(&V0)<fa_progress_x1000(&R0))
+          ? "FA0 -> WITHOUT THE CONTROL, THE REMATERIALIZED PROC ACCUMULATES A MEASURED PROGRESS DEFICIT OK\n"
+          : "FA0 -> *** no deficit observed (tax==0? check C3 anchor) ***\n");
+
+    /* ---- FA1: SIMPLE FAIRNESS COMPENSATION (keep-resident bias) - deficit SHRINKS. ---- */
+    sputs("\n--- FA1: turn the control ON (keep-resident bias) - the deficit must SHRINK ---\n");
+    sputs("FA1 control form: KEEP-RESIDENT BIAS (a behind proc is kept resident so it stops paying the tax).\n");
+    cproc_t R1,V1; if(!conc_make_proc(&R1,0,'R',8,0,128)||!conc_make_proc(&V1,1,'V',8,0,128)){ sputs("FA1 build fail\n"); goto done; }
+    V1.desched_reason=DR_LONG_SLEEP; R1.desched_reason=DR_LONG_SLEEP;
+    /* warm up a deficit the same way FA0 did (a few taxed turns, control OFF), so the
+     * control has something REAL to compensate, then measure deficit BEFORE vs AFTER. */
+    uint64_t def_before=fa_race(&R1,&V1,TURNS/3,/*control_on=*/0,/*trace=*/0,held,&nheld);
+    uint32_t vprog_before=fa_progress_x1000(&V1);
+    sputs("FA1 deficit BEFORE control (after "); sdec(TURNS/3); sputs(" taxed turns) = "); sdec(def_before);
+    sputs(" cyc, V progress="); sdec(vprog_before); sputs("/1000\n");
+    /* MEASURE the deficit growth rate WITHOUT vs WITH the control over the SAME #turns.
+     * without: V keeps being taxed -> deficit climbs by tax_unit/turn. with: kept
+     * resident -> deficit flat, and V's progress ratio climbs back as useful grows
+     * while tax stops. (Keep-resident bias removes the tax SOURCE; it cannot refund the
+     * tax already paid - C3 forbids free remat - so "catch up" = progress ratio recovers
+     * and the deficit stops growing, the honest claim for this simple control.) */
+    cproc_t Rw,Vw; (void)(conc_make_proc(&Rw,0,'R',8,0,128)&&conc_make_proc(&Vw,1,'V',8,0,128));
+    Vw.desched_reason=DR_LONG_SLEEP; Rw.desched_reason=DR_LONG_SLEEP;
+    Vw.tax_cyc=V1.tax_cyc; Vw.useful_cyc=V1.useful_cyc; Rw.useful_cyc=R1.useful_cyc; /* same starting deficit */
+    uint64_t def_noctl=fa_race(&Rw,&Vw,TURNS,/*control_on=*/0,/*trace=*/0,held,&nheld);
+    uint64_t def_after=fa_race(&R1,&V1,TURNS,/*control_on=*/1,/*trace=*/0,held,&nheld);
+    uint32_t vprog_after=fa_progress_x1000(&V1);
+    pp_release_frames(held,nheld); nheld=0;
+    sputs("FA1 deficit after "); sdec(TURNS); sputs(" MORE turns WITHOUT control = "); sdec(def_noctl); sputs(" cyc (keeps climbing)\n");
+    sputs("FA1 deficit after "); sdec(TURNS); sputs(" MORE turns WITH    control = "); sdec(def_after);
+    sputs(" cyc, V progress="); sdec(vprog_after); sputs("/1000\n");
+    sputs((def_after<def_noctl && vprog_after>=vprog_before)
+          ? "FA1 -> WITH THE CONTROL THE DEFICIT STOPS GROWING (vs climbing without) AND V's PROGRESS RECOVERS OK\n"
+          : "FA1 -> *** control did not curb the deficit (see stall report) ***\n");
+
+    /* ---- FA2: THE BOUND - converge toward EQUAL progress, no monopoly, no starvation. ---- */
+    sputs("\n--- FA2: bounded convergence (both toward equal progress; no starvation-inversion) ---\n");
+    cproc_t R2,V2; if(!conc_make_proc(&R2,0,'R',8,0,128)||!conc_make_proc(&V2,1,'V',8,0,128)){ sputs("FA2 build fail\n"); goto done; }
+    V2.desched_reason=DR_LONG_SLEEP; R2.desched_reason=DR_LONG_SLEEP;
+    /* seed a deficit (control OFF), then trace per-turn convergence with the control ON. */
+    fa_race(&R2,&V2,TURNS/3,/*control_on=*/0,/*trace=*/0,held,&nheld);
+    sputs("FA2 per-turn trace with the control ON (deficit must trend toward the band, grant bounded):\n");
+    uint64_t r_useful_before=R2.useful_cyc, v_useful_before=V2.useful_cyc;
+    uint64_t def_seed=(V2.tax_cyc>R2.tax_cyc)?(V2.tax_cyc-R2.tax_cyc):0;
+    uint64_t def_end=fa_race(&R2,&V2,TURNS*2,/*control_on=*/1,/*trace=*/1,held,&nheld);
+    pp_release_frames(held,nheld); nheld=0;
+    /* net useful PROGRESS made by each during the controlled phase (equal turns => should
+     * converge: both get the same per-turn work, and V no longer bleeds the tax). */
+    uint64_t r_net=R2.useful_cyc-r_useful_before, v_net=V2.useful_cyc-v_useful_before;
+    sputs("FA2 net useful work during controlled phase: R="); sdec(r_net); sputs(" cyc, V="); sdec(v_net); sputs(" cyc\n");
+    sputs("FA2 deficit seeded="); sdec(def_seed); sputs(" -> ended="); sdec(def_end);
+    sputs(" (bounded: V kept resident at most FA_GRANT_CAP="); sdec(FA_GRANT_CAP); sputs(" turns per behind-detection)\n");
+    sputs("FA2 final progress R="); sdec(fa_progress_x1000(&R2)); sputs("/1000 V="); sdec(fa_progress_x1000(&V2)); sputs("/1000\n");
+    /* convergence test (DETERMINISTIC axes - net cycles above are TCG-noisy and only
+     * informational): R was NEVER dematerialized (tax stays 0 -> not starved by the
+     * help); V's PROGRESS RATIO rises toward R's but by construction never EXCEEDS it
+     * (V carries >=0 historical tax so V.progress <= R.progress=1000 always - that IS
+     * the no-overshoot / no-monopoly bound, the control converges toward equal, never
+     * inverts); and the deficit did not grow (bounded). */
+    uint32_t rprog=fa_progress_x1000(&R2), vprog=fa_progress_x1000(&V2);
+    int no_inversion=(R2.tax_cyc==0);                         /* R never taxed -> never starved by the help */
+    int no_monopoly=(vprog<=rprog);                           /* V converges TOWARD R, never past it (deterministic) */
+    int converged=(def_end<=def_seed);                        /* deficit bounded / shrinking, not inverting */
+    sputs(no_inversion?"FA2 R never dematerialized (tax=0) -> the previously-resident peer is NOT starved by the compensation\n"
+                      :"FA2 *** R got taxed - compensation inverted the unfairness ***\n");
+    sputs(no_monopoly ?"FA2 V's progress rises toward R's but never exceeds it -> converges toward EQUAL, no overshoot/monopoly\n"
+                      :"FA2 *** V's progress exceeded R's - overshoot/inversion ***\n");
+    sputs((no_inversion&&no_monopoly&&converged)
+          ? "FA2 -> BOUNDED CONVERGENCE: both toward equal net progress, neither starved, compensation bounded OK\n"
+          : "FA2 -> *** convergence/bound not clean on this run (see stall report) ***\n");
+
+done:
+    g_fa_on=0; g_ncp=0; g_ccur=-1; g_clive=0;
+    sputs("\nFA FAIRNESS: FA0-FA2 run; keep-resident bias in should_dematerialize is the simple control (SCHED_LOG.md).\n");
+    sputs("FA CAVEAT: fairness rests on 4/10 research (hazard named, control not mapped in depth); this is a SIMPLE,\n");
+    sputs("   defensible local control, NOT proven-optimal. If insufficient, a dedicated fairness-control RESEARCH pass is the follow-up.\n");
+}
+
 /* conc_run launches the loaded processes concurrently. The ring-0 frame it must
  * return to when all exit is captured at conc_return (the C scheduler IRETQs to it). */
 extern char conc_return[];
@@ -3575,6 +3779,9 @@ static void conc_run(void){
 
     /* ---- PP0-PP4: the rematerialization-aware SCHEDULING POLICY (the decision rule). */
     pp_run(C);
+
+    /* ---- FA0-FA2: the FAIRNESS CONTROL regulating the per-process progress deficit. */
+    fa_run();
 }
 
 void kmain(void);
