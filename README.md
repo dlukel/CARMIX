@@ -41,6 +41,37 @@ immutable memory model, with the authority guarantee enforced on each re-mint. T
 project in the space content-addresses program binaries. CARMIX content-addresses live computation
 state and re-mints capabilities during the migration.
 
+The deeper claim is that one mechanism does several jobs. A context switch, a page fault, a
+migration, a user-to-kernel crossing, a program load, and a deschedule are not separate
+subsystems here. Each is the same operation, rematerialize an object identified by its BLAKE3
+hash under a freshly re-minted authority ceiling that the anti-amplification gate refuses to let
+exceed the source. docs/THE_CONTRIBUTION.md states the claim as it would be stated to a reviewer,
+docs/THEORY.md states the authority property precisely, and docs/ARCHITECTURE.md walks the path.
+
+## Where this sits in the literature
+
+The axis CARMIX occupies, content-addressing live execution state and tying the capability
+re-mint to it, appears unoccupied in the surveyed systems. This is a positioning statement, not a
+claim of superiority. Each of the systems below is strong on its own axis.
+
+- Theseus makes safety a language property, with intralingual state and cell-based modules. Its
+  axis is language safety, not content-addressed live state.
+- Twizzler content-addresses data at rest, persistent objects in a single global address space.
+  Its objects are storage, not a running computation's live memory graph under a migrating
+  capability.
+- seL4 is the verified microkernel and capability system. It verifies and capability-izes time
+  and access, not the content of live state, and does not migrate state by content address.
+- MITOSIS provides fast remote process fork. It is remote creation, not a content-addressed
+  time-slice of an already-running computation, and it does not re-mint capabilities by content.
+- EROS and KeyKOS take a system-wide periodic checkpoint for persistence. The checkpoint is
+  decoupled from scheduling and is not a per-operation content-addressed rematerialization gated
+  by an authority ceiling.
+- Plan 9 unifies through namespaces, and Unix through files. CARMIX unifies through
+  rematerialization of content-addressed live execution. The unifying noun is different.
+
+The CARMIX axis is content-addressed live-execution state with the capability re-mint fused to
+it. docs/THE_CONTRIBUTION.md gives the precise prior-art difference.
+
 ## What is proven, what is measured, what is demonstrated
 
 | Claim | How strong | Where observed |
@@ -68,6 +99,34 @@ state and re-mints capabilities during the migration.
 
 The two-machine byte counts and the proof results are reproducible. See docs/REPRODUCE.md.
 
+## Status and maturity
+
+CARMIX is a working research prototype, roughly 40 to 45 percent of the way to a general-purpose
+operating system in the sense of the subsystems a Linux-like system needs. It is not finished and
+it is not production software. The estimate is a self-assessment, not a benchmark.
+
+What is demonstrated, each item verified by the evidence cited in the table above: boot on x86-64
+through a standard bootloader, a physical frame allocator and a four-level page mapper, an
+interrupt and fault path that dumps and halts rather than triple-faulting, a software-rendered
+desktop with windows, focus, drag, and resize, an in-kernel WebAssembly executor under the
+software capability gate, content-addressed in-kernel rematerialization, a task substrate with a
+real assembly context switch and timer preemption, a residency manager that treats physical
+memory as a content-addressed cache, a rematerializing page-fault handler, an authority-bounded
+ring-3 userspace and re-minting syscall boundary, a content-addressed process loader, two
+concurrent processes with descheduling as rematerialization, a rematerialization-aware scheduling
+policy with a fairness control, a per-process heap, two-machine diff-proportional migration over
+ivshmem, signed cross-machine authorization with real Ed25519, a signed key lifecycle, and a
+machine-checked Coq proof of the core authority guarantee.
+
+What is not built, the gap to general purpose: there is no filesystem and no persistent storage
+(the store is in RAM), no full heap allocator (the userspace allocator is bump-only with no free),
+no dynamic linking (the one loaded program is a static executable), no real-hardware bringup
+(everything runs in QEMU), no USB input (input is PS/2), no GPU acceleration (the desktop is
+software-rendered and runs only CARMIX's own windows), no interrupt-driven input, no NIC (the
+two-machine transport is ivshmem shared memory), no learned scheduling predictor, and no
+established root of trust for keys (the first authority key is baked in). The full list is in
+docs/ROADMAP.md.
+
 ## What this is not, yet
 
 CARMIX is not a general-purpose operating system. The following are not built. They are listed
@@ -92,8 +151,42 @@ The honesty of this list is what makes the proven parts credible.
 
 ## Build and run
 
-See docs/BUILD.md for the toolchain, pinned versions, and build commands. See docs/REPRODUCE.md
-for each demo, the exact command, and the number it prints.
+TESTING.md is the shortest path from a clean machine to a running kernel. docs/BUILD.md has the
+toolchain and pinned versions, and docs/REPRODUCE.md lists each demo, its exact command, and the
+number it prints.
+
+The build scripts read every tool location from environment variables and fail loudly if one is
+unset. Set all six, then build. Set BOOT_SECS=180 so the later self-test stages have time to run
+under the emulator's slower timing.
+
+```
+export CVSASX_CLANG=/path/to/clang \
+       CVSASX_LLD=/path/to/ld.lld \
+       CVSASX_NM=/path/to/llvm-nm \
+       CVSASX_OBJDUMP=/path/to/llvm-objdump \
+       LIMINE_DIR=/path/to/limine \
+       X86TOOLS=/path/to/qemu-prefix \
+       BOOT_SECS=180
+cd kernel
+bash build.sh
+```
+
+That boots headless with serial output and streams the self-test results. To watch the desktop
+draw its own windows and drive it by hand, run the prebuilt QEMU with its VNC server and attach a
+VNC client.
+
+```
+"$X86TOOLS/usr/bin/qemu-system-x86_64" -M q35 -m 512M \
+   -cdrom kernel/carmix.iso \
+   -vnc 0.0.0.0:1 -serial stdio -no-reboot \
+   -L "$X86TOOLS/usr/share/seabios" -L "$X86TOOLS/usr/share/qemu"
+# then attach a VNC client to localhost:5901
+```
+
+You will see CARMIX boot, the self-tests stream over serial, and the kernel draw its own
+framebuffer desktop, with live PS/2 mouse and keyboard at the run_shell stage. You will not see
+any third-party GUI application, browser, or GPU-accelerated graphics, because the desktop is
+software-rendered by design. The full walk-through is in TESTING.md.
 
 ## How it is organized
 

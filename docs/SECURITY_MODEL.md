@@ -1,7 +1,9 @@
 # Security model
 
 This document states the threat model for the two-machine migration, what each mechanism
-guarantees, and what is not yet provided.
+guarantees, and what is not yet provided. docs/THEORY.md states the same three layers, identity,
+provenance, and authority, as a formal model and gives the exact theorem Coq checks for the
+authority layer.
 
 ## Threat model
 

@@ -21,28 +21,58 @@ CHERI-LLVM Clang and a CHERI build of QEMU. They are not required to build or ru
 
 ## Build scripts
 
-The build scripts read the locations of the compiler, Limine, and QEMU from environment
-variables so they can be pointed at a local install.
+The build scripts read every tool location from environment variables so they can be pointed at a
+local install, and fail loudly if one is unset. There are no defaults baked into the shipped
+scripts.
 
 - `CVSASX_CLANG` path to the freestanding x86-64 clang.
 - `CVSASX_LLD` path to ld.lld.
+- `CVSASX_NM` path to llvm-nm, used for the post-link symbol audit (zero undefined, zero libc).
+- `CVSASX_OBJDUMP` path to llvm-objdump, used for the post-link instruction audit (zero CHERI).
 - `LIMINE_DIR` path to the Limine 9.6.x directory that holds limine.h, the boot files, and the
   limine tool.
 - `X86TOOLS` path to a prefix that holds qemu-system-x86_64 and xorriso under usr/bin, plus the
   SeaBIOS firmware.
+- `BOOT_SECS` the headless boot window in seconds. The default is 40, which reaches only the early
+  stages. Set 180 to observe every self-test through the live desktop shell.
 
 ## Build and boot the kernel
 
 ```
+export CVSASX_CLANG=/path/to/clang \
+       CVSASX_LLD=/path/to/ld.lld \
+       CVSASX_NM=/path/to/llvm-nm \
+       CVSASX_OBJDUMP=/path/to/llvm-objdump \
+       LIMINE_DIR=/path/to/limine \
+       X86TOOLS=/path/to/qemu-prefix \
+       BOOT_SECS=180
 cd kernel
-CVSASX_CLANG=/path/to/clang CVSASX_LLD=/path/to/ld.lld LIMINE_DIR=/path/to/limine \
-  X86TOOLS=/path/to/qemu-prefix bash build.sh
+bash build.sh
 ```
 
-This compiles the kernel and the linked-in modules, builds a hybrid BIOS and UEFI bootable ISO at
-kernel/carmix.iso, and boots it in QEMU with serial output. The boot prints a sequence of
-self-test results over serial. The expected results are listed in docs/REPRODUCE.md. The ISO is
-also bootable on a real machine from a USB stick, which has not been verified on physical hardware.
+This compiles the kernel and the linked-in modules, prints the link audit, builds a hybrid BIOS and
+UEFI bootable ISO at kernel/carmix.iso, and boots it headless in QEMU with serial output. The boot
+prints a sequence of self-test results over serial. The expected results are listed in
+docs/REPRODUCE.md. The ISO is also bootable on a real machine from a USB stick, which has not been
+verified on physical hardware.
+
+## Watch the desktop
+
+The headless build above drives the desktop, windows, cursor, focus, drag, and resize by scripted
+self-tests and proves them by pixel readback over serial. To watch the framebuffer and drive it by
+hand, boot the ISO under the prebuilt QEMU's VNC server and attach a VNC client.
+
+```
+"$X86TOOLS/usr/bin/qemu-system-x86_64" -M q35 -m 512M \
+   -cdrom kernel/carmix.iso \
+   -vnc 0.0.0.0:1 -serial stdio -no-reboot \
+   -L "$X86TOOLS/usr/share/seabios" -L "$X86TOOLS/usr/share/qemu"
+# then attach a VNC client to localhost:5901
+```
+
+A standard distro qemu-system-x86_64 built with a window backend can open a native window with
+`-display gtk` or `-display sdl` instead of the VNC server. What you will and will not see, and what
+the live run_shell stage accepts, is described in full in TESTING.md.
 
 ## Build and run the two-machine migration
 

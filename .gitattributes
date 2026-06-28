@@ -1,0 +1,14 @@
+# Normalize line endings to LF in the repository for all text files.
+* text=auto eol=lf
+
+# Mark source and text types explicitly so they normalize regardless of detection.
+*.c    text eol=lf
+*.h    text eol=lf
+*.S    text eol=lf
+*.s    text eol=lf
+*.sh   text eol=lf
+*.md   text eol=lf
+*.v    text eol=lf
+*.tex  text eol=lf
+*.txt  text eol=lf
+Makefile text eol=lf

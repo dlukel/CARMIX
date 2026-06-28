@@ -352,3 +352,153 @@ docs/SECURITY_MODEL.md.
 
 The proven modules ship exactly as verified. The kernel, the network harness, the proofs, and the
 documentation are the new code that uses them.
+
+## Diagrams
+
+These diagrams restate the prose above. They are not a separate design. GitHub renders the fenced
+mermaid blocks.
+
+### One operation
+
+Six events that a conventional kernel handles in six subsystems funnel through one path here,
+rematerialize a content-addressed object under a freshly re-minted authority ceiling. The diagram
+shows the funnel, not a claim that the six are identical in cost or frequency. The measured costs
+differ and are stated in the task-substrate and descheduling sections above.
+
+```mermaid
+flowchart TD
+  cs[Context switch]
+  pf[Page fault]
+  mig[Two-machine migration]
+  cross[User to kernel crossing]
+  load[Process load]
+  desc[Deschedule]
+
+  cs --> R
+  pf --> R
+  mig --> R
+  cross --> R
+  load --> R
+  desc --> R
+
+  subgraph R[Rematerialize under the gate]
+    h[Resolve target to a BLAKE3 hash]
+    m[Materialize the object from the store]
+    v[Verify loaded bytes hash to the requested hash]
+    g[Re-mint authority, capped at the source ceiling]
+    res[Install and resume, or fail closed]
+    h --> m --> v --> g --> res
+  end
+```
+
+### Trust model, three layers
+
+A migration is gated by three independent questions. Identity is what the content is, by hash.
+Provenance is who authorized this rematerialization, by an Ed25519 signature over the hash.
+Authority is how much the destination may do, by the re-minted ceiling. docs/THEORY.md and
+docs/SECURITY_MODEL.md state these in full.
+
+```mermaid
+flowchart TD
+  subgraph L1[Identity]
+    i1[Object named by BLAKE3 hash of its content]
+    i2[Each received block re-hashed and matched, else rejected]
+    i1 --> i2
+  end
+  subgraph L2[Provenance]
+    p1[Authorization record over the epoch root hash]
+    p2[Ed25519 signature, verified under the trusted source key]
+    p3[Key resolved through the trust store, unknown or revoked rejected]
+    p1 --> p2 --> p3
+  end
+  subgraph L3[Authority]
+    a1[Re-mint capped at the signed authority ceiling]
+    a2[Anti-amplification gate, never wider than the source]
+    a1 --> a2
+  end
+  L1 --> L2 --> L3 --> ok[Install and rematerialize]
+```
+
+### The anti-amplification gate
+
+The re-mint is fail-closed. A request inside the source ceiling is accepted. A request outside it
+is refused by a specific reason, not silently clamped to a weaker grant. The same decision logic
+runs in the cap/ model and in the carmix/ software backend the kernel links. proofs/Carmix.v
+proves the property the gate enforces.
+
+```mermaid
+flowchart TD
+  req[Re-mint request: bounds, perms, against source cap]
+  v0{Source capability valid}
+  v1{Bounds fit inside source region}
+  v2{Permissions a subset of source}
+  v3{Not write and execute together}
+  v4{No forbidden permission}
+  acc[ACCEPT: mint capability, no wider than source]
+  rej[REJECT fail-closed, by the distinct reason that fired]
+
+  req --> v0
+  v0 -- no --> rej
+  v0 -- yes --> v1
+  v1 -- no --> rej
+  v1 -- yes --> v2
+  v2 -- no --> rej
+  v2 -- yes --> v3
+  v3 -- no --> rej
+  v3 -- yes --> v4
+  v4 -- no --> rej
+  v4 -- yes --> acc
+```
+
+The property proofs/Carmix.v machine-checks is anti_amplification, that whenever the re-minted
+capability is valid it is below the source in the authority order, its range inside the source
+range and its permissions a subset of the source permissions.
+
+### Residency and the fault path
+
+Physical memory is a content-addressed cache over the store. A miss materializes a frame from a
+hash and verifies it before resume. An idle page can be dematerialized to a hash token and its
+frame released, then rematerialized on the next fault. Verification failure installs nothing and
+does not resume.
+
+```mermaid
+flowchart TD
+  acc[Access to a virtual address]
+  pte{Page present}
+  pte -- yes --> run[Execute, no fault]
+  pte -- no --> cls{Miss or protection fault}
+  cls -- protection --> trap[Fault dump, classified, not a miss]
+  cls -- miss --> hash[Resolve vaddr to content hash]
+  hash --> mat[Materialize object from the store]
+  mat --> ver{BLAKE3 of loaded bytes equals requested hash}
+  ver -- no --> fc[Install nothing, fail closed]
+  ver -- yes --> share{Hash already resident}
+  share -- yes --> map2[Map existing frame, bump refcount, shared read-only]
+  share -- no --> map1[Install new frame mapping]
+  map1 --> resume[Return, faulting instruction re-executes]
+  map2 --> resume
+
+  idle[Idle page under memory pressure] --> demat[Dematerialize to a hash token, release frame]
+  demat -. fault on next access .-> acc
+```
+
+### System layer map
+
+Boot hands the kernel long mode, page tables, a memory map, and a framebuffer. Above that the
+gate, the store, and the residency manager are the content-addressed core, processes and the
+scheduler and the heap run on them, and the desktop draws on top.
+
+```mermaid
+flowchart TD
+  boot[Limine boot: long mode, page tables, memmap, framebuffer]
+  boot --> kernel[Kernel: serial, IDT and faults, frame allocator, page mapper, timer, PS/2 input]
+  kernel --> core[Content-addressed core]
+  subgraph core[Content-addressed core]
+    gate[gate and carmix: WebAssembly SFI and software capability re-mint]
+    store[store and sls: BLAKE3 object store and structural diff]
+    resid[Residency manager and rematerializing fault handler]
+  end
+  core --> procs[Processes, scheduler, per-process heap, user and kernel crossing]
+  core --> net[Two-machine migration and signed authorization over ivshmem]
+  procs --> desk[Software-rendered desktop: compositor, windows, console, cursor]
+```

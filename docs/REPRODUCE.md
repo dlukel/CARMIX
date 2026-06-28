@@ -41,6 +41,9 @@ The serial output includes the following self-test results.
 - Desktop. The console scrolls, a window draws, the cursor tracks the mouse, the window raises on
   click, drags by the titlebar, and resizes by the grip, each confirmed by pixel readback.
 
+The run above is headless and the desktop is proven by pixel readback over serial. To watch the
+framebuffer and drive it by hand over VNC, see the graphical command in TESTING.md and docs/BUILD.md.
+
 ## Two-machine migration and signed authorization
 
 ```

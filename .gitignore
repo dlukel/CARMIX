@@ -2,6 +2,7 @@
 *.o
 *.elf
 *.iso
+*.img
 *.bin
 
 # Coq build outputs
@@ -10,15 +11,32 @@
 *.vok
 *.glob
 .*.aux
+*.lia.cache
+.lia.cache
+.nia.cache
 _audit.v
 
-# Captures and scratch
-*.log
-serial_*.log
-*.out
-*.tmp
-build/
+# LaTeX build outputs
 *.aux
+*.log
+*.out
 *.toc
 *.cache
-.lia.cache
+paper/*.aux
+paper/*.log
+paper/*.out
+paper/*.toc
+paper/*.pdf
+paper/*.bbl
+paper/*.blg
+paper/*.synctex.gz
+
+# Captures and scratch
+serial_*.log
+boot_full.log
+*.tmp
+build/
+
+# Local verification reports (not shipped)
+kernel/VERIFY_PUBLIC.md
+kernel/boot_full.log

@@ -2,7 +2,8 @@
 
 The proofs/ directory holds a Coq development that machine-checks the core authority guarantee.
 The development is axiom-free except for one stated collision-resistance hypothesis used only by
-the acyclicity result.
+the acyclicity result. docs/THEORY.md states the authority property and the three-layer trust model
+in precise prose. This document is the re-verification reference for it.
 
 ## What is proven
 
