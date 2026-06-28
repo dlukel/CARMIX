@@ -27,6 +27,7 @@ paper/*.log
 paper/*.out
 paper/*.toc
 paper/*.pdf
+!paper/carmix.pdf
 paper/*.bbl
 paper/*.blg
 paper/*.synctex.gz
