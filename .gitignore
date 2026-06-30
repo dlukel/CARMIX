@@ -41,3 +41,7 @@ build/
 # Local verification reports (not shipped)
 kernel/VERIFY_PUBLIC.md
 kernel/boot_full.log
+
+# local tooling / editor scratch (not part of the project)
+.claude/
+CLAUDE.md
