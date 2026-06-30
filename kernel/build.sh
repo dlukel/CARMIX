@@ -60,7 +60,23 @@ EOF
 "$LIM/limine" bios-install "$OUT/carmix.iso" 2>&1 | tail -1
 cp "$OUT/carmix.iso" "$HERE/carmix.iso"   # real-hardware-bootable (USB) + qemu
 
-echo "=== headless boot (serial, default 40s cap; set BOOT_SECS to observe later stages) ==="
-timeout "${BOOT_SECS:-40}" "$X/usr/bin/qemu-system-x86_64" -M q35 -m 512M -cdrom "$OUT/carmix.iso" \
-    -serial stdio -display none -no-reboot -L "$X/usr/share/seabios" -L "$X/usr/share/qemu" 2>&1 || true
+echo "=== headless boots (serial). Durable media: file-backed virtio-blk (legacy I/O BAR). ==="
+# A cold power-cycle = a SEPARATE qemu process on the SAME host disk image: RAM is genuinely
+# empty on the next boot; only the disk file carries state. SINGLE_BOOT=1 runs just one boot
+# (fast driver iteration). Otherwise: boot1 persists, boot2 (cold reboot) revives, boot3
+# (host-tampered image) shows detection.
+DISK="$OUT/carmix-disk.img"; truncate -s 64M "$DISK"
+QEMU="$X/usr/bin/qemu-system-x86_64"
+qrun(){ timeout "${BOOT_SECS:-40}" "$QEMU" -M q35 -m 512M -cdrom "$OUT/carmix.iso" \
+    -drive file="$DISK",format=raw,if=none,id=d0,cache=writethrough \
+    -device virtio-blk-pci,drive=d0,disable-modern=on,disable-legacy=off \
+    -serial stdio -display none -no-reboot -L "$X/usr/share/seabios" -L "$X/usr/share/qemu" 2>&1 || true; }
+echo "===== BOOT 1 (fresh disk: PERSIST phase) ====="; qrun
+if [ -z "${SINGLE_BOOT:-}" ]; then
+  echo "===== COLD REBOOT: qemu exited, RAM gone, disk image persists on host ====="
+  echo "===== BOOT 2 (same disk: REVIVE phase) ====="; qrun
+  echo "===== TAMPER: host flips one byte in an on-disk object payload (block 2 +5) ====="
+  printf '\xA5' | dd of="$DISK" bs=1 seek=$((2*4096+5)) count=1 conv=notrunc 2>/dev/null
+  echo "===== BOOT 3 (host-tampered disk: detection) ====="; qrun
+fi
 rm -rf "$OUT"

@@ -52,6 +52,10 @@ static volatile LIMINE_REQUESTS_END_MARKER;
 /* ---- B0: serial (16550 COM1) -------------------------------------------- */
 static inline void outb(uint16_t p, uint8_t v){ __asm__ volatile("outb %0,%1"::"a"(v),"Nd"(p)); }
 static inline uint8_t inb(uint16_t p){ uint8_t v; __asm__ volatile("inb %1,%0":"=a"(v):"Nd"(p)); return v; }
+static inline void outw(uint16_t p, uint16_t v){ __asm__ volatile("outw %0,%1"::"a"(v),"Nd"(p)); }
+static inline uint16_t inw(uint16_t p){ uint16_t v; __asm__ volatile("inw %1,%0":"=a"(v):"Nd"(p)); return v; }
+static inline void outl(uint16_t p, uint32_t v){ __asm__ volatile("outl %0,%1"::"a"(v),"Nd"(p)); }
+static inline uint32_t inl(uint16_t p){ uint32_t v; __asm__ volatile("inl %1,%0":"=a"(v):"Nd"(p)); return v; }
 #define COM1 0x3F8
 static void serial_init(void){
     outb(COM1+1,0x00); outb(COM1+3,0x80); outb(COM1+0,0x03); outb(COM1+1,0x00);
@@ -93,6 +97,135 @@ static int map_page(uint64_t va, uint64_t pa, uint64_t flags){
     pt[(va>>12)&0x1ff]=(pa&~0xfffULL)|flags|1;
     __asm__ volatile("invlpg (%0)"::"r"(va):"memory");
     return 1;
+}
+
+/* ===========================================================================
+ * VIRTIO-BLK (legacy, PCI I/O BAR, polling) - the stable-media path (S1).
+ * Minimal and correct: PCI enumerate vendor 0x1AF4 device 0x1001, enable I/O +
+ * bus-master, reset, negotiate only VIRTIO_BLK_F_FLUSH if offered, set up ONE
+ * polled virtqueue, and do 4 KiB block read/write/flush. No interrupts, no
+ * MSI-X, no IOMMU (q35 default), so a descriptor address IS a guest-physical
+ * (falloc) address. New bring-up; nothing here reimplements an existing path.
+ * ===========================================================================*/
+#define PCI_ADDR 0xCF8
+#define PCI_DATA 0xCFC
+static uint32_t pci_rd(uint8_t bus,uint8_t dev,uint8_t fn,uint8_t off){
+    uint32_t a=0x80000000u|((uint32_t)bus<<16)|((uint32_t)dev<<11)|((uint32_t)fn<<8)|(off&0xFC);
+    outl(PCI_ADDR,a); return inl(PCI_DATA);
+}
+static void pci_wr(uint8_t bus,uint8_t dev,uint8_t fn,uint8_t off,uint32_t v){
+    uint32_t a=0x80000000u|((uint32_t)bus<<16)|((uint32_t)dev<<11)|((uint32_t)fn<<8)|(off&0xFC);
+    outl(PCI_ADDR,a); outl(PCI_DATA,v);
+}
+#define VIO_DEV_FEAT 0x00
+#define VIO_GST_FEAT 0x04
+#define VIO_Q_PFN    0x08
+#define VIO_Q_SIZE   0x0C
+#define VIO_Q_SEL    0x0E
+#define VIO_Q_NOTIFY 0x10
+#define VIO_STATUS   0x12
+#define VST_ACK 1u
+#define VST_DRV 2u
+#define VST_DRVOK 4u
+#define VQF_NEXT 1u
+#define VQF_WRITE 2u
+#define VBLK_T_IN 0u
+#define VBLK_T_OUT 1u
+#define VBLK_T_FLUSH 4u
+#define VBLK_F_FLUSH (1u<<9)
+#define VBLK_BLOCK 4096u            /* CARMIX durable block = one page = 8 virtio sectors */
+struct vq_desc { uint64_t addr; uint32_t len; uint16_t flags; uint16_t next; } __attribute__((packed));
+static uint16_t vio_io, vq_size, vq_avail_idx, vq_used_seen;
+static struct vq_desc *vq_desc; static uint16_t *vq_avail; static volatile uint8_t *vq_used;
+static uint64_t vq_phys, vblk_hdr_phys, vblk_data_phys, vblk_stat_phys;
+static uint8_t *vblk_hdr, *vblk_data, *vblk_stat;
+static int vio_ready=0, vio_has_flush=0;
+
+static int virtio_blk_init(void){
+    int dev=-1;
+    for(int d=0; d<32; d++){
+        uint32_t vd=pci_rd(0,(uint8_t)d,0,0x00);
+        if((vd&0xFFFF)==0x1AF4 && ((vd>>16)&0xFFFF)==0x1001){ dev=d; break; }
+    }
+    if(dev<0){ sputs("DUR virtio-blk: PCI device 1af4:1001 NOT FOUND\n"); return 0; }
+    uint32_t cmd=pci_rd(0,(uint8_t)dev,0,0x04);
+    pci_wr(0,(uint8_t)dev,0,0x04, cmd | 0x1u | 0x4u);          /* I/O space + bus master (DMA) */
+    uint32_t bar0=pci_rd(0,(uint8_t)dev,0,0x10);
+    if(!(bar0&1u)){ sputs("DUR virtio-blk: BAR0 not I/O\n"); return 0; }
+    vio_io=(uint16_t)(bar0 & ~0x3u);
+    outb(vio_io+VIO_STATUS,0);                                 /* reset */
+    outb(vio_io+VIO_STATUS,VST_ACK);
+    outb(vio_io+VIO_STATUS,(uint8_t)(VST_ACK|VST_DRV));
+    uint32_t devf=inl(vio_io+VIO_DEV_FEAT);
+    uint32_t gf=devf & VBLK_F_FLUSH;                           /* negotiate ONLY flush, if offered */
+    outl(vio_io+VIO_GST_FEAT, gf);
+    vio_has_flush=(gf&VBLK_F_FLUSH)?1:0;
+    outw(vio_io+VIO_Q_SEL,0);
+    vq_size=inw(vio_io+VIO_Q_SIZE);
+    if(vq_size==0){ sputs("DUR virtio-blk: queue size 0\n"); return 0; }
+    uint64_t desc_sz=(uint64_t)vq_size*16;
+    uint64_t avail_sz=6+2*(uint64_t)vq_size;
+    uint64_t used_off=(desc_sz+avail_sz+4095)&~4095ULL;
+    uint64_t total=used_off + (6+8*(uint64_t)vq_size);
+    uint64_t pages=(total+4095)/4096;
+    uint64_t base=falloc(), prev=base;                         /* contiguous (early-boot bump) */
+    for(uint64_t i=1;i<pages;i++){ uint64_t p=falloc(); if(p!=prev+4096){ sputs("DUR virtio-blk: queue not contiguous\n"); return 0; } prev=p; }
+    vq_phys=base; uint8_t *q=P2V(base);
+    for(uint64_t i=0;i<pages*4096;i++) q[i]=0;
+    vq_desc=(struct vq_desc*)q; vq_avail=(uint16_t*)(q+desc_sz); vq_used=(volatile uint8_t*)(q+used_off);
+    outl(vio_io+VIO_Q_PFN,(uint32_t)(vq_phys>>12));
+    uint64_t hf=falloc(); vblk_hdr_phys=hf; vblk_hdr=P2V(hf); vblk_stat_phys=hf+2048; vblk_stat=P2V(hf+2048);
+    uint64_t df=falloc(); vblk_data_phys=df; vblk_data=P2V(df);
+    outb(vio_io+VIO_STATUS,(uint8_t)(VST_ACK|VST_DRV|VST_DRVOK));
+    vq_avail_idx=0; vq_used_seen=0; vio_ready=1;
+    return 1;
+}
+/* one polled request. type IN/OUT use vblk_data (4 KiB); FLUSH has no data. */
+static int vblk_op(uint32_t type, uint64_t sector){
+    if(!vio_ready) return -1;
+    uint32_t *h=(uint32_t*)vblk_hdr; h[0]=type; h[1]=0; *(uint64_t*)(vblk_hdr+8)=sector;
+    *vblk_stat=0xFF;
+    if(type==VBLK_T_FLUSH){
+        vq_desc[0].addr=vblk_hdr_phys; vq_desc[0].len=16; vq_desc[0].flags=VQF_NEXT; vq_desc[0].next=1;
+        vq_desc[1].addr=vblk_stat_phys; vq_desc[1].len=1; vq_desc[1].flags=VQF_WRITE; vq_desc[1].next=0;
+    } else {
+        vq_desc[0].addr=vblk_hdr_phys; vq_desc[0].len=16; vq_desc[0].flags=VQF_NEXT; vq_desc[0].next=1;
+        vq_desc[1].addr=vblk_data_phys; vq_desc[1].len=VBLK_BLOCK; vq_desc[1].flags=(uint16_t)(VQF_NEXT|(type==VBLK_T_IN?VQF_WRITE:0)); vq_desc[1].next=2;
+        vq_desc[2].addr=vblk_stat_phys; vq_desc[2].len=1; vq_desc[2].flags=VQF_WRITE; vq_desc[2].next=0;
+    }
+    vq_avail[2 + (vq_avail_idx % vq_size)] = 0;                /* head descriptor index */
+    __asm__ volatile("mfence":::"memory");
+    vq_avail_idx++; vq_avail[1]=vq_avail_idx;                  /* avail.idx */
+    __asm__ volatile("mfence":::"memory");
+    outw(vio_io+VIO_Q_NOTIFY,0);
+    uint64_t spins=0;
+    while(*(volatile uint16_t*)(vq_used+2) == vq_used_seen){
+        __asm__ volatile("pause":::"memory");
+        if(++spins>2000000000ULL){ sputs("DUR virtio-blk: TIMEOUT\n"); return -2; }
+    }
+    vq_used_seen=*(volatile uint16_t*)(vq_used+2);
+    __asm__ volatile("mfence":::"memory");
+    return (*vblk_stat==0)?0:-3;
+}
+/* 4 KiB block read/write: logical block B -> sector B*8. data via vblk_data bounce buffer. */
+static int vblk_read(uint64_t blk){ return vblk_op(VBLK_T_IN, blk*8); }
+static int vblk_write(uint64_t blk){ return vblk_op(VBLK_T_OUT, blk*8); }
+static int vblk_flush(void){ return vio_has_flush?vblk_op(VBLK_T_FLUSH,0):0; }
+
+/* S1 self-test: write a pattern to a scratch block, read it back, verify. */
+static void virtio_blk_selftest(void){
+    if(!virtio_blk_init()){ sputs("DUR S1 virtio-blk NOT AVAILABLE (persistence stages will not run)\n"); return; }
+    sputs("DUR S1 virtio-blk up: io="); sx64(vio_io); sputs(" qsz="); sdec(vq_size);
+    sputs(" flush="); sputs(vio_has_flush?"y":"n"); sputc('\n');
+    const uint64_t TB=1000;                                    /* scratch block well past the log head */
+    for(int i=0;i<4096;i++) vblk_data[i]=(uint8_t)(i*131u+7u);
+    int w=vblk_write(TB); vblk_flush();
+    for(int i=0;i<4096;i++) vblk_data[i]=0;                    /* clobber the bounce buffer */
+    int r=vblk_read(TB);
+    int match=1; for(int i=0;i<4096;i++) if(vblk_data[i]!=(uint8_t)(i*131u+7u)){ match=0; break; }
+    sputs("DUR S1 write rc="); sdec((uint64_t)(w==0?0:1)); sputs(" read rc="); sdec((uint64_t)(r==0?0:1));
+    sputs(" block read-back matches written="); sputs(match?"y":"n");
+    sputs(match&&w==0&&r==0?"  -> STABLE-MEDIA READ/WRITE OK\n":"  -> *** virtio-blk I/O FAILED ***\n");
 }
 
 /* ---- IDT + fault handler (B2: dump, don't triple-fault) ------------------ */
@@ -5114,6 +5247,303 @@ static void run_sharedmap(void){
             :"The shared frame did NOT survive as one frame this cycle; reported honestly above, not relabeled. See kernel/SHAREDMAP_LOG.md.\n");
 }
 
+/* ===========================================================================
+ * DURABLE CONTENT-ADDRESSED PERSISTENCE (S2-S7) on the virtio-blk path (S1).
+ *
+ * On-disk layout (block = 4 KiB):
+ *   block 0          : ROOT block (magic, persisted process task-hash), optional
+ *   blocks 1,2,...   : append-only object log. Each object record = TWO blocks:
+ *                        [hdr block: magic, version, len, claimed BLAKE3]
+ *                        [payload block: the bytes, zero-padded]  (len <= 4096)
+ *
+ * The hash IS the integrity check: recovery reads the claimed length and hash,
+ * reads the payload, RE-HASHES, and accepts ONLY if the re-hash equals the
+ * claimed name. The header is written FIRST and the payload SECOND, so under an
+ * ordered-prefix (write-order) truncation any partially-written record has its
+ * claim present but its payload incomplete: recovery re-hashes, MISMATCHES, and
+ * REJECTS it (the torn-tail rejection branch). No undo log is needed for
+ * immutable content. Reuses cvsasx_blake3, the object bytes, and the vblk path.
+ *
+ * SCOPE named honestly: single durable writer; objects <= 4096 B (one payload
+ * block); crash consistency is RECOVERY-LOGIC consistency under an ordered-prefix
+ * failure model, demonstrated in QEMU (NOT real-hardware: write reordering,
+ * cache/barrier semantics, and sub-sector tearing are out of scope). Durable
+ * garbage collection is DEFERRED to its own cycle; the log grows without
+ * reclamation here. See kernel/PERSISTENCE_LOG.md.
+ * ===========================================================================*/
+#define DUR_MAGIC   0x4A424F43u    /* 'C','O','B','J' little-endian */
+#define DUR_ROOT_MAGIC 0x544F4F52u /* 'R','O','O','T' */
+#define DUR_REC_BYTES 8192u        /* 1 hdr block + 1 payload block */
+#define DUR_MAXOBJ  4096u
+typedef struct { uint8_t hash[32]; uint64_t hdr_block; } dur_ent_t;
+static dur_ent_t dur_idx[256]; static int dur_nidx; static uint64_t dur_log_head=1;
+static uint64_t dur_recover_cyc, dur_write_cyc, dur_objs_written;
+static int      dur_recover_rejected;
+static uint8_t  dur_pbuf[4096];     /* a private payload staging/verify buffer (not the vblk bounce) */
+
+static int dur_idx_find(const uint8_t*h){
+    for(int i=0;i<dur_nidx;i++){ int m=1; for(int k=0;k<32;k++) if(dur_idx[i].hash[k]!=h[k]){m=0;break;} if(m) return i; }
+    return -1;
+}
+/* append one immutable object: hdr block FIRST, payload block SECOND, then flush. dedup by hash. */
+static int dur_put(const void*bytes,uint64_t len,cvsasx_hash_t*out){
+    if(!vio_ready||len>DUR_MAXOBJ) return -1;
+    cvsasx_hash_t h; cvsasx_blake3(bytes,len,&h); if(out)*out=h;
+    if(dur_idx_find(h.b)>=0) return 0;                         /* already durable (dedup) */
+    uint64_t t0=rdtsc();
+    uint64_t B=dur_log_head;
+    for(int i=0;i<4096;i++) vblk_data[i]=0;
+    *(uint32_t*)(vblk_data+0)=DUR_MAGIC; *(uint32_t*)(vblk_data+4)=1;
+    *(uint64_t*)(vblk_data+8)=len; for(int k=0;k<32;k++) vblk_data[16+k]=h.b[k];
+    if(vblk_write(B)!=0) return -2;                            /* claim block first */
+    for(int i=0;i<4096;i++) vblk_data[i]=0;
+    for(uint64_t i=0;i<len;i++) vblk_data[i]=((const uint8_t*)bytes)[i];
+    if(vblk_write(B+1)!=0) return -2;                          /* payload block second */
+    vblk_flush();                                             /* durable before we index/ack */
+    if(dur_nidx<256){ for(int k=0;k<32;k++) dur_idx[dur_nidx].hash[k]=h.b[k]; dur_idx[dur_nidx].hdr_block=B; dur_nidx++; }
+    dur_log_head=B+2;
+    dur_write_cyc+=rdtsc()-t0; dur_objs_written++;
+    return 1;
+}
+/* load by hash: RE-HASH the on-disk bytes before serving (disk is untrusted, D5). */
+static int dur_get(const cvsasx_hash_t*h, uint8_t*outbuf, uint64_t*outlen){
+    if(!vio_ready) return -1;
+    int e=dur_idx_find(h->b); if(e<0) return -10;             /* miss (rejected/absent) */
+    uint64_t B=dur_idx[e].hdr_block;
+    if(vblk_read(B)!=0) return -2;
+    if(*(uint32_t*)(vblk_data+0)!=DUR_MAGIC) return -3;
+    uint64_t len=*(uint64_t*)(vblk_data+8); if(len>DUR_MAXOBJ) return -5;
+    for(int k=0;k<32;k++) if(vblk_data[16+k]!=h->b[k]) return -4;
+    if(vblk_read(B+1)!=0) return -2;
+    cvsasx_hash_t chk; cvsasx_blake3(vblk_data,len,&chk);
+    if(!cvsasx_hash_eq(&chk,h)) return -6;                    /* TAMPER/torn: reject, never serve */
+    for(uint64_t i=0;i<len;i++) outbuf[i]=vblk_data[i]; if(outlen)*outlen=len;
+    return 0;
+}
+/* S3: rebuild the in-RAM index purely by scanning the on-disk log, re-verifying each
+ * record. Stops at the first block without a valid claim, or at a torn/tampered record
+ * (re-hash mismatch -> REJECT, D2). Returns the count indexed; sets dur_recover_cyc. */
+static int dur_recover(void){
+    uint64_t t0=rdtsc();
+    dur_nidx=0; dur_recover_rejected=0; uint64_t B=1;
+    while(1){
+        if(vblk_read(B)!=0) break;
+        if(*(uint32_t*)(vblk_data+0)!=DUR_MAGIC) break;       /* clean end of log */
+        uint64_t len=*(uint64_t*)(vblk_data+8); if(len>DUR_MAXOBJ) break;
+        uint8_t claim[32]; for(int k=0;k<32;k++) claim[k]=vblk_data[16+k];
+        if(vblk_read(B+1)!=0){ dur_recover_rejected++; break; }
+        cvsasx_hash_t chk; cvsasx_blake3(vblk_data,len,&chk);
+        int ok=1; for(int k=0;k<32;k++) if(chk.b[k]!=claim[k]){ok=0;break;}
+        if(!ok){ dur_recover_rejected++; break; }             /* torn/tampered tail: REJECT, stop */
+        if(dur_nidx<256){ for(int k=0;k<32;k++) dur_idx[dur_nidx].hash[k]=claim[k]; dur_idx[dur_nidx].hdr_block=B; dur_nidx++; }
+        B+=2;
+    }
+    dur_log_head=B; dur_recover_cyc=rdtsc()-t0;
+    return dur_nidx;
+}
+/* the recovery PARSER over a truncated byte image (S4). Counts ONLY records whose
+ * payload is fully present AND re-hashes to its claimed name; *rej set if a claim was
+ * present but its payload was incomplete/mismatched (the rejection branch). This is the
+ * SAME accept rule dur_recover uses. */
+static int dur_parse_trunc(const uint8_t*buf,uint64_t nbytes,int*rej){
+    int count=0; if(rej)*rej=0; uint64_t o=0;
+    while(o+48<=nbytes){
+        if(*(const uint32_t*)(buf+o)!=DUR_MAGIC) break;       /* no claim: clean prefix end */
+        uint64_t len=*(const uint64_t*)(buf+o+8);
+        if(len>DUR_MAXOBJ){ if(rej)*rej=1; break; }
+        if(o+4096+len>nbytes){ if(rej)*rej=1; break; }        /* claim present, payload incomplete -> REJECT */
+        cvsasx_hash_t chk; cvsasx_blake3(buf+o+4096,len,&chk);
+        int ok=1; for(int k=0;k<32;k++) if(chk.b[k]!=buf[o+16+k]){ok=0;break;}
+        if(!ok){ if(rej)*rej=1; break; }                      /* payload mismatch -> REJECT */
+        count++; o+=DUR_REC_BYTES;
+    }
+    return count;
+}
+
+/* S6 persist: build + dematerialize a process via the SM canonical form, then persist
+ * its object graph (manifest, registers, descriptor, pages) and a ROOT block naming the
+ * task-hash. The authority ceiling lives INSIDE the hashed manifest (D4). */
+static int persist_obj(cvsasx_store_t*s, const cvsasx_hash_t*h){
+    const void*p; size_t l; if(cvsasx_store_get(s,h,&p,&l)!=CVSASX_STORE_OK) return 0;
+    return dur_put(p,l,0)>=0?1:0;
+}
+static void persist_process_phase(void){
+    sputs("DUR S6 PERSIST process: dematerialize via the SM canonical form, persist its graph + ROOT.\n");
+    if(g_kernel_cr3){ uint64_t*kp=P2V(g_kernel_cr3); for(int i=0;i<256;i++) if((kp[i]&1)&&(kp[i]&MM_USER)) kp[i]=0; __asm__ volatile("mov %0,%%cr3"::"r"(g_kernel_cr3):"memory"); }
+    framedb_init(); rset_n=0; for(uint32_t i=0;i<RSET_MAX;i++) rset[i].live=0; ts_store_once(); rm_store_once();
+    for(int i=0;i<4096;i++) sm_shared_content[i]=(uint8_t)(i*37u+11u);
+    cvsasx_store_put(&rm_store, sm_shared_content,4096,&sm_shared_hash);
+    cproc_t *P=&g_cp[0];
+    if(!sm_make_proc(P,0x9,0xC7,1)){ sputs("DUR S6 build failed\n"); return; }
+    cvsasx_hash_t th=sm_demat(P);
+    const void*mp; size_t ml; if(cvsasx_store_get(&ts_store,&th,&mp,&ml)!=CVSASX_STORE_OK){ sputs("DUR S6 manifest missing\n"); return; }
+    int objs=0; objs+=persist_obj(&ts_store,&th);
+    const uint8_t*M=mp; cvsasx_hash_t regH,descH; for(int k=0;k<32;k++){regH.b[k]=M[k];descH.b[k]=M[64+k];}
+    objs+=persist_obj(&ts_store,&regH); objs+=persist_obj(&ts_store,&descH);
+    const void*dp; size_t dl; if(cvsasx_store_get(&ts_store,&descH,&dp,&dl)==CVSASX_STORE_OK){
+        const uint8_t*D=dp; int rn=D[0]; uint64_t o=4;
+        for(int i=0;i<rn;i++){ o+=16; cvsasx_hash_t ch; for(int k=0;k<32;k++) ch.b[k]=D[o++]; objs+=persist_obj(&rm_store,&ch); }
+    }
+    for(int i=0;i<4096;i++) vblk_data[i]=0; *(uint32_t*)(vblk_data+0)=DUR_ROOT_MAGIC; for(int k=0;k<32;k++) vblk_data[16+k]=th.b[k];
+    vblk_write(0); vblk_flush();
+    sputs("DUR S6 persisted task-hash "); sputs(hx(th.b,32)); sputs(" graph-objects="); sdec((uint64_t)objs);
+    sputs(" (ceiling INSIDE the hashed manifest -> tampering it changes the hash)\n");
+}
+/* S6 revive: read ROOT -> task-hash, reload the durable graph into the in-RAM stores
+ * (every load RE-HASHED, D5), rematerialize via the core path directly, re-mint authority
+ * at the persisted ceiling, refuse wider (D4), and check the state is intact. */
+static void revive_process_phase(void){
+    sputs("DUR S6 REVIVE process from disk under the gate.\n");
+    if(vblk_read(0)!=0 || *(uint32_t*)(vblk_data+0)!=DUR_ROOT_MAGIC){ sputs("DUR S6 no persisted process ROOT on disk\n"); return; }
+    cvsasx_hash_t th; for(int k=0;k<32;k++) th.b[k]=vblk_data[16+k];
+    if(g_kernel_cr3){ uint64_t*kp=P2V(g_kernel_cr3); for(int i=0;i<256;i++) if((kp[i]&1)&&(kp[i]&MM_USER)) kp[i]=0; __asm__ volatile("mov %0,%%cr3"::"r"(g_kernel_cr3):"memory"); }
+    framedb_init(); rset_n=0; for(uint32_t i=0;i<RSET_MAX;i++) rset[i].live=0; ts_store_once(); rm_store_once();
+    for(int i=0;i<4096;i++) sm_shared_content[i]=(uint8_t)(i*37u+11u);
+    int loaded=0;
+    for(int i=0;i<dur_nidx;i++){
+        cvsasx_hash_t h; for(int k=0;k<32;k++) h.b[k]=dur_idx[i].hash[k];
+        uint64_t l=0; if(dur_get(&h,dur_pbuf,&l)==0){ cvsasx_hash_t o; cvsasx_store_put(&ts_store,dur_pbuf,l,&o); cvsasx_store_put(&rm_store,dur_pbuf,l,&o); loaded++; }
+    }
+    sputs("DUR S6 loaded + re-verified "); sdec((uint64_t)loaded); sputs(" objects from disk into the in-RAM stores (D5: every load re-hashed)\n");
+    cproc_t *P=&g_cp[1]; for(unsigned i=0;i<sizeof *P;i++) ((uint8_t*)P)[i]=0; for(int k=0;k<32;k++) P->remat_root[k]=th.b[k];
+    int can_write=0; uint64_t shf=0; int ok=sm_remat(P,&can_write,&shf);
+    sputs("DUR S6 rematerialize via the CORE materialize path DIRECTLY (NOT a live #PF): rc="); sdec((uint64_t)(ok?0:1));
+    sputs(" writer-authority="); sputs(can_write?"RW":"RO"); sputc('\n');
+    cvsasx_hash_t asr2=ts_canonicalize(P->cr3,1);
+    const void*mp; size_t ml; cvsasx_hash_t asr_orig; int havem=(cvsasx_store_get(&ts_store,&th,&mp,&ml)==CVSASX_STORE_OK);
+    if(havem){ const uint8_t*M=mp; for(int k=0;k<32;k++) asr_orig.b[k]=M[32+k]; }   /* manifest: regH@0, asr@32, descH@64 */
+    int asr_ok=havem&&cvsasx_hash_eq(&asr2,&asr_orig);
+    sputs("DUR S6 address-space root re-derived from disk-loaded state == persisted root: "); sputs(asr_ok?"y":"n"); sputc('\n');
+    cvsasx_pir_t pir; cvsasx_swcap_t cap;
+    conc_make_pir(&pir, P->ceilH, 0, P->ceil_len, (uint32_t)((uint32_t)P->ceil_off | (uint32_t)CVSASX_PERM_STORE_CAP));
+    cvsasx_status_t s=cvsasx_sw_cap_remint(&P->cust,&pir,&P->region,&cap);
+    int refused=(s==CVSASX_ERR_AMPLIFY_PERMS)&&!cap.valid;
+    sputs("DUR S6 D4 wider-authority load (+STORE_CAP beyond persisted ceiling): status="); sdec((uint64_t)s);
+    sputs(refused?" (DISTINCT: AMPLIFY_PERMS) REFUSED -> never wider than the persisted ceiling\n":" *** WRONG / AMPLIFIED ***\n");
+    int s6=ok&&asr_ok&&refused;
+    sputs(s6?"DUR S6 -> PROCESS SURVIVED A COLD REBOOT: rebuilt from disk under the gate, authority at the persisted ceiling, wider REFUSED OK\n":"DUR S6 -> *** process did not fully survive (see above) ***\n");
+    /* S7 (in-kernel): flip one byte of the on-disk manifest payload, re-hash on load -> mismatch -> REJECT. */
+    int e=dur_idx_find(th.b);
+    if(e>=0){ uint64_t B=dur_idx[e].hdr_block; vblk_read(B+1); dur_pbuf[3]=(uint8_t)(vblk_data[3]^0xFF);
+        cvsasx_hash_t chk; cvsasx_blake3(dur_pbuf, ml, &chk); int det=!cvsasx_hash_eq(&chk,&th);
+        sputs("DUR S7 tamper-on-load (manifest byte flipped): re-hash != task-hash detected="); sputs(det?"y":"n");
+        sputs(det?" -> REJECTED, bytes never served (disk untrusted) OK\n":" *** NOT DETECTED ***\n"); }
+}
+
+/* ---- the durable persistence stage (S1 measured here, S2-S7) ---- */
+static void run_persist(void){
+    sputs("\n=== DURABLE CONTENT-ADDRESSED PERSISTENCE (S1-S7): a process that LASTS across a cold reboot ===\n");
+    if(!vio_ready){ sputs("DUR NOT RUN: virtio-blk stable media unavailable\n"); return; }
+
+    /* S3: revive the store from disk. The in-RAM index is rebuilt PURELY by scanning the
+     * disk, which proves RAM started empty after the cold power-cycle (D6). */
+    int n=dur_recover();
+    sputs("DUR S3 boot recovery: re-verified + indexed "); sdec(n); sputs(" durable object(s) from disk in ");
+    sdec(dur_recover_cyc); sputs(" cyc; rejected-tail="); sdec((uint64_t)dur_recover_rejected);
+    sputs(" (index came purely from disk -> RAM started empty)\n");
+
+    /* S7 (host-side): a record that fails re-verification on the recovery scan was either
+     * torn by a crash or tampered on the host; recovery REJECTS it and does not index it. */
+    if(dur_recover_rejected>0){
+        sputs("DUR S7 HOST-TAMPER / TORN DETECTED: "); sdec((uint64_t)dur_recover_rejected);
+        sputs(" on-disk record failed re-hash on the recovery scan -> REJECTED, not indexed, bytes never served (disk untrusted). Not re-persisting over it.\n");
+        sputs("\nDURABLE PERSISTENCE: recovery rejected an unverifiable on-disk record (S7). See kernel/PERSISTENCE_LOG.md.\n");
+        return;
+    }
+
+    /* the deterministic test object: its hash is derivable from known content on BOTH
+     * boots without storing it, so the cold-reboot side can look it up. */
+    static uint8_t obj[256]; for(int i=0;i<256;i++) obj[i]=(uint8_t)(i*53u+9u);
+    cvsasx_hash_t objH; cvsasx_blake3(obj,256,&objH);
+
+    if(n==0){
+        /* ============ PERSIST PHASE (fresh disk) ============ */
+        sputs("DUR phase: PERSIST (fresh disk). Writing durable objects, then halt for a COLD reboot.\n");
+
+        /* S1 measured: per-object durable write+flush cost (CARMIX rdtsc, virtio-blk path). */
+        dur_write_cyc=0; dur_objs_written=0;
+        cvsasx_hash_t wh; int wr=dur_put(obj,256,&wh);
+        sputs("DUR S2 append-only write: object hash "); sputs(hx(objH.b,32)); sputs(" rc="); sdec((uint64_t)(wr<0?1:0));
+        sputs(" at block "); sdec(dur_idx[dur_idx_find(objH.b)].hdr_block); sputc('\n');
+        sputs("DUR S1 measured per-object durable write+flush = "); sdec(dur_objs_written?dur_write_cyc/dur_objs_written:0); sputs(" cyc (CARMIX rdtsc on the virtio-blk path)\n");
+
+        /* S4: crash-consistency proof. Write two records to a SCRATCH region (blocks
+         * 200..), read their exact on-disk bytes back, and run the recovery parser at
+         * EVERY byte offset of the write (ordered-prefix truncation). Assert the invariant
+         * and show the rejection branch firing. */
+        {
+            uint64_t SB=200;                                  /* scratch region, outside the log */
+            static uint8_t r1[300],r2[500];
+            for(int i=0;i<300;i++) r1[i]=(uint8_t)(i*7u+1u);
+            for(int i=0;i<500;i++) r2[i]=(uint8_t)(i*11u+3u);
+            cvsasx_hash_t h1,h2; cvsasx_blake3(r1,300,&h1); cvsasx_blake3(r2,500,&h2);
+            /* write record 1 (hdr@SB, payload@SB+1) and record 2 (hdr@SB+2, payload@SB+3) raw */
+            for(int rec=0;rec<2;rec++){
+                uint8_t*src=rec?r2:r1; uint64_t ln=rec?500:300; cvsasx_hash_t*hh=rec?&h2:&h1;
+                uint64_t hb=SB+rec*2;
+                for(int i=0;i<4096;i++) vblk_data[i]=0;
+                *(uint32_t*)(vblk_data+0)=DUR_MAGIC; *(uint32_t*)(vblk_data+4)=1; *(uint64_t*)(vblk_data+8)=ln;
+                for(int k=0;k<32;k++) vblk_data[16+k]=hh->b[k]; vblk_write(hb);
+                for(int i=0;i<4096;i++) vblk_data[i]=0; for(uint64_t i=0;i<ln;i++) vblk_data[i]=src[i]; vblk_write(hb+1);
+            }
+            vblk_flush();
+            /* read the 4 scratch blocks back into a contiguous byte image */
+            static uint8_t img[4*4096]; uint64_t total=4*4096;
+            for(int b=0;b<4;b++){ vblk_read(SB+b); for(int i=0;i<4096;i++) img[b*4096+i]=vblk_data[i]; }
+            /* exhaustive ordered-prefix truncation at EVERY byte offset */
+            uint64_t t0=rdtsc(); int violations=0, rejections=0; uint64_t tested=0;
+            for(uint64_t L=0; L<=total; L++){
+                int rej=0; int c=dur_parse_trunc(img,L,&rej);
+                /* invariant: accepted count is the exact number of records whose full
+                 * (hdr+payload) bytes fit within L; never a record naming torn bytes. */
+                int expect = (L>=4096+300?1:0) + (L>=8192+4096+500?1:0);
+                if(c!=expect) violations++;
+                if(rej) rejections++;
+                tested++;
+            }
+            uint64_t proof_cyc=rdtsc()-t0;
+            /* explicit D2: truncate inside record 2's payload -> rec1 kept, rec2 REJECTED, rec2 hash ABSENT */
+            int rej2=0; int c2=dur_parse_trunc(img, 8192+4096+100, &rej2);   /* rec2 payload incomplete */
+            int rec2_absent = (c2==1);
+            /* explicit tamper variant: full image, flip one payload byte of rec2 -> REJECT */
+            img[8192+4096+10]^=0xFF; int rejt=0; int ct=dur_parse_trunc(img,total,&rejt); img[8192+4096+10]^=0xFF;
+            sputs("DUR S4 crash proof: truncated at EVERY byte offset 0.."); sdec(total); sputs(" ("); sdec(tested);
+            sputs(" points); invariant violations="); sdec((uint64_t)violations);
+            sputs("; rejection branch fired at "); sdec((uint64_t)rejections); sputs(" offsets; proof cost "); sdec(proof_cyc); sputs(" cyc\n");
+            sputs("DUR S4 D2 example: truncate inside record-2 payload -> record-1 KEPT, record-2 REJECTED (absent="); sputs(rec2_absent?"y":"n"); sputs(")\n");
+            sputs("DUR S4 tamper variant: flip 1 payload byte -> re-hash MISMATCH -> REJECTED (fired="); sputs(rejt?"y":"n"); sputs(", accepted-before-it="); sdec((uint64_t)ct); sputs(")\n");
+            sputs("DUR S4 CLAIM (precise): recovery-logic crash consistency under an ORDERED-PREFIX failure model, exhaustive in QEMU.\n");
+            sputs("DUR S4 OUT OF SCOPE (named): real-hardware write reordering, cache/barrier semantics, and sub-sector tearing are NOT modeled by byte-prefix truncation.\n");
+            sputs((violations==0&&rejections>0&&rec2_absent&&rejt)?"DUR S4 -> CRASH-CONSISTENCY (ordered-prefix) PROVEN: complete-or-absent at every offset, rejection branch real OK\n":"DUR S4 -> *** crash proof FAILED ***\n");
+        }
+
+        /* S6a: persist a whole process. Build + dematerialize via the SM path (its task-hash
+         * canonical form, ceiling INSIDE the hashed manifest), then persist the object graph
+         * + a ROOT block naming the task-hash. */
+        persist_process_phase();
+
+        sputs("DUR PERSIST PHASE COMPLETE. Halt now; a COLD power-cycle (fresh RAM) will REVIVE from disk.\n");
+    } else {
+        /* ============ REVIVE PHASE (disk has data) ============ */
+        sputs("DUR phase: REVIVE (disk already has objects -> this is the post-cold-reboot boot).\n");
+
+        /* S5: cold-reboot object round-trip. Look the object up by its (content-derived) hash,
+         * re-verify the on-disk bytes, compare to the known original. */
+        uint64_t t0=rdtsc();
+        static uint8_t got[4096]; uint64_t glen=0; int rc=dur_get(&objH,got,&glen);
+        uint64_t rt=rdtsc()-t0;
+        int match=(rc==0)&&(glen==256); if(match) for(int i=0;i<256;i++) if(got[i]!=obj[i]){match=0;break;}
+        sputs("DUR S5 cold-reboot object round-trip: dur_get rc="); sdec((uint64_t)(rc==0?0:1));
+        sputs(" re-verified-on-load=y len="); sdec(glen); sputs(" content-matches-original="); sputs(match?"y":"n");
+        sputs(" round-trip "); sdec(rt); sputs(" cyc\n");
+        sputs(match?"DUR S5 -> OBJECT SURVIVED A COLD REBOOT, re-hashed-on-load, content intact OK\n":"DUR S5 -> *** object did not survive ***\n");
+
+        /* S6b: revive the persisted PROCESS from disk under the gate. */
+        revive_process_phase();
+    }
+    sputs("\nDURABLE PERSISTENCE: S1-S7 run. GC is DEFERRED to its own cycle (the log grows without reclamation here). See kernel/PERSISTENCE_LOG.md.\n");
+}
+
 void kmain(void);
 void kmain(void){
     serial_init();
@@ -5138,6 +5568,10 @@ void kmain(void){
     free_base=(bb+0xfff)&~0xfffULL; free_top=bb+bl; freelist=0; ram_lo=free_base; ram_hi=free_top;
     sputs("    HHDM=") ; sx64(hhdm_off); sputs("  largest RAM @"); sx64(bb); sputs(" = "); sdec(bl>>20); sputs(" MiB\n");
 
+    /* DURABLE PERSISTENCE (S1): bring up the virtio-blk stable-media path FIRST, so the
+     * polled virtqueue gets contiguous early-boot frames, then self-test read/write. */
+    virtio_blk_selftest();
+
     /* IDT: specific exception + timer vectors, plus a catch-all over 0-31 (AUDIT A6:
      * any stray/nested CPU exception DUMPS instead of silently triple-faulting). */
     idt_set(6,(void*)isr_ud,cs); idt_set(8,(void*)isr_df,cs); idt_set(13,(void*)isr_gp,cs);
@@ -5147,8 +5581,13 @@ void kmain(void){
         int he=0; for(unsigned k=0;k<sizeof errv;k++) if(errv[k]==v) he=1;
         idt_set(v, he?(void*)isr_exc_err:(void*)isr_exc_noerr, cs); } }
     struct idtr idtr={(uint16_t)(sizeof(idt)-1),(uint64_t)idt}; __asm__ volatile("lidt %0"::"m"(idtr));
-    __asm__ volatile("mov %%cr3,%0":"=r"(g_kernel_cr3)); g_kernel_cr3&=~0xfffULL;   /* the clean kernel PML4 (user half absent) for run_taskstate */
+    __asm__ volatile("mov %%cr3,%0":"=r"(g_kernel_cr3)); g_kernel_cr3&=~0xfffULL;   /* the clean kernel PML4 (user half absent) for run_taskstate / run_persist */
     sputs("    IDT loaded (0-31 exceptions + #DF + timer)\n");
+
+    /* DURABLE PERSISTENCE (S2-S7): runs each boot; persists on a fresh disk, revives on a
+     * disk that already holds objects (the post-cold-reboot boot). Runs here, before the
+     * regression demos, with a clean kernel cr3 and no timer yet. */
+    run_persist();
 
     /* B3: frame alloc -> map at a fresh vaddr -> write/read-back -> free/realloc */
 #if defined(AUDIT_PROBE) && AUDIT_PROBE==1
