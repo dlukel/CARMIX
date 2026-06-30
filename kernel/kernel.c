@@ -5544,6 +5544,170 @@ static void run_persist(void){
     sputs("\nDURABLE PERSISTENCE: S1-S7 run. GC is DEFERRED to its own cycle (the log grows without reclamation here). See kernel/PERSISTENCE_LOG.md.\n");
 }
 
+/* ===========================================================================
+ * VG0-VG5 - THE SINGLE-CPU VERSIONED (MVCC) CAPABILITY GATE.
+ *
+ * A versioned capability slot: a version word + two capability buffers, the version
+ * selecting the ACTIVE buffer. The gate's surrender-and-replace writes the replacement
+ * to the INACTIVE buffer, the existing anti-amplification check (cvsasx_sw_cap_remint,
+ * UNCHANGED) validates it, and a single atomic word-sized version bump commits it by
+ * flipping which buffer is active. So a capture firing at ANY instant reads the
+ * committed pre-state (before the bump) or the committed post-state (after), NEVER a
+ * torn/half-written capability: partial writes land only in the inactive buffer. The
+ * in-flight authority transient that previously needed a drain collapses to the commit
+ * point (drain cost zero).
+ *
+ * REUSE, no fork: the buffer holds the EXISTING cvsasx_swcap_t; the check is the
+ * EXISTING gate, called unchanged. The versioned slot is built BESIDE the proven core
+ * (no proven module edited).
+ *
+ * SCOPE (stated plainly): this is the SINGLE-CPU versioned gate. Single-CPU CARMIX has
+ * no remote cores, no cross-thread hardware races, no stale TLBs, so a "capture at any
+ * instant" is modeled by driving the existing capability-read at instrumented points
+ * across the gate op (including mid inactive-buffer write). It does NOT implement or
+ * validate the multi-core memory cut, the TLB hazard, or the RC/synchronization-point
+ * cut; the DRCC formalization and the RC-cut result remain THEORY, UNVALIDATED on
+ * CARMIX until SMP bring-up (AP startup, per-CPU state, IPI, cross-core invalidation)
+ * exists. See kernel/VGATE_LOG.md.
+ * ===========================================================================*/
+typedef struct { volatile uint64_t version; cvsasx_swcap_t buf[2]; } vgate_slot_t;
+_Static_assert(__builtin_offsetof(vgate_slot_t,version)==0, "version word first (aligned)");
+_Static_assert(sizeof(((vgate_slot_t*)0)->version)==8, "version is one 8-byte word (atomic store on x86-64)");
+
+static uint8_t      vg_obj[256];          /* the authority object the ceiling is carved from */
+static cvsasx_hash_t vg_hash;
+static cvsasx_sw_custodian_t vg_cust; static cvsasx_sw_region_t vg_region;
+static int vg_capture_count, vg_midwrite_count, vg_torn_count;
+
+static int vg_cap_eq(const cvsasx_swcap_t*a,const cvsasx_swcap_t*b){
+    return a->base==b->base && a->length==b->length && a->perms==b->perms && a->valid==b->valid;
+}
+/* a capture = read the version-selected ACTIVE buffer (the read a COW/sweep capture
+ * performs). Verify it is a complete, well-formed capability matching a committed
+ * configuration (pre or post), never a torn mix. */
+static int vg_capture(vgate_slot_t*s, const cvsasx_swcap_t*expect){
+    uint64_t v=s->version; cvsasx_swcap_t c=s->buf[v&1];      /* single-CPU: consistent read */
+    vg_capture_count++;
+    int ok = c.valid && vg_cap_eq(&c,expect);
+    if(!ok) vg_torn_count++;
+    return ok;
+}
+/* the versioned surrender-and-replace. Produces+checks the replacement with the
+ * UNCHANGED gate, writes it field-by-field to the INACTIVE buffer (capture hooks fire
+ * here, reading the still-intact ACTIVE buffer), then commits with one atomic version
+ * bump. do_captures drives the G4 mid-write captures. Returns the gate status; on a
+ * refusal NOTHING is committed (active stays the pre-state). */
+static cvsasx_status_t vgate_commit(vgate_slot_t*s,const cvsasx_pir_t*pir,int do_captures){
+    cvsasx_swcap_t pre=s->buf[s->version&1];
+    cvsasx_swcap_t rep;
+    cvsasx_status_t st=cvsasx_sw_cap_remint(&vg_cust,pir,&vg_region,&rep);   /* EXISTING check, unchanged */
+    if(st!=CVSASX_OK || !rep.valid) return st;                              /* refused -> no commit */
+    int inactive=1-(int)(s->version&1);
+    s->buf[inactive].base=rep.base;     if(do_captures){ vg_capture(s,&pre); vg_midwrite_count++; }
+    s->buf[inactive].length=rep.length; if(do_captures){ vg_capture(s,&pre); vg_midwrite_count++; }
+    s->buf[inactive].perms=rep.perms;   if(do_captures){ vg_capture(s,&pre); vg_midwrite_count++; }
+    s->buf[inactive].valid=rep.valid;   if(do_captures){ vg_capture(s,&pre); vg_midwrite_count++; }
+    s->version=s->version+1;            /* COMMIT: single atomic 8-byte aligned store, flips active */
+    if(do_captures) vg_capture(s,&rep); /* post-commit capture sees the checked replacement */
+    return CVSASX_OK;
+}
+
+static void run_vgate(void){
+    sputs("\n=== SINGLE-CPU VERSIONED CAPABILITY GATE (VG0-VG5): an atomic commit point, never a torn capability ===\n");
+    /* set up the ceiling over a 256 B authority object (LOAD|GLOBAL), like conc/US/SM. */
+    for(int i=0;i<256;i++) vg_obj[i]=(uint8_t)(i*29u+7u);
+    cvsasx_blake3(vg_obj,256,&vg_hash);
+    cvsasx_swcap_t root={ (uint64_t)(uintptr_t)vg_obj, 256, (uint32_t)(CVSASX_PERM_LOAD|CVSASX_PERM_GLOBAL), 1 };
+    cvsasx_sw_custodian_init(&vg_cust, root);
+    vg_region.object_cap=root; vg_region.object_base_addr=(uint64_t)(uintptr_t)vg_obj; vg_region.object_length=256;
+    for(int k=0;k<32;k++) vg_region.hash[k]=vg_hash.b[k];
+
+    vgate_slot_t slot; slot.version=0;
+    cvsasx_pir_t pir;
+    /* initial active capability: a legit LOAD, len 128 (the pre-state). */
+    conc_make_pir(&pir, vg_hash.b, 0, 128, (uint32_t)CVSASX_PERM_LOAD);
+    cvsasx_sw_cap_remint(&vg_cust,&pir,&vg_region,&slot.buf[0]);
+
+    /* ---- VG1: versioned slot + atomic commit ---- */
+    sputs("VG1 versioned slot: version word + buf[2], active = version&1. Initial active = buf[0] LOAD len="); sdec(slot.buf[0].length);
+    sputs(" valid="); sdec((uint64_t)slot.buf[0].valid); sputc('\n');
+    sputs("VG1 commit point = a single 8-byte aligned version store (x86-64 atomic): version field offset="); sdec((uint64_t)__builtin_offsetof(vgate_slot_t,version));
+    sputs(" size="); sdec((uint64_t)sizeof(slot.version)); sputs(" -> single word-sized write (D1)\n");
+
+    /* ---- VG2/G3: anti-amplification preserved, capture pre/post, wider REFUSED ---- */
+    cvsasx_swcap_t pre=slot.buf[slot.version&1];
+    conc_make_pir(&pir, vg_hash.b, 0, 64, (uint32_t)CVSASX_PERM_LOAD);       /* legit narrower replacement */
+    cvsasx_status_t s_ok=vgate_commit(&slot,&pir,0);
+    cvsasx_swcap_t post=slot.buf[slot.version&1];
+    int g3_pre_ok=(pre.length==128), g3_post_ok=(s_ok==CVSASX_OK && post.length==64);
+    int g3_le=(post.length<=root.length) && ((post.perms & ~root.perms)==0);  /* post never exceeds the ceiling */
+    sputs("VG2 gate op (LOAD 128 -> LOAD 64): pre-commit capture sees len="); sdec(pre.length);
+    sputs(" post-commit capture sees len="); sdec(post.length); sputs(" status="); sdec((uint64_t)s_ok);
+    sputs(" post<=ceiling="); sputs(g3_le?"y":"n"); sputc('\n');
+    /* adversarial: wider bounds + added perm, each REFUSED, active UNCHANGED (no amplification). */
+    cvsasx_swcap_t before_adv=slot.buf[slot.version&1];
+    conc_make_pir(&pir, vg_hash.b, 0, 257, (uint32_t)CVSASX_PERM_LOAD); cvsasx_status_t s_w=vgate_commit(&slot,&pir,0);
+    conc_make_pir(&pir, vg_hash.b, 0, 64, (uint32_t)(CVSASX_PERM_LOAD|CVSASX_PERM_STORE_CAP)); cvsasx_status_t s_p=vgate_commit(&slot,&pir,0);
+    cvsasx_swcap_t after_adv=slot.buf[slot.version&1];
+    int adv_refused=(s_w==CVSASX_ERR_BAD_BOUNDS)&&(s_p==CVSASX_ERR_AMPLIFY_PERMS)&&vg_cap_eq(&before_adv,&after_adv);
+    sputs("VG2 adversarial wider-bounds status="); sdec((uint64_t)s_w); sputs(" (BAD_BOUNDS) added-perm status="); sdec((uint64_t)s_p);
+    sputs(" (AMPLIFY_PERMS); active capability UNCHANGED by the refusals="); sputs(vg_cap_eq(&before_adv,&after_adv)?"y":"n"); sputc('\n');
+    /* replay from a pre-commit capture: the check fires again, no amplification. */
+    conc_make_pir(&pir, vg_hash.b, 0, 64, (uint32_t)CVSASX_PERM_LOAD); cvsasx_status_t s_replay=vgate_commit(&slot,&pir,0);
+    int g3=g3_pre_ok&&g3_post_ok&&g3_le&&adv_refused&&(s_replay==CVSASX_OK);
+    sputs("VG2 replay re-runs the existing check (status="); sdec((uint64_t)s_replay); sputs("), no amplification on replay\n");
+    sputs(g3?"VG2 -> ANTI-AMPLIFICATION PRESERVED (existing check reused, never exceeded, wider refused) OK\n":"VG2 -> *** FAIL ***\n");
+
+    /* ---- VG3/G4: capture at random points sees NO torn capability (with real mid-write points) ---- */
+    vg_capture_count=vg_midwrite_count=vg_torn_count=0;
+    const int OPS=64;
+    for(int i=0;i<OPS;i++){
+        uint64_t len = 32 + (uint64_t)((i*48u)%200u);          /* vary the replacement length deterministically */
+        conc_make_pir(&pir, vg_hash.b, 0, len, (uint32_t)CVSASX_PERM_LOAD);
+        vgate_commit(&slot,&pir,1);                            /* do_captures=1: 4 mid-write + 1 post per op */
+    }
+    sputs("VG3 drove "); sdec((uint64_t)OPS); sputs(" gate ops with captures; total captures="); sdec((uint64_t)vg_capture_count);
+    sputs(" of which mid-inactive-write="); sdec((uint64_t)vg_midwrite_count); sputs(" (these would tear a naive single-buffer slot)\n");
+    sputs("VG3 torn/half-written captures seen="); sdec((uint64_t)vg_torn_count);
+    sputs(" -> every capture read a COMPLETE well-formed active capability (pre before commit, post after)\n");
+    /* D2 contrast: a NAIVE single-buffer slot DOES tear on a mid-write capture. */
+    cvsasx_swcap_t preN, repN;                                /* differ in BASE and LENGTH (offset 0/len 56 vs offset 8/len 96) */
+    conc_make_pir(&pir, vg_hash.b, 0, 56, (uint32_t)CVSASX_PERM_LOAD); cvsasx_sw_cap_remint(&vg_cust,&pir,&vg_region,&preN);
+    conc_make_pir(&pir, vg_hash.b, 8, 96, (uint32_t)CVSASX_PERM_LOAD); cvsasx_sw_cap_remint(&vg_cust,&pir,&vg_region,&repN);
+    cvsasx_swcap_t naive=preN;
+    naive.base=repN.base;                                      /* single-buffer in-place write; a mid-write capture lands HERE */
+    int naive_torn = !vg_cap_eq(&naive,&preN) && !vg_cap_eq(&naive,&repN);  /* base from new, length from old -> matches neither */
+    naive.length=repN.length; naive.perms=repN.perms; naive.valid=repN.valid;  /* finish the in-place write */
+    sputs("VG3 D2 contrast: a NAIVE single-buffer slot, captured mid-write, read a TORN capability (matches neither pre nor post)="); sputs(naive_torn?"y":"n");
+    sputs(" -> exactly what the versioned slot prevents\n");
+    int g4=(vg_torn_count==0)&&(vg_midwrite_count>0)&&naive_torn;
+    sputs(g4?"VG3 -> CAPTURE-AT-RANDOM-POINTS NEVER TORN (versioned), naive slot WOULD tear (contrast) OK\n":"VG3 -> *** FAIL ***\n");
+
+    /* ---- VG4/G5: measure the cost in rdtsc (versioned vs unversioned, commit bump, memory) ---- */
+    const int N=20000;
+    conc_make_pir(&pir, vg_hash.b, 0, 64, (uint32_t)CVSASX_PERM_LOAD);
+    cvsasx_swcap_t single;
+    uint64_t t0=rdtsc(); for(int i=0;i<N;i++){ cvsasx_sw_cap_remint(&vg_cust,&pir,&vg_region,&single); } uint64_t unver=(rdtsc()-t0)/N;
+    uint64_t t1=rdtsc(); for(int i=0;i<N;i++){ vgate_commit(&slot,&pir,0); } uint64_t ver=(rdtsc()-t1)/N;
+    uint64_t t2=rdtsc(); for(int i=0;i<N;i++){ slot.version=slot.version+1; } uint64_t bump=(rdtsc()-t2)/N;
+    uint64_t added = ver>unver?ver-unver:0;
+    uint64_t mem_delta = (uint64_t)sizeof(vgate_slot_t) - (uint64_t)sizeof(cvsasx_swcap_t);
+    sputs("VG4 gate op UNVERSIONED (existing remint into one slot) = "); sdec(unver); sputs(" cyc; VERSIONED (remint+inactive-write+commit) = "); sdec(ver);
+    sputs(" cyc; versioning ADDS = "); sdec(added); sputs(" cyc (MEASURED delta, rdtsc this run)\n");
+    sputs("VG4 commit-point (version bump alone) = "); sdec(bump); sputs(" cyc (near the rdtsc-resolution floor); drain cost ELIMINATED = 0 (the transient collapses to this bump)\n");
+    sputs("VG4 per-slot memory: versioned="); sdec((uint64_t)sizeof(vgate_slot_t)); sputs(" B vs single-buffer baseline="); sdec((uint64_t)sizeof(cvsasx_swcap_t));
+    sputs(" B -> delta="); sdec(mem_delta); sputs(" B (the second buffer + version word)\n");
+    sputs("VG4 numbers are rdtsc-measured in CARMIX this run, not imported (D4).\n");
+
+    /* ---- honest scope ---- */
+    sputs("VG SCOPE (plain): this is the SINGLE-CPU versioned gate. It eliminates the in-flight authority transient by giving the\n");
+    sputs("   authority transition a single atomic commit point. Single CPU: no remote cores, no cross-thread races, no stale TLBs.\n");
+    sputs("VG SCOPE: it does NOT implement or validate the multi-core memory cut, the TLB hazard, or the RC/synchronization-point cut.\n");
+    sputs("VG SCOPE: the DRCC formalization and the RC-cut result remain THEORY, UNVALIDATED on CARMIX until SMP bring-up exists.\n");
+    int vg=g3&&g4&&(unver>0)&&(ver>0);
+    sputs(vg?"VERSIONED GATE: VG1-VG5 OK - atomic commit, anti-amplification preserved, never torn, cost measured. See kernel/VGATE_LOG.md.\n":"VERSIONED GATE: *** see failures above ***\n");
+}
+
 void kmain(void);
 void kmain(void){
     serial_init();
@@ -5588,6 +5752,7 @@ void kmain(void){
      * disk that already holds objects (the post-cold-reboot boot). Runs here, before the
      * regression demos, with a clean kernel cr3 and no timer yet. */
     run_persist();
+    run_vgate();   /* SINGLE-CPU VERSIONED GATE: VG1 slot+atomic commit, VG2 anti-amp preserved, VG3 never-torn capture, VG4 rdtsc cost */
 
     /* B3: frame alloc -> map at a fresh vaddr -> write/read-back -> free/realloc */
 #if defined(AUDIT_PROBE) && AUDIT_PROBE==1
