@@ -49,14 +49,26 @@ over BLAKE3 hashes. The contribution is this principle and its verified
 demonstration, not feature completeness. The system boots on x86-64 through a
 standard bootloader, runs a capability-guarded WebAssembly executor inside the
 kernel, rematerializes computation state on one machine and across two machines,
-and ships with a machine-checked Coq proof of its core authority guarantee. The
-proof is axiom-free except for one stated collision-resistance hypothesis. Every
-runtime result reported here was observed in the QEMU emulator and is quoted from
-the captured serial transcript; the two-machine byte counts and the proof results
-are reproducible. \carmix{} is roughly forty to forty-five percent of the way to a
-general-purpose operating system. It is a research prototype, not a finished
+persists a content-addressed object and a whole dematerialized process to disk
+so they survive a genuine cold reboot, reclaims unreachable objects with a
+durable reference-counted collector, partitions deduplication by authority domain
+to close the cross-domain timing channel, brings up a second CPU as a multi-core
+foundation, and ships a machine-checked Coq proof of its core authority
+guarantee. The proof is axiom-free except for one stated collision-resistance
+hypothesis. To keep the claims separable, every result is placed in one of three
+maturity tiers. Tier 1 is built in \carmix{}, verified, and rdtsc-measured.
+Tier 2 is proven theory not yet validated on \carmix{}. Tier 3 is a research
+verdict or formal result whose implementation is not built. The Deterministically
+Reproducible Consistent Cut result is Tier 2, and its validation gap has narrowed
+now that the SMP foundation exists, but the multi-core consistent capture is not
+yet demonstrated. The deduplication impossibility bound, the content-addressed
+convergence verdict, and the userland phasing are Tier 3. Every runtime number
+reported here was observed in the QEMU emulator and is quoted from the captured
+serial transcript. \carmix{} is roughly forty to forty-five percent of the way to
+a general-purpose operating system. It is a research prototype, not a finished
 operating system, and the Limitations section states in full what is not built.
-The honesty of that list is what is meant to make the proven parts credible.
+The honesty of that list, and of the tier labels, is what is meant to make the
+proven parts credible.
 \end{abstract}
 
 \section{Introduction}
@@ -90,6 +102,18 @@ principle, walks the architecture subsystem by subsystem with each part tied to
 the milestone that demonstrates it, states exactly what the Coq development
 proves and its one assumption, and reports the measured numbers from the
 emulator with honest framing of what each shows.
+
+This report stratifies its claims by maturity, so that no result reads as more
+finished than it is. \textbf{Tier 1} is built in \carmix{}, verified by its
+self-tests, committed to the public repository at
+\texttt{github.com/dlukel/CARMIX}, and rdtsc-measured in the emulator. The
+Architecture and Evaluation sections are Tier 1 unless a sentence states
+otherwise. \textbf{Tier 2} is proven theory that \carmix{} does not yet validate
+in running code. \textbf{Tier 3} is a research verdict or formal result,
+including clean impossibility and undecidability findings, whose implementation
+is not built or is only partially started. The Tier 2 and Tier 3 results have
+their own sections after the Evaluation, and each result is labeled with its tier
+where it appears.
 
 \section{The Principle}
 
@@ -163,7 +187,9 @@ authority by the anti-amplification gate.}
 This section walks the system from the proven modules up through the kernel, and
 ties each subsystem to the milestone in which it was observed. Milestone codes
 (for example E2, R3, C3, M4) match the kernel self-test stages and the captured
-serial transcript.
+serial transcript. Everything in this section is Tier 1, built in \carmix{} and
+observed in the captured transcript, with the measured costs reported in the
+Evaluation.
 
 \subsection{Proven modules}
 
@@ -182,14 +208,14 @@ requested, and that no forbidden permission is present. Any failure returns an
 invalid capability.
 
 \textbf{Content-addressed object store (store/).} The store maps a BLAKE3 hash to
-bytes. Putting bytes returns their hash and stores one copy; putting identical
+bytes. Putting bytes returns their hash and stores one copy. Putting identical
 bytes again stores nothing new. The vendored BLAKE3 is validated against the
 official known-answer vectors, and the kernel re-runs that known-answer check at
 startup before it trusts any content-addressed result (milestone R0, digest of
 the empty string matches \texttt{af1349b9..41f3262}).
 
 \textbf{Single-level store and structural diff (sls/).} The single-level store
-builds an object graph over the store. A leaf holds bytes; a node holds an ordered
+builds an object graph over the store. A leaf holds bytes. A node holds an ordered
 list of child identities. Mutation produces a new object and a new epoch, and
 unchanged sub-objects keep their identities. The structural diff takes two epoch
 roots and returns the changed set, pruning any subtree whose hash is unchanged,
@@ -213,7 +239,7 @@ contains no capability instructions.
 \subsection{Boot and in-kernel execution}
 
 The kernel boots on x86-64 through the Limine boot protocol, which hands it long
-mode, page tables, a memory map, and a linear framebuffer; everything above the
+mode, page tables, a memory map, and a linear framebuffer. Everything above the
 entry point is written for \carmix{}. The boot milestones B0 through B5 confirm
 serial output, long mode (\texttt{CS=0x28}, \texttt{EFER.LMA=1}), a physical frame
 allocator with read-back, a $1280\times800\times32$ framebuffer proven by pixel
@@ -232,7 +258,7 @@ A software compositor draws a background and windows back to front with a
 save-under cursor, driven by polled PS/2 keyboard and mouse. Windows support
 focus raise on click, drag by the titlebar, and resize by a corner grip, each
 proven by framebuffer pixel read-back. In the headless self-test run these events
-are scripted and labelled as such; only the final shell stage takes live PS/2
+are scripted and labelled as such. Only the final shell stage takes live PS/2
 input. The desktop draws \carmix{}'s own windows in software and does not run
 third-party graphical applications.
 
@@ -263,12 +289,12 @@ D2).
 The destination holds a trust store of an authority public key, the current
 source public key, a monotonic lifecycle epoch, and a permanent revoked set.
 Authority-signed enrollment sets the first source key, rotation replaces it, and
-revocation adds a key to the revoked set; a lifecycle record applies only if it
+revocation adds a key to the revoked set. A lifecycle record applies only if it
 verifies under the authority key and its epoch strictly exceeds the stored epoch,
 which rejects replay and downgrade. Each migration carries its signing key, which
 must be the current source key and not revoked. Six lifecycle attacks are each
 rejected by a distinct verdict (milestone KA). The destination's first authority
-key is baked in; its bootstrap is out of scope and stated as such.
+key is baked in. Its bootstrap is out of scope and stated as such.
 
 \subsection{The task substrate}
 
@@ -298,8 +324,8 @@ the capability slots are not yet part of the task state object.
 \subsection{The residency manager}
 
 Physical memory is managed as a content-addressed cache over the store. Fresh
-allocation and mapping stay conventional; fault-in and sharing collapse into
-rematerialization; free, eviction, and defragmentation partially collapse.
+allocation and mapping stay conventional. Fault-in and sharing collapse into
+rematerialization. Free, eviction, and defragmentation partially collapse.
 \texttt{materialize(hash)} fills a frame and verifies that its BLAKE3 equals the
 requested hash, so integrity holds by construction (M2), a request for a resident
 hash shares the existing frame and bumps its refcount, eviction writes a dirty
@@ -345,7 +371,7 @@ protection fault is refused at the fault boundary.
 \draw[ar] (vf) -- node[above,font=\tiny]{y} (mp);
 \end{tikzpicture}}
 \caption{The residency and fault path (F1, F2, F3). A miss is a verified
-materialize-by-hash; a protection fault and a verification failure are each
+materialize-by-hash. A protection fault and a verification failure are each
 refused at the fault boundary, and an already-resident hash is shared.}
 \label{fig:fault}
 \end{figure}
@@ -360,7 +386,7 @@ addresses bound to one hash share one resident frame, so deduplication happens o
 the fault path (F3). Two address-to-hash bindings were measured head to head and
 the choice does not move fault-service latency, because the cost is dominated by
 the materialize and the hash (F4, a null finding). The handler's own memory is
-resident so servicing a miss does not itself fault; a fault during fault handling
+resident so servicing a miss does not itself fault. A fault during fault handling
 fails closed rather than recovering, and making it recoverable needs a separate
 interrupt stack and a per-fault service context, named as future work (F5).
 
@@ -380,7 +406,7 @@ distinct status code, the same codes the migration table uses, with a replay
 refused and a legitimate crossing accepted (US3). A large syscall argument is
 passed as a hash and rematerialized by hash with verification rather than copied,
 which closes the copy-at-use class of time-of-check to time-of-use race, since a
-mutated object is a different hash and fails verification; this relocates trust to
+mutated object is a different hash and fails verification. This relocates trust to
 the address-to-hash binding and the store admission rather than eliminating it
 (US4).
 
@@ -426,7 +452,7 @@ resident (milestones PP0 through PP4). A fairness control sits on top: a process
 repeatedly paying the rematerialize cost accumulates a measured per-process
 progress deficit, and a bounded keep-resident bias removes the penalty source so
 its progress rate recovers without starving its resident peer (FA0 through FA2).
-The control bounds future unfairness and recovers the rate; it does not refund the
+The control bounds future unfairness and recovers the rate. It does not refund the
 penalty already paid and accounts for one peer rather than many, so it is a first
 measured control on a lightly-researched dimension, not a proven-optimal
 algorithm. A per-process heap grows through an authority-bounded extend-heap that
@@ -437,6 +463,147 @@ copy-on-write where copy-on-write structurally cannot, since there is no shared
 ancestor (PM3), and a hot churning page is excluded from dematerialization because
 re-hashing it on every attempt is the fine-granularity cost the residency
 measurement showed (PM4).
+
+\subsection{Durable content-addressed persistence}
+
+The store is made durable on a virtio-blk disk, so a content-addressed object and
+a whole dematerialized process survive a genuine cold reboot (milestones DUR S1
+through S7, commit \texttt{faebbd6}). A minimal polled virtio-blk driver provides
+stable-media block read, write, and flush (S1). Objects go to an append-only log,
+never overwritten, each as a header block carrying the claimed length and claimed
+BLAKE3 written before its payload block, so an ordered-prefix truncation leaves a
+partial record whose claim is present but whose payload re-hashes to a mismatch
+and is rejected (S2). The hash-to-location index is not itself persisted. It is
+rebuilt on every boot purely by scanning the log and re-verifying each record,
+which is the recovery floor and also the evidence that RAM started empty, since
+the index can only come from disk (S3).
+
+The disk is treated as untrusted media and re-verified on every load, and the
+cold reboot is genuine, each boot a separate QEMU process on the same host disk
+image with empty RAM. An object written and flushed, then revived after a cold
+reboot, rematerializes by its BLAKE3 hash with the on-disk bytes re-hashed before
+they are served (S5). The headline is the persisted process (S6). A process is
+dematerialized to its page-table-inclusive canonical task hash, its object graph
+and a root block are persisted with the authority ceiling inside the hashed
+manifest, the machine is cold-rebooted, the store is revived from disk with every
+object re-hashed on load, and the process is rematerialized with its authority
+re-minted through the same anti-amplification gate at the persisted ceiling. The
+address-space root re-derived from the disk-loaded state equals the persisted
+root, so the page-table-inclusive state is intact, and a load that requests
+authority wider than the persisted ceiling is refused by the gate with its
+distinct amplification status. Because the ceiling lives inside the hashed
+manifest, tampering it changes the task hash and is caught by re-verification.
+Tampering is caught on both an in-kernel manifest flip and a host-side payload
+flip between boots, each rejected on the recovery scan or the load with the bytes
+never served (S7). The crash consistency here is recovery-logic consistency under
+an ordered-prefix write-order model, exercised exhaustively and reported with that
+scope in the Evaluation and the Limitations. The honest scope is a single durable
+writer and objects up to one payload block.
+
+\subsection{Durable garbage collection}
+
+The durable log would otherwise grow without bound, so unreachable objects are
+reclaimed by a durable reference-counted collector (milestones GC1 through GC7,
+commit \texttt{40c99cd}). No cycle collector is needed, because the
+content-addressed graph is acyclic by construction. An object's BLAKE3 is computed
+over its content including its referents' hashes, so a referent's hash must exist
+before its referrer's hash can be computed, and an object cannot name its own or
+an ancestor's hash (GC2). This is the runtime face of the Coq \texttt{acyclic\_graph}
+result. Reference counts are mutable metadata about immutable objects, so they
+live outside the hashed content, recorded as durable count-delta records in the
+same append-only log under the same ordered-prefix discipline, and on a genuine
+cold reboot the counts are reconstructed exactly by replaying those records (GC1).
+The root set is the union of durable roots, the persisted root block and object
+index, and volatile roots held in live process state (GC3).
+
+Reclamation is crash-consistent with the tombstone as the commit point (GC4). The
+reference removal and its count decrement are recorded first, the tombstone is
+written second, and the storage is freed last. Truncating the
+decrement-then-tombstone sequence at every byte offset, the forbidden state of a
+tombstone present while a durable reference still names the object never occurs,
+so a durable tombstone implies the count reached zero and no durable root reaches
+a tombstoned object. Because deduplication is already present, a dedup hit can
+arrive in the window between zero-count detection and the tombstone commit. That
+window resurrects the zombie object, restoring its count with the same storage
+block intact rather than freeing and recreating it (GC5). End to end, dropping a
+reference reclaims the unreachable subgraph while reachable objects stay intact
+and load-verify, and re-allocation reuses the freed blocks so the high-water mark
+does not climb (GC6). The crash-consistency scope is the same
+ordered-prefix-in-QEMU scope as the persistence proof. Concurrent tracing against
+a live multi-threaded mutator and any cross-core reclamation race are not
+implemented and wait on the SMP work.
+
+\subsection{Domain-partitioned deduplication}
+
+Deduplication is scoped to an authority domain, so an observer in one domain
+cannot probe, by store hit-or-miss timing, for content held by another domain
+(milestones DS1 through DS6, commit \texttt{4dd97a5}). The reference-count table
+key gains an authority-domain tag, extending the collector's table rather than
+forking a parallel one. Identical content stored in two domains produces two
+distinct physical objects with independent counts (DS1), and a store deduplicates
+only against existing objects in its own domain, a same-domain re-store hitting
+and a cross-domain store missing (DS2). The security result is the closed channel,
+stated precisely. The cross-domain store-hit-or-miss timing channel is closed by
+partitioning, measured in the Evaluation, where a cross-domain probe now costs
+what a genuinely new store costs rather than the fast hit it cost under global
+deduplication (DS3). The resurrection window is made domain-aware, so a zombie in
+one domain is not resurrected by a same-content store in another (DS4), and
+reclamation still works under the domain-tagged counts (DS6). This is not a
+general zero-leakage result. The within-domain timing channel remains, and it is
+acceptable because the observer is already in that domain. The cost is duplicate
+storage for content shared across domains, measured (DS5). The precise claim is
+cross-domain channel closure at a measured storage cost. The formal boundary this
+responds to is a Tier 3 finding stated later.
+
+\subsection{The versioned capability gate}
+
+A single-CPU versioned (MVCC) capability slot gives an authority transition a
+single atomic commit point, so a capture firing at any instant reads a committed
+pre-state or post-state capability and never a torn one (milestones VG1 through
+VG5, commit \texttt{faae1d6}). The slot is a version word plus two capability
+buffers, the active buffer selected by the low bit of the version. A replacement
+is written to the inactive buffer, and the commit is one naturally-aligned
+eight-byte store to the version word, which x86-64 makes atomic (VG1). The
+anti-amplification check is the existing gate, reused unchanged, so the committed
+capability is exactly what the proven check produces and never wider, and a
+request for wider bounds or an added permission is refused with its distinct
+status while the active capability is left unchanged (VG2). Driven through
+sixty-four surrender-and-replace operations with captures fired at many points
+across each operation, including during the inactive-buffer write, every capture
+read a complete well-formed capability and none was torn, while a naive
+single-buffer slot captured mid-write reads a torn capability that matches neither
+the pre-state nor the post-state (VG3). The in-flight authority transient that
+previously needed a drain collapses to the commit bump. This is demonstrated on a
+single CPU, where there are no remote cores and no stale TLBs. It does not
+implement or validate the multi-core memory cut or the cross-core capture, which
+wait on the SMP work and on the Tier 2 result below. Its overhead is reported in
+the Evaluation as small and at or below the measurement noise of the re-mint it
+wraps, not a speedup.
+
+\subsection{SMP bring-up: the multi-core foundation}
+
+A second CPU is brought up, giving \carmix{} a genuine multi-core foundation
+(milestones SMP S1 through S4, commit \texttt{40c99cd}). The run is under QEMU
+with multi-threaded TCG, so the two virtual CPUs execute on separate host threads
+and are genuinely parallel. Limine performs the standard INIT-SIPI-SIPI and hands
+each application processor to the kernel in long mode, and the second core reaches
+kernel C code and announces its LAPIC id on serial, which is observable proof a
+second core is executing (S1). Each CPU has its own per-CPU record and increments
+only its own counter (S2). The Local APIC is initialized in xAPIC mode on each
+core, and a real inter-processor interrupt is delivered and handled in both
+directions with an end-of-interrupt acknowledgement, which is the primitive every
+future cross-core operation will build on, including the TLB shootdown a
+multi-core capture would need (S3). The cross-core sanity test runs the same work
+on both cores concurrently. Under a spinlock the shared counter totals exactly its
+expected value, so the lock holds across real cores, and without the lock the
+counter loses updates, which can only happen under truly concurrent
+read-modify-write and is therefore positive evidence of parallel execution (S4).
+
+This is the foundation only. It is engineering, not a research result, and it does
+not by itself validate the multi-core consistent capture or the Deterministically
+Reproducible Consistent Cut. After the test the application processor parks and
+the single-CPU path runs as before. What this foundation unlocks, and the gap that
+remains, is the subject of the Tier 2 section.
 
 \section{Trust Model and the Anti-Amplification Proof}
 
@@ -522,16 +689,20 @@ when its validity implies the other's, its range sits inside the other's, and it
 permissions are a subset. It defines a re-mint function that clamps the requested
 range to the source, intersects the requested permissions with the source, rejects
 a request for write and execute together or for any forbidden permission, and sets
-validity accordingly. Three results are machine-checked.
+validity accordingly. Three results are machine-checked, labeled C1, C2, and C3.
 
 \begin{itemize}
-\item \texttt{anti\_amplification}: for all sources and requests, if the re-minted
-capability is valid then it is below the source in the authority order.
-\item \texttt{valid\_dest\_no\_wx} and \texttt{valid\_dest\_no\_forbidden}: a valid
-re-minted capability does not hold write and execute together and holds no
+\item C1, \texttt{anti\_amplification}: for all sources and requests, if the
+re-minted capability is valid then it is below the source in the authority order.
+\item C2, \texttt{valid\_dest\_no\_wx} and \texttt{valid\_dest\_no\_forbidden}: a
+valid re-minted capability does not hold write and execute together and holds no
 forbidden permission.
-\item \texttt{acyclic\_graph}: the content-addressed object graph is acyclic.
+\item C3, \texttt{acyclic\_graph}: the content-addressed object graph is acyclic.
 \end{itemize}
+
+C3 is what makes the durable reference-counted collector of the Architecture
+sound. An acyclic graph cannot form a reference cycle, so refcounts reach zero
+exactly when objects become unreachable and no cycle collector is needed.
 
 The development is axiom-free except for one stated hypothesis. The acyclicity
 result is scoped honestly: it does not derive acyclicity from hashing alone.
@@ -542,7 +713,7 @@ from that well-founded order. The single hypothesis, that the identity function 
 injective (collision resistance), is what connects the hash-graph back to that
 finite tree. The size measure is a proven lemma, not an assumption. The
 development contains no \texttt{Admitted}, no \texttt{admit}, and no
-\texttt{Axiom}; \texttt{coqc} and \texttt{coqchk} both accept it, and an audit
+\texttt{Axiom}. \texttt{coqc} and \texttt{coqchk} both accept it, and an audit
 reports the three authority results as closed under the global context and
 \texttt{acyclic\_graph} as carrying only the collision-resistance hypothesis.
 
@@ -557,7 +728,7 @@ this model is future work.
 
 All runtime numbers below were observed in the QEMU emulator and are quoted from
 the captured serial transcript. Cycle counts are \texttt{rdtsc} differences taken
-under TCG emulation, so they are noisy run to run; that variation is real and is
+under TCG emulation, so they are noisy run to run. That variation is real and is
 reported as such, and the point of each measurement is the order of magnitude and
 the direction, not a precise constant.
 
@@ -577,7 +748,7 @@ tracks the dirty set, with a one-chunk change far cheaper than a full re-store.
 \begin{table}[t]
 \centering
 \caption{Incremental dematerialization tracks the dirty set (U2). A
-$4096$-byte page in $16$ chunks; measured cycles are \texttt{rdtsc} under TCG.}
+$4096$-byte page in $16$ chunks, measured cycles are \texttt{rdtsc} under TCG.}
 \label{tab:crossover}
 \small
 \begin{tabular}{lrrr}
@@ -594,11 +765,11 @@ large (all chunks)   & 16 & 4096 & 815{,}649 \\
 \subsection{Resume cost and the break-even}
 
 The deschedule resume path was measured directly (C3). Resuming a resident
-process, a register and page-table-root restore, cost $13{,}958$ cycles; resuming
+process, a register and page-table-root restore, cost $13{,}958$ cycles. Resuming
 a dematerialized process, a store fetch, a BLAKE3 verification, a writeback, and a
 remap, cost $1{,}029{,}941$ cycles, a ratio near $73\times$ on this run. The
-architecture narrative describes this path as about fifty times more expensive;
-the spread between that figure and the $73\times$ measured here is the run-to-run
+architecture narrative describes this path as about fifty times more expensive.
+The spread between that figure and the $73\times$ measured here is the run-to-run
 emulation noise the transcript notes explicitly. This single measured cost anchors
 the policy. The break-even deschedule duration, the point past which freeing a
 frame for the deschedule duration outweighs paying the extra resume cost, is
@@ -612,7 +783,7 @@ resident on the other six (PP4).
 \centering
 \caption{Net outcome of dematerializing across deschedule duration, anchored in
 the measured C3 resume cost (PP3). Net is freed-frame value over the deschedule
-minus extra resume cost; break-even $D^\ast = 493{,}223$ cycles.}
+minus extra resume cost. Break-even $D^\ast = 493{,}223$ cycles.}
 \label{tab:breakeven}
 \small
 \begin{tabular}{rrrl}
@@ -643,9 +814,9 @@ is the fine mechanism, and they compose.
 Table~\ref{tab:migration} reports the bytes on the wire between two emulator
 instances. The cold sync transferred the full graph, $1093$ objects in $44{,}505$
 bytes. Three warm hops after small changes transferred $1176$, $1176$, and $2219$
-bytes; the third hop changed two leaves and fetched more than the first, which
+bytes. The third hop changed two leaves and fetched more than the first, which
 changed one, so the warm transfer tracks each hop's own change set rather than a
-constant. No block was rejected on these clean runs; a corrupted or forged block
+constant. No block was rejected on these clean runs. A corrupted or forged block
 is rejected fail-closed by the BLAKE3 hash check.
 
 \begin{table}[t]
@@ -706,12 +877,84 @@ fault path two addresses bound to one hash shared one frame with a single store
 fetch (F3). Two processes that independently wrote the same heap page, with no
 shared ancestor, deduplicated to one physical frame by hash, and a later write
 split a private copy under copy-on-write (PM3). A hot churning page is excluded
-from dematerialization; over a burst of $64$ rewrites the exclusion avoided about
+from dematerialization. Over a burst of $64$ rewrites the exclusion avoided about
 $26{,}689{,}536$ cycles of repeated hashing (PM4). The fairness measurement (FA0)
 showed a process dematerialized every turn paying $12{,}191{,}796$ cycles of
 rematerialize penalty over twelve equal turns that its resident peer did not pay,
 and the keep-resident control stopped the deficit from climbing and recovered the
 victim's progress rate (FA1, FA2).
+
+\subsection{Durable persistence cost and the crash proof}
+
+A per-object durable write plus flush on the virtio-blk path cost $3{,}561{,}112$
+cycles (DUR S1). After a cold reboot, re-verifying and indexing six objects by
+scanning the log cost $46{,}884{,}349$ cycles, and the index came purely from
+disk (S3). A cold-reboot object round-trip, the lookup, read, re-hash, and
+compare, cost $3{,}099{,}346$ cycles (S5). The crash proof read the durable
+two-record log back into its exact byte image and ran the boot recovery parser at
+every one of the $16{,}385$ byte offsets of the write, modelling an ordered-prefix
+truncation at each point. At all offsets the invariant held with zero violations,
+the recovered store holding either the complete object whose bytes hash to its
+name or no such hash, and never a hash naming torn bytes. The rejection branch
+fired at $8{,}896$ offsets, every offset where a record's claim was present but its
+payload incomplete, and the same branch fires on a one-byte payload tamper. The
+proof pass cost $609{,}903{,}419$ cycles (S4). The scope is recovery-logic crash
+consistency under an ordered-prefix write-order model in QEMU. Real-hardware write
+reordering, cache and barrier semantics, and sub-sector tearing are out of scope
+and named in the Limitations.
+
+\subsection{The versioned gate overhead}
+
+The versioned gate was measured against the unversioned re-mint over
+twenty-thousand-iteration averages (VG4). The unversioned gate operation, a
+re-mint into a single slot, cost $868$ cycles, and the versioned operation, a
+re-mint plus the inactive-buffer write plus the atomic commit, cost $780$ cycles
+on this run, so the measured versioning delta was zero this run and about $+168$
+cycles on an earlier run. The honest finding is that the added work, a four-field
+buffer copy and a single word bump, is small relative to the re-mint and at or
+below the measurement noise on this hardware. It is not a speedup. The commit
+point alone, the version bump, cost $14$ cycles, near the rdtsc resolution floor,
+and the per-slot memory cost is $32$ bytes for the second buffer and the version
+word.
+
+\subsection{Durable GC cost and bounded growth}
+
+An in-RAM reference-count increment or decrement cost $731$ cycles and the
+zero-count reclamation decision cost $40$ cycles (GC7). The crash-proof pass over
+the $8{,}193$ truncation points of the decrement-then-tombstone sequence cost
+about $124{,}490$ cycles with zero invariant violations (GC4). End to end,
+dropping a reference reclaimed three unreachable objects and $12{,}288$ bytes
+while the reachable object stayed intact, and re-allocating three objects reused
+the freed blocks so the high-water mark held instead of climbing (GC6). The log
+no longer grows without bound.
+
+\subsection{Dedup domain-partitioning: the closed channel and its price}
+
+The cross-domain timing channel and its cost were measured directly (DS3, DS5). A
+genuinely new store, a miss, cost $1{,}275{,}657$ cycles including the object
+write and flush, and a within-domain hit cost $2{,}245$ cycles. A cross-domain
+probe, probing from one domain for content another domain holds, cost $42{,}873$
+cycles under global deduplication, a fast hit that leaks the content's existence,
+against $1{,}285{,}349$ cycles under domain-scoped deduplication, the same order
+as a genuinely new store. The timing under scoping no longer distinguishes
+exists-in-another-domain from does-not-exist-anywhere, so the cross-domain channel
+is closed. The within-domain hit at $2{,}245$ cycles remains, the acceptable
+residual. The price is duplicate storage. The same content across three domains
+stored three physical objects where global deduplication would store one, a
+measured duplicate-storage cost of $8{,}192$ bytes.
+
+\subsection{SMP bring-up and the cross-core race}
+
+AP startup latency, measured from writing the application processor's entry
+address to the processor signalling it is up, was $599{,}023$ cycles (SMP S1). In
+the cross-core test each core attempted one hundred thousand increments of a
+shared counter. Under the spinlock the counter totalled exactly $200{,}000$, so
+the lock holds across cores, and without the lock it reached only $112{,}245$ of
+the $200{,}000$ attempted, losing $87{,}755$ updates, which is positive evidence
+the two cores ran truly in parallel (S4). No inter-processor interrupt round-trip
+latency is reported because it was not measured in isolation on this run. The
+functional result, delivery and handling in both directions, is what is reported
+(S3).
 
 \subsection{What the evaluation shows}
 
@@ -721,8 +964,100 @@ crossover and the resume cost show that content-addressing is not free and must 
 confined to coarse boundaries, which is why the fast register switch stays the
 common path. The dirty-bit result shows the cheap hardware filter composes with
 the fine content mechanism. The adversarial tables show the one gate holds at every
-boundary. None of this is a claim about raw compute speed, cold-start migration, or
-operating-system completeness.
+boundary. The persistence and GC numbers show the durable substrate is
+crash-consistent under the named ordered-prefix model and bounded in growth, the
+dedup numbers show the cross-domain timing channel closes at a measured storage
+cost, the versioned gate adds overhead at or below the measurement noise, and the
+SMP foundation runs two cores genuinely in parallel. None of this is a claim about
+raw compute speed, cold-start migration, or operating-system completeness.
+
+\section{Formal Results Not Yet Validated on \carmix{} (Tier 2)}
+
+The result in this section is proven theory. The SMP foundation of the earlier
+sections has narrowed its validation gap, but \carmix{} does not yet exhibit it in
+running code, so it is Tier 2 and not Tier 1.
+
+\subsection{Deterministically Reproducible Consistent Cut}
+
+A consistent capture of a multi-core computation needs a cut of the global state
+that no later replay can observe to be inconsistent. The Deterministically
+Reproducible Consistent Cut, DRCC, is the formalization of that property for
+content-addressed rematerialization. The result is a split along the data-race
+line. For a data-race-free program, a cut taken at release-consistency
+synchronization points establishes DRCC without a global stop of all cores,
+because the synchronization points order the memory operations that matter and the
+unsynchronized operations cannot be observed to differ. For state with a genuine
+data race, DRCC is undefined, and no capture mechanism rescues it, because the
+racy outcome is not a function of the cut. This is a derivation that combines the
+release-consistency memory model with the consistent-cut and happened-before line
+of distributed-snapshot work, applied to the content-addressed setting, rather
+than a standalone discovery.
+
+The validation gap is explicit. The SMP bring-up of the Architecture is the
+foundation a multi-core capture would run on, and it now exists, so the gap has
+narrowed from where it stood when only a single CPU ran. But the multi-core
+consistent-capture cut is not exhibited or validated on \carmix{}. The versioned
+capability gate removes the single-CPU authority transient, and the
+inter-processor interrupt path is the primitive a cross-core TLB shootdown would
+use, but neither is the cut. \carmix{} does not yet demonstrate multi-core
+consistent capture. Doing so on the now-built SMP foundation is the first item of
+future work.
+
+\section{Research Findings and Verdicts (Tier 3)}
+
+The findings in this section are research results whose implementation is not
+built, or where only a derivation or an impossibility argument exists. A clean
+negative, an impossibility or an undecidability, is itself a contribution, because
+it bounds what any implementation could achieve. Each finding is labeled, and
+where a finding has a built response that response is named and placed in Tier 1.
+
+\subsection{The deduplication side-channel impossibility}
+
+Cross-process content deduplication is a known timing and occupancy side channel.
+A store that deduplicates globally answers a store of content another party holds
+faster than a store of genuinely new content, which leaks the content's existence.
+The formal finding, borrowed and applied from the Armknecht et al. bound, is that
+zero cross-domain leakage with nonzero cross-domain sharing is impossible. Any
+system that shares stored content across a trust boundary leaks across that
+boundary, so the only leak-free option for the cross-domain channel is to not
+share across it. This is the proven boundary. Its prescribed fix,
+domain-partitioned deduplication, is built and measured and is the Tier 1 result
+in the Architecture, which closes the cross-domain channel at the measured cost of
+duplicate cross-domain storage, exactly the trade the bound makes unavoidable. The
+copy-on-write break channel, the other classic deduplication side channel, is
+structurally absent in \carmix{}, because its objects are immutable and a write
+produces a new object with a new name rather than breaking a shared page.
+
+\subsection{Content-addressed convergence}
+
+Convergence asks whether two computations that reach the same state can be made to
+share one content-addressed name for it. The verdict is split, and it is not
+built. On the positive side, a computable canonical form exists for structural
+equivalence of reachable state, and it preserves both determinism and
+anti-amplification, provided the authority metadata is part of the hashed content
+so that two states of differing authority cannot collide to one name. The
+tractability of computing that canonical form is in principle only. It is
+polynomial for graphs of bounded degree, by the bounded-valence graph isomorphism
+result, and \carmix{}'s object arity is not measured, so the polynomial claim is
+not established for \carmix{}'s graphs. On the negative side, observational or
+behavioral equivalence is undecidable. Deciding whether two computations are
+behaviorally equivalent reduces to the halting problem by Rice's theorem, so full
+semantic convergence, sharing a name whenever two states behave the same, is
+unreachable by any algorithm. The honest statement is that structural convergence
+is constructible in principle with a tractability caveat, and behavioral
+convergence is impossible.
+
+\subsection{Userland phasing}
+
+The path to a real userland is mapped as a sequence of phases, stated here as the
+planned shape rather than as built work. U-0 is the smallest real userland, a
+single process with an explicit bounded capability space, five gated system calls,
+and an acquire-only bump allocator. U-1 follows. U-0 and U-1 are independent of the
+garbage collector and the SMP work. U-2 depends on the collector and U-3 depends
+on SMP, which is why those phases follow the substrates they need. At this writing
+U-0 is in progress and unverified. It is not yet Tier 1, and it is not presented
+as done. The currently loaded program is the static, embedded process of the
+Architecture, not the U-0 userland.
 
 \section{Limitations}
 
@@ -735,9 +1070,15 @@ section.
 the same path from a USB stick, but that has not been verified on a physical
 machine, and there is no real network transport, only ivshmem shared memory
 between two local instances.
-\item \textbf{No filesystem or persistent storage.} The store is in RAM. There is
-no storage driver, so a process image is embedded in the kernel and the trust and
-nonce state do not survive a reboot.
+\item \textbf{Durable persistence is built but narrow.} A content-addressed object
+and a whole dematerialized process now survive a genuine cold reboot on a
+virtio-blk disk, re-verified by re-hash on every load (Tier 1). The scope is
+honest and narrow. There is a single durable writer, objects are at most one
+payload block, and the crash consistency is recovery-logic consistency under an
+ordered-prefix write-order model in QEMU, with real-hardware write reordering,
+cache and barrier semantics, and sub-sector tearing out of scope. There is still
+no general filesystem or namespace, the process image is embedded in the kernel,
+and the trust-store and nonce lifecycle state do not persist across a reboot.
 \item \textbf{No full allocator.} A process can grow its heap through an
 authority-bounded extend-heap backed demand-zero, and a userspace bump allocator
 runs on the granted pages, but the bump allocator has no free, there are no huge
@@ -751,7 +1092,7 @@ rematerialization milestone calls the same C page-fault service routine the live
 vector runs, rather than triggering a live fault on a freshly-unmapped low virtual
 address, because a live touch there halts the boot on the single-stack handler.
 The serial line says so on the wire, and the live page-fault entry is proven
-separately by F1, US0, C0, and PM0.
+separately by F1, US0, and C0.
 \item \textbf{Recoverable nested faults are not supported.} A fault during fault
 handling fails closed rather than recovering. Making it recoverable needs a
 separate interrupt stack (IST/TSS) and a per-fault service context (F5).
@@ -759,9 +1100,32 @@ separate interrupt stack (IST/TSS) and a per-fault service context (F5).
 deficit growth and recovers the progress rate but does not refund the penalty
 already paid, and it accounts for one peer rather than many. It is a first measured
 control, not a proven-optimal fairness algorithm.
-\item \textbf{The dedup side channel is named, not solved.} Content-addressed
-deduplication across processes is a known timing and occupancy hazard, and \carmix{}
-states it rather than mitigating it.
+\item \textbf{Deduplication leakage is partly closed, not eliminated.}
+Domain-partitioned deduplication closes the cross-domain store-timing channel at a
+measured storage cost (Tier 1), and the cross-domain leak-freedom rests on the
+proven impossibility bound (Tier 3). The within-domain timing channel remains and
+is accepted, because the observer is already in that domain. The bounded-residual
+mitigations, timing normalization and a randomized threshold, are not built, and a
+concurrent cross-core attacker is not exercised because it depends on the SMP work.
+\item \textbf{SMP is a foundation only.} A second CPU is up with per-CPU state, a
+working inter-processor interrupt path, and a cross-core test that shows genuine
+parallelism (Tier 1). The multi-core consistent capture and the DRCC result are
+not validated on it. The DRCC result is proven theory whose validation gap has
+narrowed now that the foundation exists, but \carmix{} does not yet exhibit the
+multi-core cut (Tier 2).
+\item \textbf{Garbage collection and convergence have limits.} The durable
+collector is single-CPU. Concurrent tracing against a live multi-threaded mutator
+and cross-core reclamation are not built and wait on the SMP work.
+Content-addressed convergence is not built at all. Its structural canonical form is
+constructible only in principle, polynomial for bounded-degree graphs while
+\carmix{}'s arity is unmeasured, and its behavioral form is undecidable (Tier 3),
+a hard semantic-naming boundary rather than an engineering gap.
+\item \textbf{Userland is U-0 in progress, not a full userland.} The userland
+phasing is a research map. U-0, the smallest real userland, is in progress and
+unverified at this writing, and the later phases are planned, not built (Tier 3).
+\item \textbf{The PM0 stall is a known accepted failure.} A ring-3 readback in the
+per-process-memory stage stalls. It predates this work, is reported on the wire on
+every run rather than hidden, and is accepted, not fixed.
 \item \textbf{The trust-root bootstrap is open.} The destination's first authority
 public key is baked in. How a destination obtains and proves that first key,
 through a certificate authority, identity proofing, or an out-of-band channel, is
@@ -769,7 +1133,7 @@ the one irreducible bootstrap assumption and is not built. There is also no
 trustworthy clock for the expiry check, only a tick counter, and one authority key
 whose compromise is unrecoverable.
 \item \textbf{Input is polled PS/2.} Real modern hardware needs a USB HID stack
-over xHCI; the desktop is software-rendered and runs no third-party graphical
+over xHCI. The desktop is software-rendered and runs no third-party graphical
 applications.
 \item \textbf{The proof is the abstract algebra.} It is not a refinement of the C
 code. The runtime correspondence is demonstrated by the attack tables, not proven.
@@ -798,7 +1162,7 @@ checkpoint~\cite{shapiro1999eros,hardy1985keykos}. Genode is a capability-based
 component framework~\cite{feske2015genode}. \carmix{} shares the capability
 discipline but adds the anti-amplification re-mint as a migration and crossing
 primitive, ties it to a machine-checked authority property, and unifies it with
-content-addressed transfer; its proof covers that authority algebra rather than
+content-addressed transfer. Its proof covers that authority algebra rather than
 full kernel functional correctness.
 
 \textbf{Migration and page deduplication.} MITOSIS migrates serverless function
@@ -817,7 +1181,7 @@ of their content~\cite{git}, Nix builds a content-addressed package
 store~\cite{dolstra2004nix}, and IPFS is a content-addressed distributed file
 system~\cite{benet2014ipfs}. These address files, packages, and blocks at rest.
 \carmix{} applies the same naming to live execution state and to physical-memory
-residency. BLAKE3 is the hash function~\cite{blake3}, chosen for speed; the store
+residency. BLAKE3 is the hash function~\cite{blake3}, chosen for speed. The store
 hashes only at commit and epoch boundaries, never in an execution loop.
 
 \textbf{Replacement and working-set theory.} The residency manager and the
@@ -826,6 +1190,35 @@ locality~\cite{denning1968workingset}. \carmix{}'s contribution there is to anch
 the dematerialize decision in a measured rematerialize cost and a live break-even,
 and to compose the hardware dirty bit with content-addressed dirty tracking, not a
 new replacement algorithm.
+
+\textbf{Durable content-addressed storage and reclamation.} Venti is a durable
+content-addressed archival store whose blocks are named and verified by their
+hash~\cite{quinlan2002venti}, and \carmix{}'s persistence substrate borrows its
+self-verifying append-only model and its separation of storage from reclamation.
+Reference counting and the broader reclamation literature are
+standard~\cite{jones2011gchandbook}. \carmix{}'s contribution there is narrow, a
+durable refcount table reconstructed across a cold reboot with a
+tombstone-as-commit crash discipline, and acyclicity guaranteed by the
+content-addressed naming and machine-checked rather than assumed, so no cycle
+collector is needed.
+
+\textbf{Deduplication side channels.} Cross-user deduplication leaks the existence
+of content through timing and occupancy~\cite{harnik2010sidechannels}, and the
+impossibility of cross-domain leak-freedom with cross-domain sharing is an
+established bound~\cite{armknecht2015dedup}. \carmix{} applies that bound directly,
+partitioning deduplication by authority domain to close the cross-domain channel
+and paying the duplicate storage the bound makes unavoidable. The copy-on-write
+break channel does not apply, because \carmix{} objects are immutable.
+
+\textbf{Canonicalization and consistent cuts.} The convergence verdict rests on
+graph canonicalization and hash-consing~\cite{filliatre2006hashconsing} and on the
+bounded-valence graph isomorphism result that gives polynomial-time tractability
+only for bounded degree~\cite{luks1982valence,babai2016gi}. The DRCC result rests
+on the release-consistency memory model~\cite{gharachorloo1990rc}, the
+data-race-free program class~\cite{adve1990wo}, the consistent-snapshot and
+happened-before line~\cite{chandy1985snapshots,lamport1978clocks}, and Rice's
+theorem for the undecidability of behavioral equivalence~\cite{rice1953}.
+\carmix{}'s parts here are derivations and a verdict, not standalone discoveries.
 
 The unoccupied axis is the synthesis. No prior system makes content-addressed
 rematerialization under an authority-monotonic re-mint the single operation behind
@@ -840,25 +1233,34 @@ crossing, a program load, and a process deschedule are one operation: the
 rematerialization of content-addressed state under a re-minted anti-amplification
 capability ceiling, over BLAKE3 hashes. The contribution is the principle and its
 verified demonstration. The system boots, runs a capability-guarded WebAssembly
-executor, rematerializes state on one machine and across two, enforces one
-anti-amplification gate at every boundary with the adversarial tables to show it,
-and machine-checks the core authority property in Coq under one stated
-collision-resistance hypothesis. It is not a finished operating system, and the
-Limitations section states what is missing.
+executor, rematerializes state on one machine and across two, persists a
+content-addressed object and a whole process across a genuine cold reboot,
+reclaims unreachable objects with a durable collector, partitions deduplication by
+authority domain to close the cross-domain timing channel, brings up a second CPU
+as a multi-core foundation, enforces one anti-amplification gate at every boundary
+with the adversarial tables to show it, and machine-checks the core authority
+property in Coq under one stated collision-resistance hypothesis. Those are the
+Tier 1 results. It is not a finished operating system, and the Limitations section
+states what is missing.
 
-Future work follows the open items. The proof should be extended to a
-machine-checked refinement of the C backend against the abstract algebra, and a
-verified BLAKE3 should replace the vendored one once a verified BLAKE3 is
-confirmed to exist. The task-state object should grow to include the page-table
-root and the capability slots, recoverable nested faults need an interrupt stack
-and a per-fault service context, and the scheduling policy and the fairness control
-need a learned predictor and a multi-peer treatment. The platform needs real
-hardware bring-up, a USB HID stack, a persistent storage driver and filesystem, a
-full allocator, dynamic linking, and a real network transport. The trust root
-needs a bootstrap for the first authority key, persistent rollback-resistant trust
-and nonce state, a trustworthy clock, and revocation at scale. Each of these is an
-honest open item rather than a hidden one, and the credibility of the demonstrated
-parts is meant to rest on that honesty.
+Future work follows the open items, and the Tier 2 and Tier 3 results set the
+highest-value next steps. The DRCC result should be validated on the now-built SMP
+foundation by exhibiting a multi-core consistent-capture cut, which is the open
+multi-core question. Content-addressed convergence should be built, which is the
+high-ceiling open question, bounded above by the undecidability of behavioral
+equivalence. The userland phases should be completed past the in-progress U-0. The
+proof should be extended to a machine-checked refinement of the C backend against
+the abstract algebra, and a verified BLAKE3 should replace the vendored one once a
+verified BLAKE3 is confirmed to exist. The task-state object should grow to include
+the page-table root and the capability slots, recoverable nested faults need an
+interrupt stack and a per-fault service context, and the scheduling policy and the
+fairness control need a learned predictor and a multi-peer treatment. The platform
+needs real hardware bring-up, a USB HID stack, a general filesystem and namespace
+over the durable store, a full allocator, dynamic linking, and a real network
+transport. The trust root needs a bootstrap for the first authority key, persistent
+rollback-resistant trust and nonce state, a trustworthy clock, and revocation at
+scale. Each of these is an honest open item rather than a hidden one, and the
+credibility of the demonstrated parts is meant to rest on that honesty.
 
 \begin{thebibliography}{99}
 
@@ -981,6 +1383,71 @@ Specification, 2020.
 P.~J. Denning.
 The Working Set Model for Program Behavior.
 \emph{Communications of the ACM}, 11(5):323--333, 1968.
+
+\bibitem{quinlan2002venti}
+S.~Quinlan and S.~Dorward.
+Venti: A New Approach to Archival Storage.
+In \emph{Proceedings of the 1st USENIX Conference on File and Storage Technologies
+(FAST)}, pages 89--101, 2002.
+
+\bibitem{jones2011gchandbook}
+R.~Jones, A.~Hosking, and E.~Moss.
+\emph{The Garbage Collection Handbook: The Art of Automatic Memory Management}.
+Chapman and Hall/CRC, 2011.
+
+\bibitem{harnik2010sidechannels}
+D.~Harnik, B.~Pinkas, and A.~Shulman-Peleg.
+Side Channels in Cloud Services: Deduplication in Cloud Storage.
+\emph{IEEE Security \& Privacy}, 8(6):40--47, 2010.
+
+\bibitem{armknecht2015dedup}
+F.~Armknecht, J.-M. Bohli, G.~O. Karame, and F.~Youssef.
+Transparent Data Deduplication in the Cloud.
+In \emph{Proceedings of the 22nd ACM SIGSAC Conference on Computer and
+Communications Security (CCS)}, pages 886--900, 2015.
+
+\bibitem{filliatre2006hashconsing}
+J.-C. Filli\^atre and S.~Conchon.
+Type-Safe Modular Hash-Consing.
+In \emph{Proceedings of the 2006 ACM SIGPLAN Workshop on ML}, pages 12--19, 2006.
+
+\bibitem{luks1982valence}
+E.~M. Luks.
+Isomorphism of Graphs of Bounded Valence Can Be Tested in Polynomial Time.
+\emph{Journal of Computer and System Sciences}, 25(1):42--65, 1982.
+
+\bibitem{babai2016gi}
+L.~Babai.
+Graph Isomorphism in Quasipolynomial Time.
+In \emph{Proceedings of the 48th Annual ACM Symposium on Theory of Computing
+(STOC)}, pages 684--697, 2016.
+
+\bibitem{gharachorloo1990rc}
+K.~Gharachorloo, D.~Lenoski, J.~Laudon, P.~Gibbons, A.~Gupta, and J.~Hennessy.
+Memory Consistency and Event Ordering in Scalable Shared-Memory Multiprocessors.
+In \emph{Proceedings of the 17th Annual International Symposium on Computer
+Architecture (ISCA)}, pages 15--26, 1990.
+
+\bibitem{adve1990wo}
+S.~V. Adve and M.~D. Hill.
+Weak Ordering: A New Definition.
+In \emph{Proceedings of the 17th Annual International Symposium on Computer
+Architecture (ISCA)}, pages 2--14, 1990.
+
+\bibitem{chandy1985snapshots}
+K.~M. Chandy and L.~Lamport.
+Distributed Snapshots: Determining Global States of Distributed Systems.
+\emph{ACM Transactions on Computer Systems}, 3(1):63--75, 1985.
+
+\bibitem{lamport1978clocks}
+L.~Lamport.
+Time, Clocks, and the Ordering of Events in a Distributed System.
+\emph{Communications of the ACM}, 21(7):558--565, 1978.
+
+\bibitem{rice1953}
+H.~G. Rice.
+Classes of Recursively Enumerable Sets and Their Decision Problems.
+\emph{Transactions of the American Mathematical Society}, 74(2):358--366, 1953.
 
 \end{thebibliography}
 
