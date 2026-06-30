@@ -5340,15 +5340,20 @@ static int dur_get(const cvsasx_hash_t*h, uint8_t*outbuf, uint64_t*outlen){
  * to scope counts per domain, but THIS build is global (one count per object). */
 #define RC_MAGIC   0x43524752u    /* 'R','G','R','C' (refcount delta record) */
 #define TOMB_MAGIC 0x424D4F54u    /* 'T','O','M','B' (tombstone record) */
-typedef struct { uint8_t hash[32]; int32_t count; uint8_t tombstoned; } gc_rc_t;
+/* DS extension: the key is now (hash, authority-domain). The GC build reserved the key for
+ * exactly this; domain 0 is the GC/system domain (every GC caller passes 0, so GC behaves
+ * as before). DS uses distinct domains so identical content in two domains is two physical
+ * objects with independent counts. */
+#define GC_DOM_SYS 0u
+typedef struct { uint8_t hash[32]; uint32_t domain; int32_t count; uint8_t tombstoned; } gc_rc_t;
 static gc_rc_t gc_rc[256]; static int gc_nrc;
-static int gc_rc_find(const uint8_t*h){ for(int i=0;i<gc_nrc;i++){ int m=1; for(int k=0;k<32;k++) if(gc_rc[i].hash[k]!=h[k]){m=0;break;} if(m) return i; } return -1; }
-static void gc_rc_apply(const uint8_t*h, int32_t delta){
-    int e=gc_rc_find(h);
-    if(e<0){ if(gc_nrc>=256) return; e=gc_nrc++; for(int k=0;k<32;k++) gc_rc[e].hash[k]=h[k]; gc_rc[e].count=0; gc_rc[e].tombstoned=0; }
+static int gc_rc_find(const uint8_t*h, uint32_t dom){ for(int i=0;i<gc_nrc;i++){ if(gc_rc[i].domain!=dom) continue; int m=1; for(int k=0;k<32;k++) if(gc_rc[i].hash[k]!=h[k]){m=0;break;} if(m) return i; } return -1; }
+static void gc_rc_apply(const uint8_t*h, uint32_t dom, int32_t delta){
+    int e=gc_rc_find(h,dom);
+    if(e<0){ if(gc_nrc>=256) return; e=gc_nrc++; for(int k=0;k<32;k++) gc_rc[e].hash[k]=h[k]; gc_rc[e].domain=dom; gc_rc[e].count=0; gc_rc[e].tombstoned=0; }
     gc_rc[e].count+=delta;
 }
-static int32_t gc_rc_get(const uint8_t*h){ int e=gc_rc_find(h); return e<0?0:gc_rc[e].count; }
+static int32_t gc_rc_get(const uint8_t*h, uint32_t dom){ int e=gc_rc_find(h,dom); return e<0?0:gc_rc[e].count; }
 
 static int dur_recover(void){
     uint64_t t0=rdtsc();
@@ -5366,8 +5371,8 @@ static int dur_recover(void){
             if(dur_nidx<256){ for(int k=0;k<32;k++) dur_idx[dur_nidx].hash[k]=claim[k]; dur_idx[dur_nidx].hdr_block=B; dur_nidx++; }
             B+=2;
         } else if(m==RC_MAGIC){                               /* GC refcount delta (1 block): replay it */
-            int32_t delta=*(int32_t*)(vblk_data+4); uint8_t h[32]; for(int k=0;k<32;k++) h[k]=vblk_data[16+k];
-            gc_rc_apply(h,delta); B+=1;
+            int32_t delta=*(int32_t*)(vblk_data+4); uint32_t dom=*(uint32_t*)(vblk_data+8); uint8_t h[32]; for(int k=0;k<32;k++) h[k]=vblk_data[16+k];
+            gc_rc_apply(h,dom,delta); B+=1;                    /* domain at offset 8 (0 for pre-DS records) */
         } else break;                                          /* no known record: clean end of log */
     }
     dur_log_head=B; dur_recover_cyc=rdtsc()-t0;
@@ -5900,12 +5905,12 @@ static void run_smp(void){
  * ===========================================================================*/
 /* durable refcount delta: append an RC record to the main log (survives reboot via the
  * dur_recover replay). Used for GC1's cold-reboot survival demonstration. */
-static void gc_rc_put_delta(const cvsasx_hash_t*h, int32_t delta){
+static void gc_rc_put_delta(const cvsasx_hash_t*h, uint32_t dom, int32_t delta){
     if(!vio_ready) return;
     for(int i=0;i<4096;i++) vblk_data[i]=0;
-    *(uint32_t*)(vblk_data+0)=RC_MAGIC; *(int32_t*)(vblk_data+4)=delta; for(int k=0;k<32;k++) vblk_data[16+k]=h->b[k];
+    *(uint32_t*)(vblk_data+0)=RC_MAGIC; *(int32_t*)(vblk_data+4)=delta; *(uint32_t*)(vblk_data+8)=dom; for(int k=0;k<32;k++) vblk_data[16+k]=h->b[k];
     vblk_write(dur_log_head); vblk_flush(); dur_log_head+=1;
-    gc_rc_apply(h->b, delta);
+    gc_rc_apply(h->b, dom, delta);
 }
 /* a small GC-local block arena for the end-to-end reclamation demo (GC6), with a
  * free-list so reclaimed blocks are reused and growth stays bounded. Region 700+ is past
@@ -5949,27 +5954,27 @@ static void run_gc(void){
     /* ---- GC1: durable refcount table + survives a cold reboot ---- */
     static uint8_t gA[128],gB[128]; for(int i=0;i<128;i++){ gA[i]=(uint8_t)(i*5u+2u); gB[i]=(uint8_t)(i*9u+4u); }
     cvsasx_hash_t hA,hB; cvsasx_blake3(gA,128,&hA); cvsasx_blake3(gB,128,&hB);
-    if(gc_rc_get(hA.b)>0 || gc_rc_get(hB.b)>0){
+    if(gc_rc_get(hA.b,GC_DOM_SYS)>0 || gc_rc_get(hB.b,GC_DOM_SYS)>0){
         /* REVIVE: counts were reconstructed by dur_recover from the durable RC records. */
-        sputs("GC1 REVIVE: refcounts reconstructed from the durable log after a COLD REBOOT: A="); sdec((uint64_t)gc_rc_get(hA.b));
-        sputs(" B="); sdec((uint64_t)gc_rc_get(hB.b)); sputs(" (survived: A==1,B==1 = "); sputs((gc_rc_get(hA.b)==1&&gc_rc_get(hB.b)==1)?"y":"n"); sputs(") OK\n");
+        sputs("GC1 REVIVE: refcounts reconstructed from the durable log after a COLD REBOOT: A="); sdec((uint64_t)gc_rc_get(hA.b,GC_DOM_SYS));
+        sputs(" B="); sdec((uint64_t)gc_rc_get(hB.b,GC_DOM_SYS)); sputs(" (survived: A==1,B==1 = "); sputs((gc_rc_get(hA.b,GC_DOM_SYS)==1&&gc_rc_get(hB.b,GC_DOM_SYS)==1)?"y":"n"); sputs(") OK\n");
     } else {
         /* PERSIST: durable inc/inc/dec for A (=1) and inc for B (=1). */
         dur_put(gA,128,0); dur_put(gB,128,0);
-        gc_rc_put_delta(&hA,+1); gc_rc_put_delta(&hA,+1); gc_rc_put_delta(&hA,-1);   /* inc, inc, dec -> 1 */
-        gc_rc_put_delta(&hB,+1);                                                     /* inc -> 1 */
-        sputs("GC1 PERSIST: wrote durable refcount deltas (A: +1+1-1=1, B: +1=1) to the log; A="); sdec((uint64_t)gc_rc_get(hA.b));
-        sputs(" B="); sdec((uint64_t)gc_rc_get(hB.b)); sputs("; these reconstruct on the next COLD boot OK\n");
+        gc_rc_put_delta(&hA,GC_DOM_SYS,+1); gc_rc_put_delta(&hA,GC_DOM_SYS,+1); gc_rc_put_delta(&hA,GC_DOM_SYS,-1);   /* inc, inc, dec -> 1 */
+        gc_rc_put_delta(&hB,GC_DOM_SYS,+1);                                                     /* inc -> 1 */
+        sputs("GC1 PERSIST: wrote durable refcount deltas (A: +1+1-1=1, B: +1=1) to the log; A="); sdec((uint64_t)gc_rc_get(hA.b,GC_DOM_SYS));
+        sputs(" B="); sdec((uint64_t)gc_rc_get(hB.b,GC_DOM_SYS)); sputs("; these reconstruct on the next COLD boot OK\n");
     }
 
     /* ---- GC3: root set (durable + volatile), volatile-only object held live ---- */
     cvsasx_hash_t hV; { uint8_t v[64]; for(int i=0;i<64;i++) v[i]=(uint8_t)(i*13u+5u); cvsasx_blake3(v,64,&hV); }
     int durable_roots = dur_nidx;                                        /* the persisted objects + ROOT are the durable roots */
-    int e=gc_rc_find(hV.b); if(e<0){ e=gc_nrc++; for(int k=0;k<32;k++) gc_rc[e].hash[k]=hV.b[k]; gc_rc[e].count=0; gc_rc[e].tombstoned=0; }
+    int e=gc_rc_find(hV.b,GC_DOM_SYS); if(e<0){ e=gc_nrc++; for(int k=0;k<32;k++) gc_rc[e].hash[k]=hV.b[k]; gc_rc[e].domain=GC_DOM_SYS; gc_rc[e].count=0; gc_rc[e].tombstoned=0; }
     gc_rc[e].count=1;                                                    /* held by a VOLATILE root (a live hash) */
-    int held_live = gc_rc_get(hV.b)>0;
+    int held_live = gc_rc_get(hV.b,GC_DOM_SYS)>0;
     gc_rc[e].count=0;                                                    /* drop the volatile root */
-    int now_reclaimable = gc_rc_get(hV.b)==0;
+    int now_reclaimable = gc_rc_get(hV.b,GC_DOM_SYS)==0;
     sputs("GC3 root set: durable roots (persisted objects/ROOT)="); sdec((uint64_t)durable_roots);
     sputs(" + volatile roots (live hashes). Quiesce is trivial on single-CPU (snapshot at the GC invocation point).\n");
     sputs("GC3 a volatile-only-rooted object: held live while the root exists="); sputs(held_live?"y":"n");
@@ -6052,7 +6057,7 @@ static void run_gc(void){
 
         /* ---- GC7: rdtsc measurements ---- */
         const int NN=20000;
-        uint64_t t1=rdtsc(); for(int i=0;i<NN;i++) gc_rc_apply(hK.b,+1); for(int i=0;i<NN;i++) gc_rc_apply(hK.b,-1); uint64_t rcc=(rdtsc()-t1)/(2*NN);
+        uint64_t t1=rdtsc(); for(int i=0;i<NN;i++) gc_rc_apply(hK.b,GC_DOM_SYS,+1); for(int i=0;i<NN;i++) gc_rc_apply(hK.b,GC_DOM_SYS,-1); uint64_t rcc=(rdtsc()-t1)/(2*NN);
         uint64_t t2=rdtsc(); for(int i=0;i<NN;i++){ volatile int32_t cc=1; cc--; if(cc==0){} } uint64_t recl=(rdtsc()-t2)/NN;
         sputs("GC7 rdtsc (this run): refcount inc/dec (in-RAM table) = "); sdec(rcc); sputs(" cyc; durable refcount delta (RC record write+flush) measured in GC1 above; reclamation decision = "); sdec(recl);
         sputs(" cyc; bytes reclaimed end-to-end = "); sdec(reclaimed_bytes); sputs(" (numbers rdtsc-measured this run, not imported)\n");
@@ -6062,6 +6067,133 @@ static void run_gc(void){
     sputs("   crash-consistent tombstone free path (tombstone = commit, ordered-prefix-in-QEMU), resurrection window for dedup-on-zombie.\n");
     sputs("GC SCOPE: NO domain-scoping, NO dedup side-channel mitigation, NO leakage claim, NO convergence canonicalization (separate future builds).\n");
     sputs("GC SCOPE: NO concurrent tracing / cross-core reclamation / epoch multi-holder (SMP-blocked, unvalidated until SMP). The persistence log no longer grows unbounded.\n");
+}
+
+/* ===========================================================================
+ * DS1-DS6 - DEDUPLICATION DOMAIN-SCOPING (single-CPU). EXTENDS the committed GC.
+ *
+ * The dedup side-channel research reached an impossibility verdict (Armknecht et al.):
+ * zero cross-domain leakage with nonzero cross-domain sharing is impossible. The leak-free
+ * option for the cross-domain channel is to PARTITION dedup by authority domain. This build
+ * implements that partition by extending the committed GC refcount table key with a domain
+ * tag (DS1) and scoping the dedup lookup to the storing domain (DS2), so an observer in one
+ * domain cannot probe (via store hit/miss timing) for content held by ANOTHER domain (DS3,
+ * the closure, measured). The cost is duplicate storage for cross-domain-shared content
+ * (DS5, measured). The resurrection check is made domain-aware (DS4) and GC reclamation
+ * still works under the domain tag (DS6).
+ *
+ * PRECISE CLAIM: domain-PARTITIONED dedup closes the CROSS-domain timing channel at the
+ * measured cost of duplicate storage. NOT a general zero-leakage claim: the WITHIN-domain
+ * timing channel remains and is acceptable (the observer is already in that domain). No
+ * timing-normalization or randomized-threshold mitigation (the research's other options).
+ * Single-CPU; a concurrent cross-core attacker is SMP-blocked, not exercised. See
+ * kernel/DEDUP_SCOPING_LOG.md.
+ * ===========================================================================*/
+#define DS_DOM_A 1u
+#define DS_DOM_B 2u
+#define DS_DOM_C 3u
+typedef struct { int hit; uint64_t block; uint64_t cyc; } ds_res_t;
+/* domain-scoped store: dedup ONLY within `dom`. An existing (live or zombie) object in
+ * `dom` is a HIT (count++, no new storage; a zombie hit is the domain-aware resurrection).
+ * Content absent FROM `dom` is a MISS (new physical object), even if another domain holds
+ * identical content. */
+static ds_res_t ds_store_scoped(const void*c,uint64_t len,uint32_t dom){
+    cvsasx_hash_t h; cvsasx_blake3(c,len,&h); ds_res_t r; uint64_t t=rdtsc();
+    int e=gc_rc_find(h.b,dom);
+    if(e>=0 && !gc_rc[e].tombstoned){ gc_rc[e].count++; r.hit=1; r.block=0; }   /* same-domain hit / zombie resurrect */
+    else { uint64_t b=gc_obj_put(c,len,0); gc_rc_apply(h.b,dom,+1); r.hit=0; r.block=b; }  /* miss: new object in dom */
+    r.cyc=rdtsc()-t; return r;
+}
+/* the PRE-scoping baseline: global dedup keyed by hash alone (any domain). Used only to
+ * MEASURE the channel that scoping closes. A cross-domain probe is a fast HIT here. */
+static ds_res_t ds_store_global(const void*c,uint64_t len){
+    cvsasx_hash_t h; cvsasx_blake3(c,len,&h); ds_res_t r; uint64_t t=rdtsc();
+    int any=0; for(int i=0;i<gc_nrc;i++){ if(gc_rc[i].tombstoned||gc_rc[i].count<=0) continue; int m=1; for(int k=0;k<32;k++) if(gc_rc[i].hash[k]!=h.b[k]){m=0;break;} if(m){any=1;break;} }
+    if(any){ r.hit=1; r.block=0; } else { uint64_t b=gc_obj_put(c,len,0); r.hit=0; r.block=b; }
+    r.cyc=rdtsc()-t; return r;
+}
+
+static void run_ds(void){
+    sputs("\n=== DEDUP DOMAIN-SCOPING (DS1-DS6): close the cross-domain timing channel by partitioning ===\n");
+    if(!vio_ready){ sputs("DS NOT RUN: durable media unavailable\n"); return; }
+    static uint8_t X[96]; for(int i=0;i<96;i++) X[i]=(uint8_t)(i*7u+3u);   /* the shared content */
+
+    /* ---- DS1: domain tag on the table -> same content in two domains = two objects ---- */
+    ds_res_t a=ds_store_scoped(X,96,DS_DOM_A);
+    ds_res_t b=ds_store_scoped(X,96,DS_DOM_B);
+    cvsasx_hash_t hX; cvsasx_blake3(X,96,&hX);
+    int two_objs=(a.block!=b.block) && !a.hit && !b.hit;
+    sputs("DS1 same content stored in domain A and domain B: blocks "); sdec(a.block); sputs(" and "); sdec(b.block);
+    sputs(" (distinct="); sputs(a.block!=b.block?"y":"n"); sputs("), counts A="); sdec((uint64_t)gc_rc_get(hX.b,DS_DOM_A));
+    sputs(" B="); sdec((uint64_t)gc_rc_get(hX.b,DS_DOM_B)); sputs(" (independent)\n");
+    sputs(two_objs?"DS1 -> TWO PHYSICAL OBJECTS, INDEPENDENT COUNTS (domain-tagged key) OK\n":"DS1 -> *** FAIL ***\n");
+
+    /* ---- DS2: cross-domain store = miss, same-domain store = hit ---- */
+    ds_res_t same=ds_store_scoped(X,96,DS_DOM_A);             /* X already in A -> HIT */
+    static uint8_t Y[96]; for(int i=0;i<96;i++) Y[i]=(uint8_t)(i*11u+5u);
+    ds_store_scoped(Y,96,DS_DOM_A);                           /* Y now in A */
+    ds_res_t cross=ds_store_scoped(Y,96,DS_DOM_B);            /* Y in A, stored in B -> MISS (cross-domain) */
+    sputs("DS2 same-domain re-store (X in A) hit="); sputs(same.hit?"y":"n");
+    sputs("; cross-domain store (Y exists in A, stored in B) hit="); sputs(cross.hit?"y":"n"); sputs(" (miss = new object)\n");
+    sputs(same.hit&&!cross.hit?"DS2 -> DEDUP SCOPED TO DOMAIN (same-domain hit, cross-domain miss) OK\n":"DS2 -> *** FAIL ***\n");
+
+    /* ---- DS3: the channel closure, MEASURED ---- */
+    const int R=8; uint64_t miss_new=0,hit_same=0,glob_cross=0,scop_cross=0;
+    for(int i=0;i<R;i++){ uint8_t z[96]; for(int j=0;j<96;j++) z[j]=(uint8_t)(j+i*17u+200u); miss_new+=ds_store_scoped(z,96,DS_DOM_A).cyc; }   /* genuinely-new in A */
+    for(int i=0;i<R;i++) hit_same+=ds_store_scoped(X,96,DS_DOM_A).cyc;                                   /* X in A -> within-domain hit */
+    for(int i=0;i<R;i++) glob_cross+=ds_store_global(X,96).cyc;                                          /* BASELINE: global dedup, X exists -> fast HIT (leaks) */
+    for(int i=0;i<R;i++) scop_cross+=ds_store_scoped(X,96,DS_DOM_C+(uint32_t)i).cyc;                      /* SCOPED: X absent from each other domain -> MISS == new (channel closed) */
+    miss_new/=R; hit_same/=R; glob_cross/=R; scop_cross/=R;
+    sputs("DS3 store latency (rdtsc avg of "); sdec((uint64_t)R); sputs("): genuinely-new(miss)="); sdec(miss_new);
+    sputs(" within-domain-existing(hit)="); sdec(hit_same); sputs(" cyc\n");
+    sputs("DS3 cross-domain probe for content held by ANOTHER domain: GLOBAL-dedup baseline="); sdec(glob_cross);
+    sputs(" (a fast HIT, LEAKS existence) vs DOMAIN-SCOPED="); sdec(scop_cross); sputs(" cyc (a MISS)\n");
+    /* closed if scoped-cross looks like a new miss, not like the fast hit */
+    int closed = (scop_cross > hit_same*4) && (glob_cross < miss_new/2);
+    sputs("DS3 -> under scoping the cross-domain probe == genuinely-new (no longer the fast hit) -> CROSS-DOMAIN TIMING CHANNEL CLOSED="); sputs(closed?"y":"n");
+    sputs("; within-domain hit remains (acceptable residual)\n");
+    sputs(closed?"DS3 -> CHANNEL CLOSED BY PARTITIONING (measured) OK\n":"DS3 -> *** measured latencies did not separate, see numbers ***\n");
+
+    /* ---- DS4: domain-aware resurrection ---- */
+    static uint8_t Z[96]; for(int i=0;i<96;i++) Z[i]=(uint8_t)(i*13u+9u); cvsasx_hash_t hZ; cvsasx_blake3(Z,96,&hZ);
+    ds_res_t za=ds_store_scoped(Z,96,DS_DOM_A);              /* Z in A, count 1, block za.block */
+    gc_rc_apply(hZ.b,DS_DOM_A,-1);                           /* dec -> count 0: zombie in A (entry present, not tombstoned) */
+    int zombie=(gc_rc_get(hZ.b,DS_DOM_A)==0)&&(gc_rc_find(hZ.b,DS_DOM_A)>=0);
+    ds_res_t zb=ds_store_scoped(Z,96,DS_DOM_B);              /* same content in B -> MISS (new), does NOT resurrect A */
+    int not_resurrected_by_B=(gc_rc_get(hZ.b,DS_DOM_A)==0) && !zb.hit;
+    ds_res_t za2=ds_store_scoped(Z,96,DS_DOM_A);            /* same content in A -> HIT: resurrects the zombie */
+    int resurrected_by_A=(gc_rc_get(hZ.b,DS_DOM_A)==1) && za2.hit && (za2.block==0) && gc_obj_verify(za.block,&hZ);  /* SAME storage, intact */
+    sputs("DS4 zombie in A (count 0)="); sputs(zombie?"y":"n"); sputs("; store same content in B -> new object, A NOT resurrected="); sputs(not_resurrected_by_B?"y":"n");
+    sputs("; store same content in A -> A RESURRECTED (count 1, no new storage)="); sputs(resurrected_by_A?"y":"n"); sputc('\n');
+    sputs(zombie&&not_resurrected_by_B&&resurrected_by_A?"DS4 -> RESURRECTION IS DOMAIN-AWARE OK\n":"DS4 -> *** FAIL ***\n");
+
+    /* ---- DS5: the storage cost, MEASURED ---- */
+    static uint8_t W[96]; for(int i=0;i<96;i++) W[i]=(uint8_t)(i*19u+1u);
+    uint64_t hwm0=gc_hwm; const uint32_t NDOM=3;
+    ds_store_scoped(W,96,DS_DOM_A); ds_store_scoped(W,96,DS_DOM_B); ds_store_scoped(W,96,DS_DOM_C);
+    uint64_t objs=gc_hwm-hwm0; uint64_t dup_bytes=(objs>0?objs-1:0)*4096;
+    sputs("DS5 same content across "); sdec((uint64_t)NDOM); sputs(" domains -> "); sdec(objs); sputs(" physical objects (global dedup would be 1); duplicate-storage cost="); sdec(dup_bytes);
+    sputs(" bytes -> the unavoidable price of cross-domain leak-freedom (measured)\n");
+    sputs(objs==NDOM?"DS5 -> STORAGE COST IS N-FOLD FOR N-DOMAIN-SHARED CONTENT (measured, not hidden) OK\n":"DS5 -> *** FAIL ***\n");
+
+    /* ---- DS6: GC still works under the domain tag ---- */
+    static uint8_t G[96]; for(int i=0;i<96;i++) G[i]=(uint8_t)(i*23u+2u); cvsasx_hash_t hG; cvsasx_blake3(G,96,&hG);
+    static uint8_t H2[96]; for(int i=0;i<96;i++) H2[i]=(uint8_t)(i*29u+4u); cvsasx_hash_t hH2; cvsasx_blake3(H2,96,&hH2);
+    ds_res_t g=ds_store_scoped(G,96,DS_DOM_A);              /* reclaim target in A */
+    ds_res_t k=ds_store_scoped(H2,96,DS_DOM_A);            /* reachable in A */
+    gc_rc_apply(hG.b,DS_DOM_A,-1);                          /* drop ref -> count 0 */
+    int reclaim=0; if(gc_rc_get(hG.b,DS_DOM_A)==0){ int e=gc_rc_find(hG.b,DS_DOM_A); if(e>=0){ gc_rc[e].tombstoned=1; gc_freeblk(g.block); reclaim=1; } } /* tomb + free */
+    int g_gone = gc_rc[gc_rc_find(hG.b,DS_DOM_A)].tombstoned==1;
+    int k_intact = gc_rc_get(hH2.b,DS_DOM_A)>0 && gc_obj_verify(k.block,&hH2);
+    sputs("DS6 GC under domain tag: domain-A object reclaimed (tombstone+free)="); sputs(reclaim&&g_gone?"y":"n");
+    sputs("; reachable domain-A object intact + load-verifies="); sputs(k_intact?"y":"n"); sputc('\n');
+    sputs(reclaim&&g_gone&&k_intact?"DS6 -> GC RECLAMATION STILL WORKS WITH DOMAIN-TAGGED COUNTS OK\n":"DS6 -> *** FAIL ***\n");
+
+    sputs("DS SCOPE (plain): domain-PARTITIONED dedup. Content dedups only WITHIN an authority domain, so the CROSS-domain\n");
+    sputs("   store-hit/miss timing channel is CLOSED (an observer cannot probe for content held by another domain).\n");
+    sputs("DS SCOPE: cost is duplicate storage for cross-domain-shared content (measured above). NOT general zero-leakage:\n");
+    sputs("   the WITHIN-domain timing channel remains and is acceptable (the observer is already in that domain).\n");
+    sputs("DS SCOPE: no timing-normalization / randomized-threshold (research's other options). Single-CPU; cross-core attacker SMP-blocked, not exercised.\n");
 }
 
 void kmain(void);
@@ -6114,6 +6246,7 @@ void kmain(void){
      * regression demos, with a clean kernel cr3 and no timer yet. */
     run_persist();
     run_gc();      /* SINGLE-CPU DURABLE GC: GC1 refcount table, GC2 acyclicity, GC3 root set, GC4 crash-consistent tombstone, GC5 resurrection window, GC6 end-to-end reclaim, GC7 rdtsc */
+    run_ds();      /* DEDUP DOMAIN-SCOPING: DS1 domain-tagged key, DS2 scoped dedup, DS3 channel closed (measured), DS4 domain-aware resurrection, DS5 storage cost, DS6 GC intact */
     run_vgate();   /* SINGLE-CPU VERSIONED GATE: VG1 slot+atomic commit, VG2 anti-amp preserved, VG3 never-torn capture, VG4 rdtsc cost */
 
     /* B3: frame alloc -> map at a fresh vaddr -> write/read-back -> free/realloc */
