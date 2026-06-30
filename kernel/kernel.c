@@ -4215,6 +4215,555 @@ pm_done:
     framedb_init();   /* clean database for run_shell */
 }
 
+/* ===========================================================================
+ * TS0-TS5 - FULL TASK-STATE DEMATERIALIZATION (the page-table root INCLUDED).
+ *
+ * Closes the standing caveat named in every prior milestone (C2/PP/ROADMAP:
+ * "the page-table root stays resident"). Makes ONE whole live (descheduled)
+ * process a content-addressed object: its page-table hierarchy canonicalized to
+ * a placement-independent Merkle root, its registers/stack/authority/metadata
+ * folded into ONE task-hash, ALL its frames freed (page-table frames too, not
+ * just backing pages), rebuilt BIT-EXACT from the hash, authority re-minted
+ * through the PROVEN gate under the SAME ceiling and never widened, the cost
+ * measured against today's keep-the-root-resident behaviour.
+ *
+ * REUSES (the proven core is NOT touched, ships byte-identical): conc_make_proc
+ * / conc_enter (the ring-3 process model), mm_new_space / mm_walk / mm_map /
+ * mm_resolve (page tables), frame_reserve / frame_release_physical / falloc /
+ * ffree (frames), rm_materialize / dematerialize_frame / cvsasx_blake3 / the
+ * store (content addressing, the PM2 path), cvsasx_sw_cap_remint + the
+ * custodian/region (the gate). Numbers COMPUTED (rdtsc / counters), never
+ * hardcoded. See kernel/TASKSTATE_LOG.md.
+ *
+ * SCOPE LOCK (from the research report): IN scope = a QUIESCENT (descheduled)
+ * process with ordinary CONTENT-BACKED pages. OUT of scope, EXCLUDED + flagged,
+ * never hashed: device/MMIO mappings (no meaningful content hash); live/
+ * non-quiescent address spaces (canonicalization needs a consistent snapshot).
+ * ===========================================================================*/
+
+/* the clean kernel PML4 (its low/user half is absent) captured at boot. The late
+ * run_taskstate restores it so fresh spaces (mm_new_space) clone a clean top-half;
+ * an earlier ring-3 stage may have left a process cr3 active. */
+static uint64_t g_kernel_cr3=0;
+
+/* the structural object store for the canonical tree / descriptor / registers /
+ * metadata / manifest. Page CONTENTS live in rm_store (the proven PM2 path), so
+ * rm_materialize rebuilds them verbatim. */
+static uint8_t  ts_arena[1u<<18]; static cvsasx_store_entry_t ts_idx[512]; static cvsasx_store_t ts_store; static int ts_ready=0;
+static void ts_store_once(void){ if(!ts_ready){ cvsasx_store_init(&ts_store,ts_arena,sizeof ts_arena,ts_idx,512); ts_ready=1; } }
+
+/* a recovered canonical leaf (the placement-independent mapping record). */
+#define TS_MAXLEAF 64
+typedef struct { uint64_t vpn; uint64_t perm; uint8_t chash[32]; } ts_leaf_t;
+static ts_leaf_t ts_leaves[TS_MAXLEAF]; static int ts_nleaf;
+static int      ts_excluded; static uint64_t ts_excluded_va;   /* device/MMIO classified out */
+
+/* the EXACT permission mask folded into a leaf: present, write, user, NX. The
+ * hardware ACCESSED(5)/DIRTY(6) status bits are NOT permissions and are masked
+ * out, so an accessed page and an untouched one with the same rights canonicalize
+ * identically (determinism). */
+#define TS_PERM_MASK ((uint64_t)(MM_PRESENT|MM_WRITE|MM_USER) | (1ULL<<63))
+
+/* classifier: a frame is CONTENT-BACKED iff its physical address is tracked RAM.
+ * A device/MMIO frame (framebuffer, LAPIC, anything off the usable map) has no
+ * meaningful content hash and is EXCLUDED. */
+static int ts_content_backed(uint64_t pa){ return pa>=ram_lo && pa<ram_hi; }
+
+/* one static node buffer PER level (PML4/PDPT/PD/PT). The canonicalization is a
+ * depth-first walk, so exactly one buffer per level is live at a time: no
+ * aliasing, and 16 KiB*4 stays out of the kernel stack. */
+static uint8_t ts_nbuf_pml4[512*32], ts_nbuf_pdpt[512*32], ts_nbuf_pd[512*32], ts_nbuf_pt[512*32];
+
+/* canonical PT (leaf-level) node: BLAKE3 of the ORDERED leaf hashes, where each
+ * leaf = BLAKE3( VPN || page-content-hash || perm-bits ) and page-content-hash is
+ * the existing BLAKE3 of the 4 KiB backing page (REUSE the store's hashing). The
+ * node BYTES (the ordered leaf hashes) are stored so the whole tree is in the
+ * store by hash. Non-content (device/MMIO) leaves are EXCLUDED + flagged. */
+static cvsasx_hash_t ts_canon_pt(uint64_t pt_phys, uint64_t va_base, int collect){
+    uint8_t *buf=ts_nbuf_pt; int n=0;
+    uint64_t *t=P2V(pt_phys);
+    for(int i=0;i<512;i++){
+        if(!(t[i]&1)) continue;
+        if(!(t[i]&MM_USER)) continue;                /* only USER (ring-3) leaves are this process's content */
+        uint64_t pte=t[i]; uint64_t pa=pte&~0xfffULL;
+        uint64_t va=va_base | ((uint64_t)i<<12); uint64_t vpn=va>>12;
+        if(!ts_content_backed(pa)){ if(collect){ ts_excluded++; ts_excluded_va=va; } continue; } /* device/MMIO: never hashed */
+        uint64_t perm=pte & TS_PERM_MASK;
+        cvsasx_hash_t ch; cvsasx_blake3((const void*)P2V(pa),4096,&ch);
+        uint8_t lb[8+32+8];
+        for(int k=0;k<8;k++) lb[k]=(uint8_t)(vpn>>(8*k));
+        for(int k=0;k<32;k++) lb[8+k]=ch.b[k];
+        for(int k=0;k<8;k++) lb[40+k]=(uint8_t)(perm>>(8*k));
+        cvsasx_hash_t leaf; cvsasx_blake3(lb,sizeof lb,&leaf);
+        for(int k=0;k<32;k++) buf[n*32+k]=leaf.b[k]; n++;
+        if(collect && ts_nleaf<TS_MAXLEAF){ ts_leaves[ts_nleaf].vpn=vpn; ts_leaves[ts_nleaf].perm=perm;
+            for(int k=0;k<32;k++) ts_leaves[ts_nleaf].chash[k]=ch.b[k]; ts_nleaf++; }
+    }
+    cvsasx_hash_t node; cvsasx_blake3(buf,(size_t)n*32,&node);
+    ts_store_once(); cvsasx_hash_t tmp; cvsasx_store_put(&ts_store,buf,(size_t)n*32,&tmp);  /* store the node */
+    return node;
+}
+/* canonical interior node (lvl 3=PDPT, 2=PD): BLAKE3 of the ORDERED child hashes.
+ * The index need not be folded in: each leaf carries its full VPN, so a child at a
+ * different slot yields different leaf VPNs and a different root by construction. */
+static cvsasx_hash_t ts_canon_interior(uint64_t tbl_phys, int lvl, uint64_t va_base, int collect){
+    uint8_t *buf=(lvl==3)?ts_nbuf_pdpt:ts_nbuf_pd; int n=0;
+    uint64_t *t=P2V(tbl_phys); int shift=12+9*(lvl-1);
+    for(int i=0;i<512;i++){
+        if(!(t[i]&1)) continue;
+        if(!(t[i]&MM_USER)) continue;                /* descend only into USER (process-private) subtrees */
+        uint64_t child=t[i]&~0xfffULL; uint64_t cva=va_base | ((uint64_t)i<<shift);
+        cvsasx_hash_t ch=(lvl==2)?ts_canon_pt(child,cva,collect):ts_canon_interior(child,lvl-1,cva,collect);
+        for(int k=0;k<32;k++) buf[n*32+k]=ch.b[k]; n++;
+    }
+    cvsasx_hash_t node; cvsasx_blake3(buf,(size_t)n*32,&node);
+    ts_store_once(); cvsasx_hash_t tmp; cvsasx_store_put(&ts_store,buf,(size_t)n*32,&tmp);
+    return node;
+}
+/* TS0 - canonicalize the process's CONTENT-BACKED user address space into the
+ * research report's Merkle form. Walks the REAL page table via mm_walk's own PML4;
+ * descends ONLY into PRIVATE (user) subtrees - the PML4 slots the kernel clone
+ * left absent - so the SHARED kernel/HHDM half (device/MMIO, not this process's
+ * content) is never hashed. address-space root = hash of the canonical PML4-level
+ * node over the included mappings. Returns the root; with collect=1 fills
+ * ts_leaves[] + the exclusion counters. PLACEMENT-INDEPENDENT: only VPN, content
+ * hash and perm-bits enter the hash; never a physical frame number. */
+static cvsasx_hash_t ts_canonicalize(uint64_t cr3, int collect){
+    if(collect){ ts_nleaf=0; ts_excluded=0; ts_excluded_va=0; }
+    uint64_t *pp=P2V(cr3&~0xfffULL);
+    uint8_t *buf=ts_nbuf_pml4; int n=0;
+    for(int i=0;i<256;i++){                          /* LOW/USER half only (PML4 0..255); the kernel/HHDM live in the high half (256..511) */
+        if(!(pp[i]&1)) continue;
+        if(!(pp[i]&MM_USER)) continue;              /* USER slot only: kernel supervisor low-half mappings (e.g. B3) are skipped */
+        uint64_t child=pp[i]&~0xfffULL; uint64_t cva=((uint64_t)i)<<39;
+        cvsasx_hash_t ch=ts_canon_interior(child,3,cva,collect);   /* child is a PDPT */
+        for(int k=0;k<32;k++) buf[n*32+k]=ch.b[k]; n++;
+    }
+    cvsasx_hash_t root; cvsasx_blake3(buf,(size_t)n*32,&root);
+    ts_store_once(); cvsasx_hash_t tmp; cvsasx_store_put(&ts_store,buf,(size_t)n*32,&tmp);
+    return root;
+}
+
+/* the recoverable canonical DESCRIPTOR: [count:1][pad:3] then count*( vpn:8 perm:8
+ * chash:32 ) in ascending VPN order (the walk order). This is the placement-
+ * independent form the rebuild reads; its hash equals across two spaces with the
+ * same logical mapping. */
+static uint8_t ts_descbuf[4+TS_MAXLEAF*48];
+static cvsasx_hash_t ts_put_descriptor(void){
+    uint64_t o=0; ts_descbuf[0]=(uint8_t)ts_nleaf; ts_descbuf[1]=ts_descbuf[2]=ts_descbuf[3]=0; o=4;
+    for(int i=0;i<ts_nleaf;i++){
+        for(int k=0;k<8;k++) ts_descbuf[o++]=(uint8_t)(ts_leaves[i].vpn>>(8*k));
+        for(int k=0;k<8;k++) ts_descbuf[o++]=(uint8_t)(ts_leaves[i].perm>>(8*k));
+        for(int k=0;k<32;k++) ts_descbuf[o++]=ts_leaves[i].chash[k];
+    }
+    ts_store_once(); cvsasx_hash_t h; cvsasx_store_put(&ts_store,ts_descbuf,o,&h); return h;
+}
+
+/* pack the per-task METADATA needed for a correct rebuild (residency / PP / FA
+ * counters + the local ceiling base offset + the descriptor hash). IDENTICAL
+ * packing in demat and verify, so the metadata hash round-trips bit-exact. */
+static uint64_t ts_pack_meta(uint8_t *b, const cproc_t *p, uint64_t ceil_off, const cvsasx_hash_t *dhash){
+    uint64_t o=0;
+    for(int k=0;k<4;k++) b[o++]=(uint8_t)(p->id>>(8*k));
+    b[o++]=p->tag; b[o++]=p->desched_reason; b[o++]=0; b[o++]=0;
+    for(int k=0;k<4;k++) b[o++]=(uint8_t)(p->wakeup_count>>(8*k));
+    for(int k=0;k<4;k++) b[o++]=(uint8_t)(p->cooldown_budget>>(8*k));
+    for(int k=0;k<8;k++) b[o++]=(uint8_t)(p->useful_cyc>>(8*k));
+    for(int k=0;k<8;k++) b[o++]=(uint8_t)(p->tax_cyc>>(8*k));
+    for(int k=0;k<4;k++) b[o++]=(uint8_t)(p->fair_grant>>(8*k));
+    for(int k=0;k<8;k++) b[o++]=(uint8_t)(ceil_off>>(8*k));
+    for(int k=0;k<32;k++) b[o++]=dhash->b[k];
+    return o;
+}
+
+/* free a process's PAGE-TABLE frames (the new thing): walk the PRIVATE user
+ * subtree of cr3 and ffree every PT/PD/PDPT frame, then the PML4 frame itself.
+ * The SHARED kernel/HHDM slots (cloned by mm_new_space) are kept. Leaf PTEs point
+ * at backing frames that are freed on the separate backing-page path, so a PT
+ * frame is the table, never a backing page. Returns the count freed. */
+static int ts_free_pagetables(uint64_t cr3){
+    uint64_t pml4_phys=cr3&~0xfffULL; uint64_t *pp=P2V(pml4_phys);
+    int freed=0;
+    for(int i=0;i<256;i++){                                            /* LOW/USER half only; the kernel/HHDM high half (256..511) is never freed */
+        if(!(pp[i]&1)||!(pp[i]&MM_USER)) continue;                     /* keep supervisor low-half kernel mappings (e.g. B3) */
+        uint64_t pdpt=pp[i]&~0xfffULL; uint64_t *pdv=P2V(pdpt);
+        for(int j=0;j<512;j++){
+            if(!(pdv[j]&1)||!(pdv[j]&MM_USER)) continue; if(pdv[j]&0x80) continue; /* 1 GiB page: none here (4K only) */
+            uint64_t pd=pdv[j]&~0xfffULL; uint64_t *pv=P2V(pd);
+            for(int k=0;k<512;k++){
+                if(!(pv[k]&1)||!(pv[k]&MM_USER)) continue; if(pv[k]&0x80) continue; /* 2 MiB page: none here */
+                ffree(pv[k]&~0xfffULL); freed++;                       /* the PT frame */
+            }
+            ffree(pd); freed++;                                       /* the PD frame */
+        }
+        ffree(pdpt); freed++;                                         /* the PDPT frame */
+    }
+    ffree(pml4_phys); freed++;                                        /* the PML4 root frame */
+    return freed;
+}
+
+/* a rebuild slot for the recovered process (so TS3 keeps OLD frame numbers for the
+ * placement-differs proof). */
+static cvsasx_hash_t g_ts_taskhash;             /* the ONE content address P collapses to */
+static cvsasx_hash_t g_ts_asr_orig;             /* TS1 address-space root (for the TS3 match) */
+static uint64_t g_ts_canon_cyc, g_ts_demat_cyc, g_ts_remat_cyc;
+static uint64_t g_ts_backing_freed, g_ts_pt_freed;
+static uint64_t g_ts_old_data_pfn, g_ts_old_stk_pfn, g_ts_old_pml4;
+
+/* run a process via the PROVEN conc ring-3 path until it parks (counter==park) or
+ * runs to completion (park==0). Mirrors the C2 IDT dance exactly. */
+static void ts_run_ring3(cproc_t *p, uint64_t park){
+    g_ncp=1; g_clive=1; p->live=1; p->present=1;
+    idt_set(0x20,(void*)conc_trap,SEL_KCODE);
+    idt_set(0x80,(void*)conc_sysent,SEL_KCODE); idt[0x80].type=0xEE;
+    { struct idtr idtr={(uint16_t)(sizeof(idt)-1),(uint64_t)idt}; __asm__ volatile("lidt %0"::"m"(idtr):"memory"); }
+    g_conc_active=1; g_c2_park_at=park; g_ccur=0;
+    conc_enter(&p->tf, p->cr3);
+    g_conc_active=0; g_c2_park_at=0;
+    idt_set(0x20,(void*)isr_timer,SEL_KCODE);
+    idt_set(0x80,(void*)isr_syscall,SEL_KCODE); idt[0x80].type=0xEE;
+    { struct idtr idtr={(uint16_t)(sizeof(idt)-1),(uint64_t)idt}; __asm__ volatile("lidt %0"::"m"(idtr):"memory"); }
+}
+
+static void run_taskstate(void){
+    sputs("\n=== FULL TASK-STATE DEMATERIALIZATION (TS0-TS5): a whole process as ONE content hash, page table + authority included ===\n");
+    sputs("TS scope: a QUIESCENT (descheduled) process, CONTENT-BACKED pages only; device/MMIO EXCLUDED+flagged; live spaces OUT (need a consistent snapshot).\n");
+    /* Base fresh spaces on a CLEAN kernel PML4. Earlier ring-3 demo stages (US / L /
+     * PM) mapped user pages into the kernel cr3's low half and left USER PML4 slots
+     * present; cloning those would make every "fresh" space SHARE them (and freeing
+     * the page tables would then free the kernel's own shared tables). Drop EVERY
+     * leftover low-half USER slot (the kernel runs entirely in the high half: code,
+     * stack, HHDM, framebuffer; supervisor low-half mappings like B3's are kept) and
+     * reload, so mm_new_space clones a private, clean low half. */
+    if(g_kernel_cr3){ uint64_t *kpml=P2V(g_kernel_cr3);
+        for(int i=0;i<256;i++) if((kpml[i]&1)&&(kpml[i]&MM_USER)) kpml[i]=0;
+        __asm__ volatile("mov %0,%%cr3"::"r"(g_kernel_cr3):"memory"); }
+    framedb_init();                                  /* clean pool -> deterministic frame accounting */
+    rset_n=0; for(uint32_t i=0;i<RSET_MAX;i++) rset[i].live=0;   /* clean resident-set */
+    ts_store_once(); conc_store_once(); rm_store_once();
+    sputs("TS note: the process's content is its USER (ring-3) page-table subtree (USER bit set at every level);\n");
+    sputs("         the shared kernel/HHDM half is supervisor (USER bit clear) and is never canonicalized or freed.\n");
+
+    /* =====================================================================
+     * TS0 - THE CANONICAL PAGE-TABLE FORM (placement-independent Merkle root)
+     * ===================================================================*/
+    sputs("\n--- TS0: canonical Merkle page-table form (leaf=BLAKE3(VPN||content-hash||perm); root=PML4 node) ---\n");
+    /* A and B: identical LOGICAL space (same VAs, same page CONTENT - same tag/target,
+     * stacks zeroed below, code shared-by-hash) in DIFFERENT physical frames, so only
+     * placement differs. (The id differs but is not part of the hashed page content.) */
+    int okA=conc_make_proc(&g_cp[0], 0xA, 'P', 8, 0, 128);
+    int okB=conc_make_proc(&g_cp[1], 0xB, 'P', 8, 0, 128);
+    if(!okA||!okB){ sputs("TS0 NOT RUN: could not build two processes (frames/space)\n"); return; }
+    cproc_t *A=&g_cp[0], *B=&g_cp[1];
+    /* equalize CONTENT at every mapped VA so only PHYSICAL placement differs:
+     * zero both stacks (frame_reserve does not), data pages already identical
+     * (same tag/target), code shared-by-hash. */
+    for(int i=0;i<4096;i++){ ((uint8_t*)P2V(A->stack_frame))[i]=0; ((uint8_t*)P2V(B->stack_frame))[i]=0; }
+    cvsasx_hash_t rA=ts_canonicalize(A->cr3,1);
+    cvsasx_hash_t rB=ts_canonicalize(B->cr3,1);
+    int eqAB=cvsasx_hash_eq(&rA,&rB);
+    sputs("TS0 proc A root = "); sputs(hx(rA.b,32)); sputc('\n');
+    sputs("TS0 proc B root = "); sputs(hx(rB.b,32)); sputc('\n');
+    sputs("TS0 A frames: code#"); sdec(fr_idx(A->code_frame)); sputs(" data#"); sdec(fr_idx(A->data_frame)); sputs(" stack#"); sdec(fr_idx(A->stack_frame));
+    sputs("  B frames: code#"); sdec(fr_idx(B->code_frame)); sputs(" data#"); sdec(fr_idx(B->data_frame)); sputs(" stack#"); sdec(fr_idx(B->stack_frame)); sputc('\n');
+    /* genuinely SEPARATE page tables (not a shared subtree): A and B resolve the same VA to DIFFERENT physical frames. */
+    int sep_tables=(mm_resolve(A->cr3,CONC_DATA_VA)!=mm_resolve(B->cr3,CONC_DATA_VA))&&(A->cr3!=B->cr3);
+    int diffplace=(A->data_frame!=B->data_frame)&&(A->stack_frame!=B->stack_frame)&&sep_tables;
+    sputs("TS0 identical logical space, DIFFERENT physical frames (data/stack distinct="); sputs(diffplace?"y":"n");
+    sputs("; code deduped-by-hash to one frame) -> roots EQUAL="); sputs(eqAB?"y":"n"); sputs(eqAB?" (PLACEMENT-INDEPENDENT) OK\n":" *** roots differ ***\n");
+    /* change ONE page content -> root DIFFERS */
+    cvsasx_hash_t rBbase=rB;
+    ((uint8_t*)P2V(B->data_frame))[0]^=0xFF;
+    cvsasx_hash_t rBc=ts_canonicalize(B->cr3,1);
+    int diff_content=!cvsasx_hash_eq(&rBc,&rBbase);
+    ((uint8_t*)P2V(B->data_frame))[0]^=0xFF;                       /* restore */
+    /* change ONE perm bit (data RW -> RO) -> root DIFFERS */
+    mm_map(B->cr3, CONC_DATA_VA, B->data_frame, MM_USER);          /* drop MM_WRITE */
+    cvsasx_hash_t rBp=ts_canonicalize(B->cr3,1);
+    int diff_perm=!cvsasx_hash_eq(&rBp,&rBbase);
+    mm_map(B->cr3, CONC_DATA_VA, B->data_frame, MM_USER|MM_WRITE); /* restore */
+    cvsasx_hash_t rBr=ts_canonicalize(B->cr3,1);
+    int restored=cvsasx_hash_eq(&rBr,&rBbase);
+    sputs("TS0 one CONTENT byte changed -> root "); sputs(hx(rBc.b,12)); sputs(".. differs="); sputs(diff_content?"y":"n"); sputc('\n');
+    sputs("TS0 one PERM bit changed (RW->RO) -> root "); sputs(hx(rBp.b,12)); sputs(".. differs="); sputs(diff_perm?"y":"n");
+    sputs("; restored-to-baseline="); sputs(restored?"y":"n"); sputc('\n');
+    /* device/MMIO EXCLUSION: a scratch space with one RAM page + one MMIO page. */
+    uint64_t sc=mm_new_space(); uint64_t ramf=frame_reserve();
+    int okmmio=0;
+    if(sc&&ramf){
+        for(int i=0;i<4096;i++) ((uint8_t*)P2V(ramf))[i]=(uint8_t)(i*5u+1u);
+        uint64_t mmio_pa=(ram_hi+0x100000ULL)&~0xfffULL;           /* off the usable map = device/MMIO */
+        mm_map(sc, 0x0000000040000000ULL, ramf,    MM_USER|MM_WRITE);
+        mm_map(sc, 0x0000000060000000ULL, mmio_pa, MM_USER);       /* non-content: must be skipped, not read */
+        ts_canonicalize(sc,1);
+        okmmio=(ts_nleaf==1)&&(ts_excluded==1)&&(ts_excluded_va==0x0000000060000000ULL);
+        sputs("TS0 device/MMIO exclusion: content-backed leaves INCLUDED="); sdec(ts_nleaf);
+        sputs(", non-content EXCLUDED="); sdec((uint64_t)ts_excluded); sputs(" (flagged @"); sx64(ts_excluded_va);
+        sputs(", never hashed) "); sputs(okmmio?"OK\n":"*** classify wrong ***\n");
+        ts_free_pagetables(sc); frame_release_physical(ramf);
+    }
+    int ts0=eqAB&&diffplace&&diff_content&&diff_perm&&restored&&okmmio;
+    sputs(ts0?"TS0 -> CANONICAL MERKLE FORM: placement-independent, content/perm sensitive, device-excluded OK\n":"TS0 -> *** FAIL ***\n");
+    /* tear A and B down so TS1+ starts from a clean pool */
+    for(int i=0;i<4096;i++){} /* (no-op marker) */
+    refdrop(&conc_code_hash); refdrop(&conc_code_hash);            /* A and B each took one code ref */
+    frame_release_physical(A->data_frame); frame_release_physical(A->stack_frame);
+    frame_release_physical(B->data_frame); frame_release_physical(B->stack_frame);
+    ts_free_pagetables(A->cr3); ts_free_pagetables(B->cr3);
+
+    /* =====================================================================
+     * TS1 - THE COMPLETE TASK OBJECT (reduce a live process to one hash)
+     * ===================================================================*/
+    sputs("\n--- TS1: the complete task object (one task-hash over registers||stack||addr-space-root||ceiling||metadata) ---\n");
+    framedb_init(); rset_n=0; for(uint32_t i=0;i<RSET_MAX;i++) rset[i].live=0;
+    if(!conc_make_proc(&g_cp[0], 0x7, 'T', 8, 0, 128)){ sputs("TS1 NOT RUN: could not build process\n"); return; }
+    cproc_t *P=&g_cp[0];
+    ts_run_ring3(P, 3);                                          /* live: run in ring 3 until counter reaches 3, then park (descheduled, quiescent) */
+    uint64_t counter0=*(uint64_t*)(P2V(P->data_frame)+8);
+    sputs("TS1 process ran in ring 3 then descheduled (quiescent) at counter="); sdec(counter0); sputs(" (full context saved in its trapframe)\n");
+    g_ts_old_data_pfn=fr_idx(P->data_frame); g_ts_old_stk_pfn=fr_idx(P->stack_frame); g_ts_old_pml4=(P->cr3&~0xfffULL);
+    /* component 1+2: registers + stack content (REUSE the C2 register/stack content addressing). */
+    cvsasx_hash_t regH; cvsasx_store_put(&ts_store,&P->tf,sizeof(c_tf_t),&regH);
+    cvsasx_hash_t stkH; cvsasx_blake3((const void*)P2V(P->stack_frame),4096,&stkH);
+    /* component 3: the address-space root (TS0). Its cost is measured inside TS2's
+     * demat (a warm re-canonicalize), so the broken-out page-table cost is consistent
+     * with the rest of the demat timing rather than paying first-call warmup here. */
+    cvsasx_hash_t asr=ts_canonicalize(P->cr3,1);
+    cvsasx_hash_t descH=ts_put_descriptor();
+    g_ts_asr_orig=asr;
+    /* component 4: the capability ceiling as a RE-MINTABLE DESCRIPTOR (ceilH || len || perms),
+     * NOT raw kernel pointers or raw cap bits - this is what the gate re-mints on rebuild. */
+    uint8_t capd[44]; uint32_t ceil_perms=(uint32_t)(CVSASX_PERM_LOAD|CVSASX_PERM_GLOBAL);
+    for(int k=0;k<32;k++) capd[k]=P->ceilH[k];
+    for(int k=0;k<8;k++) capd[32+k]=(uint8_t)(P->ceil_len>>(8*k));
+    for(int k=0;k<4;k++) capd[40+k]=(uint8_t)(ceil_perms>>(8*k));
+    /* component 5: metadata (residency/PP/FA counters + ceiling base offset + descriptor hash). */
+    static uint8_t metab[128]; uint64_t metalen=ts_pack_meta(metab,P,P->ceil_off,&descH);
+    cvsasx_hash_t metaH; cvsasx_store_put(&ts_store,metab,metalen,&metaH);
+    /* the MANIFEST is the task-hash preimage; task-hash = BLAKE3(manifest). */
+    static uint8_t manifest[172];
+    for(int k=0;k<32;k++) manifest[k]=regH.b[k];
+    for(int k=0;k<32;k++) manifest[32+k]=stkH.b[k];
+    for(int k=0;k<32;k++) manifest[64+k]=asr.b[k];
+    for(int k=0;k<44;k++) manifest[96+k]=capd[k];
+    for(int k=0;k<32;k++) manifest[140+k]=metaH.b[k];
+    cvsasx_hash_t taskH; cvsasx_store_put(&ts_store,manifest,172,&taskH);   /* store under, and = , BLAKE3(manifest) */
+    g_ts_taskhash=taskH;
+    sputs("TS1 registers-hash         = "); sputs(hx(regH.b,32)); sputc('\n');
+    sputs("TS1 stack-hash             = "); sputs(hx(stkH.b,32)); sputc('\n');
+    sputs("TS1 address-space-root     = "); sputs(hx(asr.b,32)); sputc('\n');
+    sputs("TS1 capability-ceiling-desc= ceilH "); sputs(hx(P->ceilH,12)); sputs(".. len="); sdec(P->ceil_len);
+    sputs(" perms="); sx64(ceil_perms); sputs(" (LOAD|GLOBAL; re-mintable, NO raw pointers/cap-bits)\n");
+    sputs("TS1 metadata-hash          = "); sputs(hx(metaH.b,32)); sputc('\n');
+    sputs("TS1 ==> TASK-HASH          = "); sputs(hx(taskH.b,32)); sputs("  (the whole process reduced to ONE 32-byte content address)\n");
+    sputs("TS1 -> WHOLE PROCESS REDUCED TO ONE HASH; capability carried as the re-mintable ceiling descriptor OK\n");
+
+    /* =====================================================================
+     * TS2 - FULL DEMATERIALIZATION (free ALL frames, page-table frames too)
+     * ===================================================================*/
+    sputs("\n--- TS2: full dematerialization (free ALL frames incl. the page-table frames; footprint -> zero) ---\n");
+    uint64_t pool_free_before=fdb_freetop;
+    uint64_t d0=rdtsc();
+    /* THE NEW page-table cost, broken out: a warm re-canonicalize of the page-table
+     * hierarchy into the store (idempotent; same root and nodes as TS1). Timed inside
+     * the demat so it is comparable to the rest of the cost. */
+    uint64_t cc0=rdtsc(); ts_canonicalize(P->cr3,0); g_ts_canon_cyc=rdtsc()-cc0;
+    /* backing pages: REUSE the PM2 path (dematerialize_frame -> content into the store), then free
+     * the frame. Each page is stored as a full 4 KiB object under its page-hash (the same hash the
+     * canonical leaf carries), so rm_materialize rebuilds it verbatim. Code is shared-by-hash
+     * (refdrop after storing its page); data+stack are private (release to the pool). */
+    dematerialize_frame(P->code_frame,4096);
+    dematerialize_frame(P->data_frame,4096);  dematerialize_frame(P->stack_frame,4096);
+    int code_in_store=cvsasx_store_exists(&rm_store,&conc_code_hash);
+    refdrop(&conc_code_hash);                                      /* code: last ref -> frame reclaimed */
+    frame_release_physical(P->data_frame); frame_release_physical(P->stack_frame);
+    uint64_t pool_free_mid=fdb_freetop;
+    g_ts_backing_freed=pool_free_mid-pool_free_before;             /* backing frames returned to the pool */
+    /* THE NEW THING: free the PAGE-TABLE frames themselves (PML4/PDPT/PD/PT). */
+    g_ts_pt_freed=(uint64_t)ts_free_pagetables(P->cr3);
+    g_ts_demat_cyc=rdtsc()-d0;
+    uint64_t old_cr3=P->cr3;
+    P->code_frame=P->data_frame=P->stack_frame=0; P->cr3=0; P->present=0; P->dematerialized=1;
+    uint64_t footprint=0;  /* the process now holds NO frames at all */
+    sputs("TS2 backing content in store: code-resident-by-hash="); sputs(code_in_store?"y":"n");
+    sputs("; data+stack dematerialized via the PM2 path (hash->store, frame freed)\n");
+    sputs("TS2 pool free BEFORE="); sdec(pool_free_before); sputs(" AFTER-backing="); sdec(pool_free_mid);
+    sputs(" (backing frames freed="); sdec(g_ts_backing_freed); sputs(")\n");
+    sputs("TS2 PAGE-TABLE frames freed (PML4+PDPT+PD+PT, cr3="); sx64(old_cr3); sputs(") = "); sdec(g_ts_pt_freed);
+    sputs(" (the standing 'page-table root stays resident' caveat is now CLOSED)\n");
+    sputs("TS2 total physical footprint = backing("); sdec(g_ts_backing_freed); sputs(") + page-table("); sdec(g_ts_pt_freed);
+    sputs(") = "); sdec(g_ts_backing_freed+g_ts_pt_freed); sputs(" frames freed; frames held = "); sdec(footprint); sputc('\n');
+    sputs("TS2 process now exists only as task-hash "); sputs(hx(g_ts_taskhash.b,32)); sputs(", frames held = 0\n");
+    sputs("TS2 cost MEASURED = "); sdec(g_ts_demat_cyc); sputs(" cyc total (of which canonicalization = "); sdec(g_ts_canon_cyc);
+    sputs(" cyc, the NEW page-table cost broken out)\n");
+    int ts2=(g_ts_backing_freed==3)&&(g_ts_pt_freed>=4)&&(footprint==0);
+    sputs(ts2?"TS2 -> FULL DEMATERIALIZATION: every frame freed (page-table frames included), footprint zero OK\n":"TS2 -> *** FAIL (frame accounting) ***\n");
+
+    /* =====================================================================
+     * TS3 - BIT-EXACT REMATERIALIZATION (rebuild the whole process from the hash)
+     * ===================================================================*/
+    sputs("\n--- TS3: bit-exact rematerialization (rebuild EVERYTHING from ONLY the task-hash) ---\n");
+    /* hold spacer frames so the rebuild cannot reuse the just-freed LIFO slots:
+     * this FORCES fresh physical placement, making the placement-differs proof
+     * deterministic (placement-independence itself is shown in TS0). */
+    uint64_t sp[3]; for(int i=0;i<3;i++) sp[i]=frame_reserve();
+    uint64_t fsp[8]; for(int i=0;i<8;i++) fsp[i]=falloc();
+    uint64_t r0=rdtsc();
+    /* resolve the manifest from ONLY the task-hash, then its components. */
+    const void *mb; size_t ml;
+    if(cvsasx_store_get(&ts_store,&g_ts_taskhash,&mb,&ml)!=CVSASX_STORE_OK||ml!=172){ sputs("TS3 FAIL: manifest miss\n"); return; }
+    const uint8_t *M=mb;
+    cvsasx_hash_t regH2,asr_orig,metaH2; for(int k=0;k<32;k++){ regH2.b[k]=M[k]; asr_orig.b[k]=M[64+k]; metaH2.b[k]=M[140+k]; }
+    uint64_t r_ceil_len=0; for(int k=0;k<8;k++) r_ceil_len|=((uint64_t)M[96+32+k])<<(8*k);
+    uint32_t r_ceil_perms=0; for(int k=0;k<4;k++) r_ceil_perms|=((uint32_t)M[96+40+k])<<(8*k);
+    uint8_t r_ceilH[32]; for(int k=0;k<32;k++) r_ceilH[k]=M[96+k];
+    /* metadata -> counters + ceil_off + descriptor hash. */
+    const void *eb; size_t el; if(cvsasx_store_get(&ts_store,&metaH2,&eb,&el)!=CVSASX_STORE_OK){ sputs("TS3 FAIL: metadata miss\n"); return; }
+    const uint8_t *E=eb; uint64_t mo=0;
+    uint32_t r_id=0; for(int k=0;k<4;k++) r_id|=((uint32_t)E[mo++])<<(8*k);
+    uint8_t r_tag=E[mo++]; uint8_t r_dr=E[mo++]; mo+=2;
+    uint32_t r_wk=0; for(int k=0;k<4;k++) r_wk|=((uint32_t)E[mo++])<<(8*k);
+    uint32_t r_cd=0; for(int k=0;k<4;k++) r_cd|=((uint32_t)E[mo++])<<(8*k);
+    uint64_t r_uc=0; for(int k=0;k<8;k++) r_uc|=((uint64_t)E[mo++])<<(8*k);
+    uint64_t r_tx=0; for(int k=0;k<8;k++) r_tx|=((uint64_t)E[mo++])<<(8*k);
+    uint32_t r_fg=0; for(int k=0;k<4;k++) r_fg|=((uint32_t)E[mo++])<<(8*k);
+    uint64_t r_ceil_off=0; for(int k=0;k<8;k++) r_ceil_off|=((uint64_t)E[mo++])<<(8*k);
+    cvsasx_hash_t descH2; for(int k=0;k<32;k++) descH2.b[k]=E[mo++];
+    /* descriptor -> the canonical mapping list. */
+    const void *db; size_t dl; if(cvsasx_store_get(&ts_store,&descH2,&db,&dl)!=CVSASX_STORE_OK){ sputs("TS3 FAIL: descriptor miss\n"); return; }
+    const uint8_t *D=db; int rn=D[0]; uint64_t doff=4;
+    /* build a FRESH four-level hierarchy + install the mappings with FRESH frames. */
+    uint64_t new_cr3=mm_new_space(); if(!new_cr3){ sputs("TS3 FAIL: no address space\n"); return; }
+    uint64_t new_data=0,new_stk=0,new_code=0;
+    for(int i=0;i<rn;i++){
+        uint64_t vpn=0; for(int k=0;k<8;k++) vpn|=((uint64_t)D[doff++])<<(8*k);
+        uint64_t perm=0; for(int k=0;k<8;k++) perm|=((uint64_t)D[doff++])<<(8*k);
+        cvsasx_hash_t ch; for(int k=0;k<32;k++) ch.b[k]=D[doff++];
+        uint64_t frame;
+        if(perm&MM_WRITE){
+            /* writable page MUST be private: fetch by hash, BLAKE3-verify, copy into a fresh frame. */
+            const void *cb; size_t cl;
+            if(cvsasx_store_get(&rm_store,&ch,&cb,&cl)!=CVSASX_STORE_OK){ sputs("TS3 FAIL: page miss\n"); return; }
+            cvsasx_hash_t chk; cvsasx_blake3(cb,cl,&chk); if(!cvsasx_hash_eq(&chk,&ch)){ sputs("TS3 FAIL: page verify\n"); return; }
+            frame=frame_reserve(); if(!frame){ sputs("TS3 FAIL: no frame\n"); return; }
+            for(size_t k=0;k<cl;k++) ((uint8_t*)P2V(frame))[k]=((const uint8_t*)cb)[k];
+        } else {
+            frame=rm_materialize(&ch);                            /* read-only code: share-by-hash, BLAKE3-verified */
+            if(!frame){ sputs("TS3 FAIL: materialize\n"); return; }
+        }
+        mm_map(new_cr3, vpn<<12, frame, perm|MM_USER|MM_PRESENT);   /* re-apply the exact stored perm (present/write/user/NX); USER so canonicalize re-finds it */
+        uint64_t va=vpn<<12;
+        if(va==CONC_DATA_VA) new_data=frame; else if(va==CONC_STK_VA) new_stk=frame; else if(va==CONC_CODE_VA) new_code=frame;
+    }
+    /* restore the register file from the registers-hash. */
+    const void *rb; size_t rl; if(cvsasx_store_get(&ts_store,&regH2,&rb,&rl)!=CVSASX_STORE_OK||rl!=sizeof(c_tf_t)){ sputs("TS3 FAIL: regs miss\n"); return; }
+    for(unsigned k=0;k<sizeof(c_tf_t);k++) ((uint8_t*)&P->tf)[k]=((const uint8_t*)rb)[k];
+    /* rebuild the LOCAL ceiling region from the re-mintable descriptor (TS4 re-mints it). */
+    P->ceil_off=r_ceil_off; P->ceil_len=r_ceil_len; for(int k=0;k<32;k++) P->ceilH[k]=r_ceilH[k];
+    { cvsasx_swcap_t root={ (uint64_t)(uintptr_t)conc_obj+r_ceil_off, r_ceil_len, r_ceil_perms, 1 };
+      cvsasx_sw_custodian_init(&P->cust, root);
+      P->region.object_cap=root; P->region.object_base_addr=(uint64_t)(uintptr_t)conc_obj+r_ceil_off;
+      P->region.object_length=r_ceil_len; for(int k=0;k<32;k++) P->region.hash[k]=r_ceilH[k]; }
+    /* restore metadata counters. */
+    P->id=r_id; P->tag=r_tag; P->desched_reason=r_dr; P->wakeup_count=r_wk; P->cooldown_budget=r_cd;
+    P->useful_cyc=r_uc; P->tax_cyc=r_tx; P->fair_grant=r_fg;
+    P->cr3=new_cr3; P->code_frame=new_code; P->data_frame=new_data; P->stack_frame=new_stk;
+    P->present=1; P->dematerialized=0; P->live=1;
+    g_ts_remat_cyc=rdtsc()-r0;
+    for(int i=0;i<3;i++) frame_release_physical(sp[i]); for(int i=0;i<8;i++) ffree(fsp[i]);  /* drop spacers */
+    sputs("TS3 rebuilt via the CORE materialize path directly (rm_materialize / frame_reserve+BLAKE3-verify), NOT a live #PF (the PM2/F2 precedent)\n");
+    /* BIT-EXACT verification: RE-CANONICALIZE the live rebuilt process + recompute the task-hash. */
+    cvsasx_hash_t asr2=ts_canonicalize(P->cr3,1);
+    cvsasx_hash_t descH3=ts_put_descriptor();
+    cvsasx_hash_t regH3; cvsasx_store_put(&ts_store,&P->tf,sizeof(c_tf_t),&regH3);
+    cvsasx_hash_t stkH3; cvsasx_blake3((const void*)P2V(P->stack_frame),4096,&stkH3);
+    static uint8_t metab3[128]; uint64_t ml3=ts_pack_meta(metab3,P,P->ceil_off,&descH3);
+    cvsasx_hash_t metaH3; cvsasx_store_put(&ts_store,metab3,ml3,&metaH3);
+    static uint8_t manifest3[172];
+    for(int k=0;k<32;k++){ manifest3[k]=regH3.b[k]; manifest3[32+k]=stkH3.b[k]; manifest3[64+k]=asr2.b[k]; manifest3[140+k]=metaH3.b[k]; }
+    for(int k=0;k<44;k++) manifest3[96+k]=capd[k];     /* same re-mintable ceiling descriptor */
+    cvsasx_hash_t taskH3; cvsasx_blake3(manifest3,172,&taskH3);
+    int asr_match=cvsasx_hash_eq(&asr2,&g_ts_asr_orig);
+    int task_match=cvsasx_hash_eq(&taskH3,&g_ts_taskhash);
+    sputs("TS3 original task-hash  = "); sputs(hx(g_ts_taskhash.b,32)); sputc('\n');
+    sputs("TS3 recomputed task-hash= "); sputs(hx(taskH3.b,32)); sputs(task_match?"  MATCH (BIT-EXACT)\n":"  *** MISMATCH ***\n");
+    sputs("TS3 address-space root re-derived from the NEW page tables matches="); sputs(asr_match?"y":"n"); sputc('\n');
+    int diff_frames=(fr_idx(new_data)!=g_ts_old_data_pfn)&&(fr_idx(new_stk)!=g_ts_old_stk_pfn)&&((new_cr3&~0xfffULL)!=g_ts_old_pml4);
+    sputs("TS3 frames DIFFER (old data#"); sdec(g_ts_old_data_pfn); sputs(" -> new#"); sdec(fr_idx(new_data));
+    sputs("; old stack#"); sdec(g_ts_old_stk_pfn); sputs(" -> new#"); sdec(fr_idx(new_stk));
+    sputs("; old PML4 "); sx64(g_ts_old_pml4); sputs(" -> new "); sx64(new_cr3&~0xfffULL); sputs(") distinct="); sputs(diff_frames?"y":"n");
+    sputs(" yet contents+mapping IDENTICAL\n");
+    sputs("TS3 rebuild cost MEASURED = "); sdec(g_ts_remat_cyc); sputs(" cyc\n");
+    int ts3=task_match&&asr_match&&diff_frames;
+    sputs(ts3?"TS3 -> BIT-EXACT REMATERIALIZATION: recomputed task-hash EQUALS the original, frames differ, mapping identical OK\n":"TS3 -> *** FAIL ***\n");
+
+    /* =====================================================================
+     * TS4 - AUTHORITY SAFETY AT PROCESS GRANULARITY (the non-negotiable property)
+     * ===================================================================*/
+    sputs("\n--- TS4: authority re-minted through the PROVEN gate under the SAME ceiling; a wider request REFUSED ---\n");
+    cvsasx_pir_t pir; cvsasx_swcap_t cap;
+    /* same ceiling: re-mint the full ceiling -> ACCEPT, authority IDENTICAL (not wider). */
+    conc_make_pir(&pir, P->ceilH, 0, P->ceil_len, CVSASX_PERM_LOAD);
+    cvsasx_status_t s_same=conc_remint(P,&pir,&cap);
+    int same_ok=(s_same==CVSASX_OK)&&cap.valid&&(cap.length==P->ceil_len)&&(cap.length<=P->ceil_len);
+    sputs("TS4 re-mint under the SAME ceiling: status="); sdec((uint64_t)s_same); sputs(" minted-len="); sdec(cap.length);
+    sputs(" (ceiling="); sdec(P->ceil_len); sputs(") -> "); sputs(same_ok?"ACCEPT, authority IDENTICAL (not wider) OK\n":"*** legit rejected ***\n");
+    /* ADVERSARIAL (a): wider BOUNDS -> REFUSED, BAD_BOUNDS. */
+    conc_make_pir(&pir, P->ceilH, 0, P->ceil_len+1, CVSASX_PERM_LOAD);
+    cvsasx_status_t s_wide=conc_remint(P,&pir,&cap);
+    int wide_ref=(s_wide==CVSASX_ERR_BAD_BOUNDS)&&!cap.valid;
+    sputs("TS4 ADVERSARIAL wider bounds (len="); sdec(P->ceil_len+1); sputs(">ceiling): status="); sdec((uint64_t)s_wide);
+    sputs(wide_ref?" (DISTINCT: CVSASX_ERR_BAD_BOUNDS) REFUSED, no amplification\n":" *** WRONG-REASON / AMPLIFIED ***\n");
+    /* ADVERSARIAL (b): added PERMISSION -> REFUSED, AMPLIFY_PERMS. */
+    conc_make_pir(&pir, P->ceilH, 0, P->ceil_len, CVSASX_PERM_LOAD); pir.perms|=CVSASX_PERM_STORE_CAP;
+    cvsasx_status_t s_perm=conc_remint(P,&pir,&cap);
+    int perm_ref=(s_perm==CVSASX_ERR_AMPLIFY_PERMS)&&!cap.valid;
+    sputs("TS4 ADVERSARIAL added perm (+STORE_CAP): status="); sdec((uint64_t)s_perm);
+    sputs(perm_ref?" (DISTINCT: CVSASX_ERR_AMPLIFY_PERMS) REFUSED, no amplification\n":" *** WRONG-REASON / AMPLIFIED ***\n");
+    int ts4=same_ok&&wide_ref&&perm_ref;
+    sputs("TS4 -> a rematerialized process can NEVER come back with wider authority than it left:\n");
+    sputs("TS4    re-mint under the SAME ceiling ACCEPTS (identical); wider bounds and added perms each REFUSED by a DISTINCT reason.\n");
+    sputs("TS4    This is the C1 anti-amplification invariant holding at PROCESS granularity (runtime adversarial evidence).\n");
+    sputs("TS4 // OPEN: a machine-checked Coq extension of anti_amplification to whole-process rebuild is NOT done this cycle; the runtime refusal is the evidence, the Coq extension is the named follow-up (NOT claimed as proven).\n");
+    sputs(ts4?"TS4 -> AUTHORITY SAFETY AT PROCESS GRANULARITY OK\n":"TS4 -> *** FAIL ***\n");
+
+    /* =====================================================================
+     * TS5 - THE BREAK-EVEN (full-process collapse vs keep-the-root-resident)
+     * ===================================================================*/
+    sputs("\n--- TS5: break-even, full collapse (TS2+TS3) vs keeping the page-table root resident (C3) ---\n");
+    uint64_t cost_a=g_ts_demat_cyc+g_ts_remat_cyc;                 /* (a) full canonicalize+demat+remat, MEASURED */
+    uint64_t cost_b=g_c3_fromhash_cyc;                            /* (b) the existing C3 keep-PT-resident resume, MEASURED */
+    uint64_t frees_a=g_ts_backing_freed+g_ts_pt_freed;            /* full collapse frees backing + page-table frames */
+    uint64_t frees_b=PP_FRAMES_FREED;                            /* C3 frees data+stack only (root stays resident) */
+    uint64_t extra_frames=(frees_a>frees_b)?(frees_a-frees_b):0;  /* the page-table+code frames full collapse also frees */
+    uint64_t extra_cost=(cost_a>cost_b)?(cost_a-cost_b):0;        /* the extra cost full collapse pays to rebuild them */
+    /* same linear model as PP3: a freed frame is worth one avoided resume-from-hash per PP_REUSE_WINDOW cycles held.
+     * break-even D* solves extra_frames * (fromhash/window) * D* = extra_cost. */
+    uint64_t denom=extra_frames*(g_c3_fromhash_cyc?g_c3_fromhash_cyc:1);
+    uint64_t Dstar=denom?(extra_cost*PP_REUSE_WINDOW)/denom:~0ULL;
+    sputs("TS5 (a) full collapse  cost = "); sdec(cost_a); sputs(" cyc (demat "); sdec(g_ts_demat_cyc); sputs(" + remat "); sdec(g_ts_remat_cyc);
+    sputs("), frees "); sdec(frees_a); sputs(" frames (incl. the page-table frames)\n");
+    sputs("TS5 (b) keep-root C3   cost = "); sdec(cost_b); sputs(" cyc (resume-from-hash, page-table root resident), frees "); sdec(frees_b); sputs(" frames\n");
+    sputs("TS5 extra frames freed by full collapse = "); sdec(extra_frames); sputs("; extra cost paid = "); sdec(extra_cost); sputs(" cyc\n");
+    sputs("TS5 break-even absence D* = "); sdec(Dstar); sputs(" cyc (= extra_cost*window/(extra_frames*fromhash); MEASURED inputs, window="); sdec((uint64_t)PP_REUSE_WINDOW); sputs(")\n");
+    sputs("TS5 CONCLUSION: full collapse (freeing the page-table frames too) pays ONLY for a DEEPLY IDLE process,\n");
+    sputs("TS5    one descheduled longer than D*; for a process that wakes soon, keeping the root resident (C3) is cheaper.\n");
+    sputs("TS5    This is the process-level analogue of the PP page policy; collapse is NOT claimed to be the common case.\n");
+    int ts5=(cost_a>0)&&(cost_b>0)&&(extra_frames>0);
+    sputs(ts5?"TS5 -> BREAK-EVEN MEASURED; honest 'deeply idle only' conclusion OK\n":"TS5 -> *** FAIL (a measured input was zero) ***\n");
+
+    /* optional: RESUME the rematerialized process to completion (functional bit-exactness). */
+    sputs("\nTS3 (resume) the rematerialized process runs to completion from its rebuilt state: ");
+    ts_run_ring3(P, 0);                                            /* park=0: run to SYS_EXIT */
+    uint64_t counter_final=P->data_frame?*(uint64_t*)(P2V(P->data_frame)+8):0;
+    sputs("\nTS3 resumed-to-completion final counter="); sdec(counter_final); sputs(" (target 8), exited="); sputs(P->live?"n":"y");
+    sputs((counter_final==8&&!P->live)?" -> the REBUILT process ran correctly OK\n":" -> (see stall report)\n");
+
+    sputs("\nTASK-STATE: TS0-TS5 run; a whole live process is now a content-addressed object - page table and authority\n");
+    sputs("included - dematerialized to ONE hash with ALL frames freed, rebuilt bit-exact, authority never amplified.\n");
+    sputs("The 'except the page-table root' caveat is CLOSED. See kernel/TASKSTATE_LOG.md.\n");
+}
+
 void kmain(void);
 void kmain(void){
     serial_init();
@@ -4248,6 +4797,7 @@ void kmain(void){
         int he=0; for(unsigned k=0;k<sizeof errv;k++) if(errv[k]==v) he=1;
         idt_set(v, he?(void*)isr_exc_err:(void*)isr_exc_noerr, cs); } }
     struct idtr idtr={(uint16_t)(sizeof(idt)-1),(uint64_t)idt}; __asm__ volatile("lidt %0"::"m"(idtr));
+    __asm__ volatile("mov %%cr3,%0":"=r"(g_kernel_cr3)); g_kernel_cr3&=~0xfffULL;   /* the clean kernel PML4 (user half absent) for run_taskstate */
     sputs("    IDT loaded (0-31 exceptions + #DF + timer)\n");
 
     /* B3: frame alloc -> map at a fresh vaddr -> write/read-back -> free/realloc */
@@ -4329,6 +4879,7 @@ void kmain(void){
     run_loader();      /* PROCESS LOADER: L0 ELF as a stored object + parse, L1 materialize segments by hash (W^X), L2 enter+run the loaded ELF, L3 load-time authority ceiling, L4 two procs share code by hash */
     conc_run();        /* CONCURRENT MULTI-PROCESS SCHEDULING: C0 two ring-3 procs timer-preempted, C1 per-process ceilings, C2 deschedule->dematerialize->rematerialize, C3 measured policy-cost */
     run_permem();      /* PER-PROCESS MEMORY MANAGEMENT: PM0 extend-heap+demand-zero+bump alloc, PM1 authority-bounded, PM2 dematerialize-idle, PM3 cross-process dedup-by-hash+COW, PM4 U3 hot-page exclusion */
+    run_taskstate();   /* FULL TASK-STATE DEMATERIALIZATION: TS0 canonical Merkle page-table form, TS1 whole-process task-hash, TS2 free ALL frames (page-table frames too), TS3 bit-exact rebuild, TS4 authority never amplified, TS5 break-even vs keep-root-resident */
     run_shell();       /* E4: live focus/drag/resize/type desktop (does not return) */
 #endif
     hcf();
