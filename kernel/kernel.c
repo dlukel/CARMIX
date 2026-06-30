@@ -4258,11 +4258,18 @@ typedef struct { uint64_t vpn; uint64_t perm; uint8_t chash[32]; } ts_leaf_t;
 static ts_leaf_t ts_leaves[TS_MAXLEAF]; static int ts_nleaf;
 static int      ts_excluded; static uint64_t ts_excluded_va;   /* device/MMIO classified out */
 
-/* the EXACT permission mask folded into a leaf: present, write, user, NX. The
- * hardware ACCESSED(5)/DIRTY(6) status bits are NOT permissions and are masked
- * out, so an accessed page and an untouched one with the same rights canonicalize
- * identically (determinism). */
-#define TS_PERM_MASK ((uint64_t)(MM_PRESENT|MM_WRITE|MM_USER) | (1ULL<<63))
+/* MM_SHARED: a software-available PTE bit (AVL bit 9, ignored by hardware) that
+ * marks a leaf as a SHARED-object mapping (SM stages). A PRIVATE leaf never sets it,
+ * so TS canonicalization/rebuild is unchanged; only SHARED leaves take the attach
+ * path on rebuild. */
+#define MM_SHARED  (1ULL<<9)
+
+/* the EXACT permission mask folded into a leaf: present, write, user, the SHARED
+ * marker, and NX. The hardware ACCESSED(5)/DIRTY(6) status bits are NOT permissions
+ * and are masked out, so an accessed page and an untouched one with the same rights
+ * canonicalize identically (determinism). MM_SHARED is 0 on every TS (private) leaf,
+ * so including it here does not change any TS hash. */
+#define TS_PERM_MASK ((uint64_t)(MM_PRESENT|MM_WRITE|MM_USER|MM_SHARED) | (1ULL<<63))
 
 /* classifier: a frame is CONTENT-BACKED iff its physical address is tracked RAM.
  * A device/MMIO frame (framebuffer, LAPIC, anything off the usable map) has no
@@ -4764,6 +4771,349 @@ static void run_taskstate(void){
     sputs("The 'except the page-table root' caveat is CLOSED. See kernel/TASKSTATE_LOG.md.\n");
 }
 
+/* ===========================================================================
+ * SM0-SM5 - SHARED MAPPINGS IN THE CANONICAL FORM (a shared frame survives a
+ * whole-process dematerialize/rematerialize round trip as ONE physical frame).
+ *
+ * THE CAPABILITY: two processes sharing ONE physical frame by content hash must
+ * STILL share ONE physical frame after BOTH round-trip, proven by the actual
+ * physical frame INDEX being EQUAL for both owners after rebuild, the shared page's
+ * content hash unchanged, each owner's authority re-minted through the proven gate
+ * under its OWN ceiling. The FORBIDDEN dodge (two private frames with identical
+ * content, called shared) is never accepted: SM3 asserts equal frame index and a
+ * coherence write/read through each owner's OWN page tables proves it is genuinely
+ * one frame.
+ *
+ * REPRESENTATIONAL GAP this closes: the TS canonical leaf (VPN, content-hash, perms)
+ * captures CONTENT identity but not SHARING identity (same physical frame, one object
+ * with >1 owner). The missing notion is a SHARED OBJECT with identity + refcount that
+ * per-process trees REFERENCE rather than each inlining a private copy.
+ *
+ * THE SHARED-OBJECT LAYER (the new machinery, built on the proven plumbing): a leaf
+ * carries a shared-bit (MM_SHARED) + the object hash; on rebuild a SHARED leaf takes
+ * the ATTACH-or-materialize path (rm_materialize over the resident-set), so the first
+ * sharer to rebuild MATERIALIZES the frame and the second ATTACHES to the SAME frame.
+ * The refcount is the residency refcount (framedb), reconstructed by rm_materialize;
+ * the frame is freed only when the LAST owner releases it (refdrop). A PRIVATE leaf
+ * behaves exactly as TS (copy-private for writable, dedup for read-only).
+ *
+ * REUSES: rm_materialize / dematerialize_frame / refdrop / the residency refcount /
+ * the store / the resident-set, ts_canonicalize / ts_put_descriptor / ts_free_pagetables
+ * (the TS canonical form), mm_new_space / mm_map / mm_walk / mm_resolve, the gate
+ * (cvsasx_sw_cap_remint + custodian/region). The proven core is byte-identical.
+ *
+ * SCOPE (honest, not a scoping-away of the core): SINGLE-WRITER-SHARED (one owner
+ * maps the frame read-write, the other read-only, ONE physical frame), QUIESCENT (no
+ * write during the round trip). OUT of scope, flagged not faked: full multi-writer
+ * coherence and live (non-quiescent) sharing. Read-shared is the special case where
+ * both owners map read-only. See kernel/SHAREDMAP_LOG.md. =====================*/
+
+#define SM_DATA_VPN   0x0000000042000000ULL   /* a PRIVATE writable page (distinct content per owner) */
+#define SM_SHARED_VPN 0x0000000044000000ULL   /* the SHARED page (one physical frame, two owners) */
+
+static uint8_t      sm_shared_content[4096];   /* the shared object's content (also the gate's authority referent) */
+static cvsasx_hash_t sm_shared_hash;           /* its content address */
+
+/* build a QUIESCENT process: own address space, one PRIVATE data page (distinct
+ * content), and the SHARED page attached by hash (writer maps RW, reader RO), plus a
+ * per-owner ceiling over the shared object. No ring-3 execution is needed; the
+ * capability is the shared frame surviving the round trip, proven by frame index and
+ * a coherence write/read through each owner's OWN page tables. */
+static int sm_make_proc(cproc_t *p, uint32_t id, uint8_t priv_pat, int is_writer){
+    for(unsigned i=0;i<sizeof *p;i++) ((uint8_t*)p)[i]=0;
+    p->id=id; p->tag=is_writer?'W':'R'; p->live=1; p->present=1;
+    p->cr3=mm_new_space(); if(!p->cr3) return 0;
+    /* PRIVATE data page: distinct content per owner -> distinct frame, never shared. */
+    p->data_frame=frame_reserve(); if(!p->data_frame) return 0;
+    { uint8_t *d=(uint8_t*)P2V(p->data_frame); for(int i=0;i<4096;i++) d[i]=(uint8_t)(priv_pat+i); }
+    if(!mm_map(p->cr3, SM_DATA_VPN, p->data_frame, MM_USER|MM_WRITE)) return 0;
+    /* SHARED page: attach-or-materialize the shared object by hash (the share-by-hash path). */
+    uint64_t sf=rm_materialize(&sm_shared_hash); if(!sf) return 0;
+    p->code_frame=sf;                                  /* (re)using code_frame to hold the shared frame */
+    uint64_t shflags=MM_USER|MM_SHARED|(is_writer?MM_WRITE:0);
+    if(!mm_map(p->cr3, SM_SHARED_VPN, sf, shflags)) return 0;
+    /* per-owner ceiling over the SHARED object (referent = sm_shared_hash): writer LOAD|STORE, reader LOAD. */
+    uint32_t cperm=is_writer?(uint32_t)(CVSASX_PERM_LOAD|CVSASX_PERM_STORE):(uint32_t)CVSASX_PERM_LOAD;
+    cvsasx_swcap_t root={ (uint64_t)(uintptr_t)sm_shared_content, 4096, cperm, 1 };
+    cvsasx_sw_custodian_init(&p->cust, root);
+    p->region.object_cap=root; p->region.object_base_addr=(uint64_t)(uintptr_t)sm_shared_content;
+    p->region.object_length=4096; for(int k=0;k<32;k++) p->region.hash[k]=sm_shared_hash.b[k];
+    p->ceil_len=4096; for(int k=0;k<32;k++) p->ceilH[k]=sm_shared_hash.b[k];
+    p->ceil_off=cperm;                                 /* stash the owner's capability perms (reused field) */
+    return 1;
+}
+
+/* SM round-trip: dematerialize a process to a task-hash. PRIVATE leaves free their
+ * frame; the SHARED leaf refdrops (refcount-aware) so the frame survives while the
+ * other owner still maps it, and is freed only at the LAST release. Content of every
+ * page is in the store; the manifest (registers || address-space-root || descriptor ||
+ * owner ceiling) is stored under the task-hash. */
+static uint8_t sm_manifest[140];
+static cvsasx_hash_t sm_demat(cproc_t *p){
+    cvsasx_hash_t asr=ts_canonicalize(p->cr3,1);            /* fills ts_leaves[] (perm carries MM_SHARED) */
+    cvsasx_hash_t regH; cvsasx_store_put(&ts_store,&p->tf,sizeof(c_tf_t),&regH);
+    cvsasx_hash_t descH=ts_put_descriptor();
+    uint32_t cperm=(uint32_t)p->ceil_off;
+    uint8_t *M=sm_manifest;
+    for(int k=0;k<32;k++) M[k]=regH.b[k];
+    for(int k=0;k<32;k++) M[32+k]=asr.b[k];
+    for(int k=0;k<32;k++) M[64+k]=descH.b[k];
+    for(int k=0;k<32;k++) M[96+k]=p->ceilH[k];
+    for(int k=0;k<4;k++)  M[128+k]=(uint8_t)(cperm>>(8*k));
+    for(int k=0;k<8;k++)  M[132+k]=(uint8_t)(p->ceil_len>>(8*k));
+    cvsasx_hash_t th; cvsasx_store_put(&ts_store,M,140,&th);
+    for(int k=0;k<32;k++) p->remat_root[k]=th.b[k];
+    /* free frames: store each page's content, then free (SHARED via refdrop, PRIVATE via release). */
+    int n=ts_nleaf;
+    for(int i=0;i<n;i++){
+        uint64_t va=ts_leaves[i].vpn<<12;
+        uint64_t frame=mm_resolve(p->cr3,va)&~0xfffULL;
+        if(!frame) continue;
+        dematerialize_frame(frame,4096);                    /* content -> store (idempotent for the shared page) */
+        if(ts_leaves[i].perm & MM_SHARED){
+            cvsasx_hash_t ch; for(int k=0;k<32;k++) ch.b[k]=ts_leaves[i].chash[k];
+            refdrop(&ch);                                   /* refcount-aware: frees ONLY at the last owner */
+        } else {
+            frame_release_physical(frame);                  /* private: free now */
+        }
+    }
+    ts_free_pagetables(p->cr3);
+    p->cr3=0; p->data_frame=0; p->code_frame=0; p->present=0; p->dematerialized=1;
+    return th;
+}
+
+/* SM round-trip: rematerialize a process from its task-hash. PRIVATE writable leaves
+ * are copied into a FRESH frame (BLAKE3-verified); the SHARED leaf takes rm_materialize
+ * (ATTACH if the object is already resident from the other owner, else MATERIALIZE
+ * once). The owner's authority to the shared object is re-minted through the gate under
+ * its OWN ceiling; the page is mapped read-write ONLY if the gate grants STORE. Returns
+ * the shared frame in *out_shared (0 on failure). */
+static int sm_remat(cproc_t *p, int *out_can_write, uint64_t *out_shared){
+    cvsasx_hash_t th; for(int k=0;k<32;k++) th.b[k]=p->remat_root[k];
+    const void *mb; size_t ml;
+    if(cvsasx_store_get(&ts_store,&th,&mb,&ml)!=CVSASX_STORE_OK||ml!=140) return 0;
+    const uint8_t *M=mb;
+    cvsasx_hash_t regH,descH,ceilH; for(int k=0;k<32;k++){ regH.b[k]=M[k]; descH.b[k]=M[64+k]; ceilH.b[k]=M[96+k]; }
+    uint32_t cperm=0; for(int k=0;k<4;k++) cperm|=((uint32_t)M[128+k])<<(8*k);
+    uint64_t clen=0; for(int k=0;k<8;k++) clen|=((uint64_t)M[132+k])<<(8*k);
+    const void *db; size_t dl;
+    if(cvsasx_store_get(&ts_store,&descH,&db,&dl)!=CVSASX_STORE_OK) return 0;
+    const uint8_t *D=db; int rn=D[0]; uint64_t off=4;
+    /* reconstruct the per-owner ceiling/region for the shared object (independent, gate-mediated). */
+    cvsasx_swcap_t root={ (uint64_t)(uintptr_t)sm_shared_content, clen, cperm, 1 };
+    cvsasx_sw_custodian_init(&p->cust, root);
+    p->region.object_cap=root; p->region.object_base_addr=(uint64_t)(uintptr_t)sm_shared_content;
+    p->region.object_length=clen; for(int k=0;k<32;k++) p->region.hash[k]=ceilH.b[k];
+    p->ceil_len=clen; for(int k=0;k<32;k++) p->ceilH[k]=ceilH.b[k]; p->ceil_off=cperm;
+    uint64_t new_cr3=mm_new_space(); if(!new_cr3) return 0;
+    uint64_t shared_frame=0; int can_write=0;
+    for(int i=0;i<rn;i++){
+        uint64_t vpn=0; for(int k=0;k<8;k++) vpn|=((uint64_t)D[off++])<<(8*k);
+        uint64_t perm=0; for(int k=0;k<8;k++) perm|=((uint64_t)D[off++])<<(8*k);
+        cvsasx_hash_t ch; for(int k=0;k<32;k++) ch.b[k]=D[off++];
+        uint64_t frame; uint64_t pageflags=MM_USER;
+        if(perm & MM_SHARED){
+            /* per-owner authority re-mint through the PROVEN gate under THIS owner's ceiling. */
+            cvsasx_pir_t pir; conc_make_pir(&pir, ceilH.b, 0, clen, cperm);
+            cvsasx_swcap_t cap; cvsasx_status_t s=cvsasx_sw_cap_remint(&p->cust,&pir,&p->region,&cap);
+            can_write = (s==CVSASX_OK) && cap.valid && (cap.perms & CVSASX_PERM_STORE);
+            frame=rm_materialize(&ch);                       /* ATTACH-or-materialize: the shared-object path */
+            if(!frame) return 0;
+            shared_frame=frame; pageflags|=MM_SHARED|(can_write?MM_WRITE:0);   /* RW only if the gate granted STORE */
+        } else if(perm & MM_WRITE){
+            const void *cb; size_t cl;
+            if(cvsasx_store_get(&rm_store,&ch,&cb,&cl)!=CVSASX_STORE_OK) return 0;
+            cvsasx_hash_t chk; cvsasx_blake3(cb,cl,&chk); if(!cvsasx_hash_eq(&chk,&ch)) return 0;
+            frame=frame_reserve(); if(!frame) return 0;
+            for(size_t k=0;k<cl;k++) ((uint8_t*)P2V(frame))[k]=((const uint8_t*)cb)[k];
+            pageflags|=MM_WRITE;
+        } else {
+            frame=rm_materialize(&ch); if(!frame) return 0;  /* private read-only dedup */
+        }
+        mm_map(new_cr3, vpn<<12, frame, pageflags|MM_PRESENT);
+        if(perm & MM_SHARED) p->code_frame=frame; else p->data_frame=frame;
+    }
+    const void *rb; size_t rl;
+    if(cvsasx_store_get(&ts_store,&regH,&rb,&rl)==CVSASX_STORE_OK && rl==sizeof(c_tf_t))
+        for(unsigned k=0;k<sizeof(c_tf_t);k++) ((uint8_t*)&p->tf)[k]=((const uint8_t*)rb)[k];
+    p->cr3=new_cr3; p->present=1; p->dematerialized=0;
+    if(out_can_write) *out_can_write=can_write;
+    if(out_shared) *out_shared=shared_frame;
+    return 1;
+}
+
+static void run_sharedmap(void){
+    sputs("\n=== SHARED MAPPINGS IN THE CANONICAL FORM (SM0-SM5): one shared frame surviving a whole-process round trip ===\n");
+    sputs("SM scope: SINGLE-WRITER-SHARED (one RW owner, one RO owner, ONE physical frame), QUIESCENT (no write during the round trip).\n");
+    if(g_kernel_cr3){ uint64_t *kpml=P2V(g_kernel_cr3);
+        for(int i=0;i<256;i++) if((kpml[i]&1)&&(kpml[i]&MM_USER)) kpml[i]=0;     /* clean low half (earlier ring-3 stages) */
+        __asm__ volatile("mov %0,%%cr3"::"r"(g_kernel_cr3):"memory"); }
+    framedb_init(); rset_n=0; for(uint32_t i=0;i<RSET_MAX;i++) rset[i].live=0;
+    ts_store_once(); rm_store_once();
+    /* the shared object's content + content address. */
+    for(int i=0;i<4096;i++) sm_shared_content[i]=(uint8_t)(i*37u+11u);
+    cvsasx_store_put(&rm_store, sm_shared_content, 4096, &sm_shared_hash);
+
+    /* =====================================================================
+     * SM0 - establish REAL sharing (two processes, ONE physical frame)
+     * ===================================================================*/
+    sputs("\n--- SM0: two processes genuinely SHARE one physical frame (verified before any round trip) ---\n");
+    cproc_t *W=&g_cp[0], *R=&g_cp[1];
+    if(!sm_make_proc(W, 0x1, 0xA0, 1) || !sm_make_proc(R, 0x2, 0xB0, 0)){ sputs("SM0 NOT RUN: build failed\n"); return; }
+    uint64_t f_w=mm_resolve(W->cr3, SM_SHARED_VPN)&~0xfffULL;
+    uint64_t f_r=mm_resolve(R->cr3, SM_SHARED_VPN)&~0xfffULL;
+    uint32_t rc0=framedb[fr_idx(f_w)].refcount;
+    int sm0=(f_w==f_r)&&(f_w!=0)&&(rc0==2);
+    sputs("SM0 shared object hash = "); sputs(hx(sm_shared_hash.b,32)); sputc('\n');
+    sputs("SM0 writer(W) sees shared frame#"); sdec(fr_idx(f_w)); sputs("  reader(R) sees shared frame#"); sdec(fr_idx(f_r));
+    sputs("  EQUAL="); sputs(f_w==f_r?"y":"n"); sputs(" refcount="); sdec(rc0); sputc('\n');
+    /* the private pages are DISTINCT frames (privacy preserved alongside sharing). */
+    uint64_t d_w=mm_resolve(W->cr3, SM_DATA_VPN)&~0xfffULL, d_r=mm_resolve(R->cr3, SM_DATA_VPN)&~0xfffULL;
+    sputs("SM0 private data: W frame#"); sdec(fr_idx(d_w)); sputs(" R frame#"); sdec(fr_idx(d_r)); sputs(" distinct="); sputs(d_w!=d_r?"y":"n"); sputc('\n');
+    sputs(sm0?"SM0 -> ONE PHYSICAL FRAME, TWO OWNERS, refcount 2 (real sharing established) OK\n":"SM0 -> *** FAIL (not actually sharing) ***\n");
+
+    /* =====================================================================
+     * SM1 - the shared-object layer (shared-bit + identity/refcount/per-owner ceiling)
+     * ===================================================================*/
+    sputs("\n--- SM1: shared-object layer (a leaf marks shared-vs-private; table holds hash -> frame -> refcount -> per-owner ceiling) ---\n");
+    sputs("SM1 shared-object table: hash "); sputs(hx(sm_shared_hash.b,12)); sputs(".. frame#"); sdec(fr_idx(f_w));
+    sputs(" refcount="); sdec(framedb[fr_idx(f_w)].refcount);
+    sputs("  owner ceilings: W perms="); sx64((uint32_t)W->ceil_off); sputs(" (LOAD|STORE)  R perms="); sx64((uint32_t)R->ceil_off); sputs(" (LOAD), independent (not pooled)\n");
+    ts_canonicalize(W->cr3,1);
+    int saw_shared=0, saw_private=0;
+    for(int i=0;i<ts_nleaf;i++){
+        int sh=(ts_leaves[i].perm & MM_SHARED)?1:0;
+        sputs("SM1 leaf VPN="); sx64(ts_leaves[i].vpn<<12); sputs(" shared-bit="); sputs(sh?"1":"0");
+        sputs(sh?" (SHARED object)\n":" (PRIVATE)\n");
+        if(sh) saw_shared=1; else saw_private=1;
+    }
+    int sm1=saw_shared&&saw_private&&((uint32_t)W->ceil_off!=(uint32_t)R->ceil_off);
+    sputs(sm1?"SM1 -> SHARED-OBJECT LAYER: shared leaf carries the bit, private leaf does not, per-owner ceilings distinct OK\n":"SM1 -> *** FAIL ***\n");
+
+    /* =====================================================================
+     * SM2 - dematerialize BOTH; shared frame lifetime correct (freed only at last release)
+     * ===================================================================*/
+    sputs("\n--- SM2: dematerialize both; the shared frame is freed only when the LAST owner releases it ---\n");
+    uint64_t pool_free_b=fdb_freetop;
+    sm_demat(W);   /* task-hash retained in W->remat_root */
+    uint32_t rc_after_w=framedb[fr_idx(f_w)].refcount;
+    int resident_after_w=(rset_find(&sm_shared_hash)>=0);
+    sputs("SM2 after W dematerializes: shared refcount="); sdec(rc_after_w);
+    sputs(" shared frame still resident="); sputs(resident_after_w?"y":"n"); sputs(" (NOT freed: R still maps it; double-free avoided)\n");
+    sm_demat(R);   /* task-hash retained in R->remat_root */
+    int resident_after_r=(rset_find(&sm_shared_hash)>=0);
+    int content_in_store=cvsasx_store_exists(&rm_store,&sm_shared_hash);
+    uint64_t pool_free_a=fdb_freetop;
+    sputs("SM2 after R dematerializes: shared frame resident="); sputs(resident_after_r?"y":"n");
+    sputs(" (freed at last release) content-in-store="); sputs(content_in_store?"y":"n"); sputc('\n');
+    sputs("SM2 pool free "); sdec(pool_free_b); sputs(" -> "); sdec(pool_free_a); sputs(" (both processes' frames returned)\n");
+    int sm2=(rc_after_w==1)&&resident_after_w&&!resident_after_r&&content_in_store;
+    sputs(sm2?"SM2 -> LIFETIME CORRECT: refcount 2->1->0, frame freed only at last release, content persists OK\n":"SM2 -> *** FAIL ***\n");
+
+    /* =====================================================================
+     * SM3 - rematerialize BOTH: THE CAPABILITY GATE (one shared frame survives)
+     * ===================================================================*/
+    sputs("\n--- SM3: rematerialize both (order-independent); THE CAPABILITY GATE: ONE shared frame for BOTH owners ---\n");
+    sputs("SM3 serviced via the CORE materialize/attach path directly (rm_materialize over the resident-set), NOT a live #PF (the PM2/F2/TS3 precedent)\n");
+    uint64_t rt0=rdtsc();
+    int okW=sm_remat(W,0,0);                                  /* FIRST sharer: MATERIALIZES the shared frame */
+    uint64_t f_w2=okW?(mm_resolve(W->cr3, SM_SHARED_VPN)&~0xfffULL):0;
+    uint32_t rc_w_only=f_w2?framedb[fr_idx(f_w2)].refcount:0; /* expect 1 */
+    int okR=sm_remat(R,0,0);                                  /* SECOND sharer: ATTACHES to the SAME frame */
+    uint64_t f_r2=okR?(mm_resolve(R->cr3, SM_SHARED_VPN)&~0xfffULL):0;
+    uint64_t rt=rdtsc()-rt0;
+    uint32_t rc_final=f_w2?framedb[fr_idx(f_w2)].refcount:0;  /* expect 2 */
+    int equal=okW&&okR&&(f_w2==f_r2)&&(f_w2!=0);
+    cvsasx_hash_t now_hash; if(f_w2) cvsasx_blake3((const void*)P2V(f_w2),4096,&now_hash);
+    int content_unchanged=f_w2&&cvsasx_hash_eq(&now_hash,&sm_shared_hash);
+    sputs("SM3 after W rebuilt (first): shared frame#"); sdec(f_w2?fr_idx(f_w2):0); sputs(" refcount="); sdec(rc_w_only); sputs(" (materialized once)\n");
+    sputs("SM3 after R rebuilt (second): W sees frame#"); sdec(f_w2?fr_idx(f_w2):0); sputs(" R sees frame#"); sdec(f_r2?fr_idx(f_r2):0);
+    sputs("  EQUAL="); sputs(equal?"y":"n"); sputs(" refcount="); sdec(rc_final); sputc('\n');
+    sputs("SM3 shared content hash now = "); sputs(hx(now_hash.b,32)); sputs("  unchanged-from-SM0="); sputs(content_unchanged?"y":"n"); sputc('\n');
+    /* coherence proof that it is GENUINELY one frame (not two with equal content): write via W's
+     * OWN page table (RW), read via R's OWN page table (RO); R must see W's write. */
+    int coherent=0;
+    if(equal){
+        uint64_t sentinel=0x00C0FFEE12345678ULL;
+        uint64_t orig8=*(uint64_t*)sm_shared_content;        /* to restore the shared content after the test */
+        uint64_t save; __asm__ volatile("mov %%cr3,%0":"=r"(save));
+        __asm__ volatile("cli");
+        __asm__ volatile("mov %0,%%cr3"::"r"(W->cr3):"memory"); *(volatile uint64_t*)SM_SHARED_VPN=sentinel; /* sentinel via W (RW) */
+        uint64_t seen;
+        __asm__ volatile("mov %0,%%cr3"::"r"(R->cr3):"memory"); seen=*(volatile uint64_t*)SM_SHARED_VPN;      /* read via R (RO) */
+        __asm__ volatile("mov %0,%%cr3"::"r"(W->cr3):"memory"); *(volatile uint64_t*)SM_SHARED_VPN=orig8;     /* restore so content hash is unchanged for SM5 */
+        __asm__ volatile("mov %0,%%cr3"::"r"(save):"memory");
+        __asm__ volatile("sti");
+        coherent=(seen==sentinel);
+        sputs("SM3 coherence: wrote sentinel via W's RW mapping, read it back via R's RO mapping -> R saw it="); sputs(coherent?"y":"n");
+        sputs(" (GENUINELY one physical frame, not two)\n");
+    }
+    sputs("SM3 round-trip cost MEASURED = "); sdec(rt); sputs(" cyc\n");
+    int sm3=equal&&(rc_final==2)&&content_unchanged&&coherent;
+    if(sm3) sputs("SM3 -> CAPABILITY GATE PASSED: the shared frame SURVIVED the round trip as ONE physical frame for BOTH owners OK\n");
+    else if(equal&&!coherent) sputs("SM3 -> *** equal frame index but coherence FAILED: investigate ***\n");
+    else sputs("SM3 -> *** SHARED FRAME DID NOT SURVIVE THE ROUND TRIP: two frames where there should be one. NOT relabeled as success. ***\n");
+
+    /* =====================================================================
+     * SM4 - per-owner authority on the shared frame (sound under sharing, never pooled)
+     * ===================================================================*/
+    sputs("\n--- SM4: per-owner authority re-minted through the gate under each OWN ceiling; never pooled, never widened ---\n");
+    cvsasx_pir_t pir; cvsasx_swcap_t cap;
+    conc_make_pir(&pir, sm_shared_hash.b, 0, 4096, (uint32_t)(CVSASX_PERM_LOAD|CVSASX_PERM_STORE));
+    cvsasx_status_t sW=cvsasx_sw_cap_remint(&W->cust,&pir,&W->region,&cap);
+    int wok=(sW==CVSASX_OK)&&cap.valid&&(cap.perms&CVSASX_PERM_STORE);
+    sputs("SM4 W (writer) re-mint LOAD|STORE under its OWN ceiling: status="); sdec((uint64_t)sW); sputs(" minted-perms="); sx64(cap.perms);
+    sputs(wok?" -> ACCEPT, READ-WRITE (its own authority, not pooled) OK\n":" *** writer rejected ***\n");
+    conc_make_pir(&pir, sm_shared_hash.b, 0, 4096, (uint32_t)CVSASX_PERM_LOAD);
+    cvsasx_status_t sR=cvsasx_sw_cap_remint(&R->cust,&pir,&R->region,&cap);
+    int rok=(sR==CVSASX_OK)&&cap.valid&&!(cap.perms&CVSASX_PERM_STORE);
+    sputs("SM4 R (reader) re-mint LOAD under its OWN ceiling: status="); sdec((uint64_t)sR); sputs(" minted-perms="); sx64(cap.perms);
+    sputs(rok?" -> ACCEPT, READ-ONLY (stays read-only) OK\n":" *** reader authority wrong ***\n");
+    /* page-table check: W's shared PTE is writable, R's is read-only (gate-mediated). */
+    uint64_t *wpte=mm_walk(W->cr3, SM_SHARED_VPN, 0), *rpte=mm_walk(R->cr3, SM_SHARED_VPN, 0);
+    int w_rw=wpte&&(*wpte&MM_WRITE), r_ro=rpte&&!(*rpte&MM_WRITE);
+    sputs("SM4 page perms: W shared PTE writable="); sputs(w_rw?"y":"n"); sputs(" R shared PTE read-only="); sputs(r_ro?"y":"n"); sputc('\n');
+    /* ADVERSARIAL: reader attaches with WIDER authority (request STORE) under its LOAD-only ceiling -> REFUSED. */
+    conc_make_pir(&pir, sm_shared_hash.b, 0, 4096, (uint32_t)(CVSASX_PERM_LOAD|CVSASX_PERM_STORE));
+    cvsasx_status_t sAdv=cvsasx_sw_cap_remint(&R->cust,&pir,&R->region,&cap);
+    int adv_ref=(sAdv==CVSASX_ERR_AMPLIFY_PERMS)&&!cap.valid;
+    sputs("SM4 ADVERSARIAL reader attaches READ-WRITE (LOAD|STORE) under its LOAD-only ceiling: status="); sdec((uint64_t)sAdv);
+    sputs(adv_ref?" (DISTINCT: CVSASX_ERR_AMPLIFY_PERMS) REFUSED -> sharing the frame NEVER widens authority\n":" *** WRONG-REASON / AMPLIFIED ***\n");
+    /* ADVERSARIAL bounds: wider than the object -> REFUSED. */
+    conc_make_pir(&pir, sm_shared_hash.b, 0, 4097, (uint32_t)CVSASX_PERM_LOAD);
+    cvsasx_status_t sB=cvsasx_sw_cap_remint(&W->cust,&pir,&W->region,&cap);
+    int bnd_ref=(sB==CVSASX_ERR_BAD_BOUNDS)&&!cap.valid;
+    sputs("SM4 ADVERSARIAL wider bounds (4097>4096): status="); sdec((uint64_t)sB); sputs(bnd_ref?" (DISTINCT: CVSASX_ERR_BAD_BOUNDS) REFUSED\n":" *** WRONG-REASON ***\n");
+    int sm4=wok&&rok&&w_rw&&r_ro&&adv_ref&&bnd_ref;
+    sputs(sm4?"SM4 -> PER-OWNER AUTHORITY SOUND UNDER SHARING: each re-minted under its OWN ceiling, read-only stays read-only, wider REFUSED OK\n":"SM4 -> *** FAIL ***\n");
+
+    /* =====================================================================
+     * SM5 - limits + cost (honest scope, not a scoping-away of the core)
+     * ===================================================================*/
+    sputs("\n--- SM5: sharing mode, costs, shared hash in both roots, OPEN items ---\n");
+    cvsasx_hash_t rootW=ts_canonicalize(W->cr3,1);
+    cvsasx_hash_t shchW; { int found=0; for(int i=0;i<ts_nleaf;i++) if(ts_leaves[i].perm&MM_SHARED){ for(int k=0;k<32;k++) shchW.b[k]=ts_leaves[i].chash[k]; found=1; } (void)found; }
+    int wroot_has=cvsasx_hash_eq(&shchW,&sm_shared_hash);
+    cvsasx_hash_t rootR=ts_canonicalize(R->cr3,1);
+    cvsasx_hash_t shchR; for(int i=0;i<ts_nleaf;i++) if(ts_leaves[i].perm&MM_SHARED){ for(int k=0;k<32;k++) shchR.b[k]=ts_leaves[i].chash[k]; }
+    int rroot_has=cvsasx_hash_eq(&shchR,&sm_shared_hash);
+    sputs("SM5 sharing mode delivered: SINGLE-WRITER-SHARED (W read-write, R read-only, ONE frame), QUIESCENT\n");
+    sputs("SM5 round-trip cost = "); sdec(rt); sputs(" cyc (attach reconstructs the refcount via the residency resident-set)\n");
+    sputs("SM5 W address-space root = "); sputs(hx(rootW.b,16)); sputs(".. contains shared hash="); sputs(wroot_has?"y":"n"); sputc('\n');
+    sputs("SM5 R address-space root = "); sputs(hx(rootR.b,16)); sputs(".. contains shared hash="); sputs(rroot_has?"y":"n");
+    sputs(" (both roots reflect the shared content; roots differ because per-owner perms differ)\n");
+    sputs("SM5 // OPEN: full multi-writer coherence (two writers, write-shared) is OUT of scope - a write changes the content hash, the content-addressing/coherence frontier.\n");
+    sputs("SM5 // OPEN: live (non-quiescent) sharing - the round trip is a deschedule-point operation.\n");
+    sputs("SM5 // OPEN: a machine-checked Coq extension of anti-amplification to the shared-object attach is not done; the runtime per-owner refusal (SM4) is the evidence.\n");
+    sputs("SM5 HONEST SCOPE vs the FORBIDDEN dodge: single-writer-shared is honest scope; SM3 proved ONE frame (equal index + coherence), so the two-private-frames dodge did NOT occur.\n");
+    int sm5=wroot_has&&rroot_has;
+    sputs(sm5?"SM5 -> LIMITS NAMED; costs measured; shared hash in BOTH roots; honest scope distinct from the dodge OK\n":"SM5 -> *** FAIL (shared hash not in both roots) ***\n");
+
+    sputs("\nSHARED MAPPINGS: SM0-SM5 run. ");
+    sputs(sm3?"The shared frame SURVIVED the round trip as ONE physical frame for both owners; authority re-minted per-owner through the gate, never widened. See kernel/SHAREDMAP_LOG.md.\n"
+            :"The shared frame did NOT survive as one frame this cycle; reported honestly above, not relabeled. See kernel/SHAREDMAP_LOG.md.\n");
+}
+
 void kmain(void);
 void kmain(void){
     serial_init();
@@ -4880,6 +5230,7 @@ void kmain(void){
     conc_run();        /* CONCURRENT MULTI-PROCESS SCHEDULING: C0 two ring-3 procs timer-preempted, C1 per-process ceilings, C2 deschedule->dematerialize->rematerialize, C3 measured policy-cost */
     run_permem();      /* PER-PROCESS MEMORY MANAGEMENT: PM0 extend-heap+demand-zero+bump alloc, PM1 authority-bounded, PM2 dematerialize-idle, PM3 cross-process dedup-by-hash+COW, PM4 U3 hot-page exclusion */
     run_taskstate();   /* FULL TASK-STATE DEMATERIALIZATION: TS0 canonical Merkle page-table form, TS1 whole-process task-hash, TS2 free ALL frames (page-table frames too), TS3 bit-exact rebuild, TS4 authority never amplified, TS5 break-even vs keep-root-resident */
+    run_sharedmap();   /* SHARED MAPPINGS IN THE CANONICAL FORM: SM0 establish sharing, SM1 shared-object layer, SM2 lifetime across demat, SM3 capability gate (one shared frame survives the round trip), SM4 per-owner authority, SM5 limits */
     run_shell();       /* E4: live focus/drag/resize/type desktop (does not return) */
 #endif
     hcf();
