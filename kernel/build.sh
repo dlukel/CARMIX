@@ -67,7 +67,7 @@ echo "=== headless boots (serial). Durable media: file-backed virtio-blk (legacy
 # (host-tampered image) shows detection.
 DISK="$OUT/carmix-disk.img"; truncate -s 64M "$DISK"
 QEMU="$X/usr/bin/qemu-system-x86_64"
-qrun(){ timeout "${BOOT_SECS:-40}" "$QEMU" -M q35 -m 512M -cdrom "$OUT/carmix.iso" \
+qrun(){ timeout "${BOOT_SECS:-40}" "$QEMU" -M q35 -m 512M -smp 2 -accel tcg,thread=multi -cdrom "$OUT/carmix.iso" \
     -drive file="$DISK",format=raw,if=none,id=d0,cache=writethrough \
     -device virtio-blk-pci,drive=d0,disable-modern=on,disable-legacy=off \
     -serial stdio -display none -no-reboot -L "$X/usr/share/seabios" -L "$X/usr/share/qemu" 2>&1 || true; }

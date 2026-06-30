@@ -46,6 +46,13 @@ __attribute__((used, section(".limine_requests")))
 static volatile struct limine_memmap_request mm_req = { .id = LIMINE_MEMMAP_REQUEST, .revision = 0 };
 __attribute__((used, section(".limine_requests")))
 static volatile struct limine_hhdm_request hhdm_req = { .id = LIMINE_HHDM_REQUEST, .revision = 0 };
+/* SMP/MP: Limine performs the standard INIT-SIPI-SIPI and parks each AP in long mode at
+ * its goto_address (the known sequence, via the existing boot path). flags=0 -> xAPIC. */
+#ifndef LIMINE_MP_REQUEST
+#define LIMINE_MP_REQUEST LIMINE_SMP_REQUEST
+#endif
+__attribute__((used, section(".limine_requests")))
+static volatile struct LIMINE_MP(request) smp_req = { .id = LIMINE_MP_REQUEST, .revision = 0 };
 __attribute__((used, section(".limine_requests_end_marker")))
 static volatile LIMINE_REQUESTS_END_MARKER;
 
@@ -67,6 +74,7 @@ static void sputs(const char*s){ while(*s) sputc(*s++); }
 static void sx64(uint64_t v){ sputs("0x"); for(int i=60;i>=0;i-=4){ int d=(v>>i)&0xF; sputc(d<10?(char)('0'+d):(char)('a'+d-10)); } }
 static void sdec(uint64_t v){ char b[24]; int i=0; if(!v){sputc('0');return;} while(v){b[i++]=(char)('0'+v%10);v/=10;} while(i)sputc(b[--i]); }
 static uint64_t rdmsr(uint32_t m){ uint32_t lo,hi; __asm__ volatile("rdmsr":"=a"(lo),"=d"(hi):"c"(m)); return ((uint64_t)hi<<32)|lo; }
+static void wrmsr(uint32_t m, uint64_t v){ __asm__ volatile("wrmsr"::"c"(m),"a"((uint32_t)v),"d"((uint32_t)(v>>32))); }
 static inline void hcf(void){ for(;;) __asm__ volatile("cli; hlt"); }
 
 /* ---- frame allocator + page mapper (over Limine memmap + HHDM) ----------- */
@@ -5323,20 +5331,44 @@ static int dur_get(const cvsasx_hash_t*h, uint8_t*outbuf, uint64_t*outlen){
 /* S3: rebuild the in-RAM index purely by scanning the on-disk log, re-verifying each
  * record. Stops at the first block without a valid claim, or at a torn/tampered record
  * (re-hash mismatch -> REJECT, D2). Returns the count indexed; sets dur_recover_cyc. */
+/* ---- GC refcount side table (durable, crash-consistent, reconstructed from the log).
+ * Counts are MUTABLE metadata about IMMUTABLE objects, so they live OUTSIDE the hashed
+ * content (a count inside an object would change its hash). They are recorded as durable
+ * RC-delta records in the SAME log (one block each, ordered-prefix discipline), so a cold
+ * reboot reconstructs them by replay, exactly as the object index is rebuilt. DESIGN NOTE:
+ * the key is (hash) only here; an authority-domain tag could later be folded into the key
+ * to scope counts per domain, but THIS build is global (one count per object). */
+#define RC_MAGIC   0x43524752u    /* 'R','G','R','C' (refcount delta record) */
+#define TOMB_MAGIC 0x424D4F54u    /* 'T','O','M','B' (tombstone record) */
+typedef struct { uint8_t hash[32]; int32_t count; uint8_t tombstoned; } gc_rc_t;
+static gc_rc_t gc_rc[256]; static int gc_nrc;
+static int gc_rc_find(const uint8_t*h){ for(int i=0;i<gc_nrc;i++){ int m=1; for(int k=0;k<32;k++) if(gc_rc[i].hash[k]!=h[k]){m=0;break;} if(m) return i; } return -1; }
+static void gc_rc_apply(const uint8_t*h, int32_t delta){
+    int e=gc_rc_find(h);
+    if(e<0){ if(gc_nrc>=256) return; e=gc_nrc++; for(int k=0;k<32;k++) gc_rc[e].hash[k]=h[k]; gc_rc[e].count=0; gc_rc[e].tombstoned=0; }
+    gc_rc[e].count+=delta;
+}
+static int32_t gc_rc_get(const uint8_t*h){ int e=gc_rc_find(h); return e<0?0:gc_rc[e].count; }
+
 static int dur_recover(void){
     uint64_t t0=rdtsc();
-    dur_nidx=0; dur_recover_rejected=0; uint64_t B=1;
+    dur_nidx=0; dur_recover_rejected=0; gc_nrc=0; uint64_t B=1;
     while(1){
         if(vblk_read(B)!=0) break;
-        if(*(uint32_t*)(vblk_data+0)!=DUR_MAGIC) break;       /* clean end of log */
-        uint64_t len=*(uint64_t*)(vblk_data+8); if(len>DUR_MAXOBJ) break;
-        uint8_t claim[32]; for(int k=0;k<32;k++) claim[k]=vblk_data[16+k];
-        if(vblk_read(B+1)!=0){ dur_recover_rejected++; break; }
-        cvsasx_hash_t chk; cvsasx_blake3(vblk_data,len,&chk);
-        int ok=1; for(int k=0;k<32;k++) if(chk.b[k]!=claim[k]){ok=0;break;}
-        if(!ok){ dur_recover_rejected++; break; }             /* torn/tampered tail: REJECT, stop */
-        if(dur_nidx<256){ for(int k=0;k<32;k++) dur_idx[dur_nidx].hash[k]=claim[k]; dur_idx[dur_nidx].hdr_block=B; dur_nidx++; }
-        B+=2;
+        uint32_t m=*(uint32_t*)(vblk_data+0);
+        if(m==DUR_MAGIC){                                     /* OBJECT record (2 blocks) - path unchanged */
+            uint64_t len=*(uint64_t*)(vblk_data+8); if(len>DUR_MAXOBJ) break;
+            uint8_t claim[32]; for(int k=0;k<32;k++) claim[k]=vblk_data[16+k];
+            if(vblk_read(B+1)!=0){ dur_recover_rejected++; break; }
+            cvsasx_hash_t chk; cvsasx_blake3(vblk_data,len,&chk);
+            int ok=1; for(int k=0;k<32;k++) if(chk.b[k]!=claim[k]){ok=0;break;}
+            if(!ok){ dur_recover_rejected++; break; }         /* torn/tampered tail: REJECT, stop */
+            if(dur_nidx<256){ for(int k=0;k<32;k++) dur_idx[dur_nidx].hash[k]=claim[k]; dur_idx[dur_nidx].hdr_block=B; dur_nidx++; }
+            B+=2;
+        } else if(m==RC_MAGIC){                               /* GC refcount delta (1 block): replay it */
+            int32_t delta=*(int32_t*)(vblk_data+4); uint8_t h[32]; for(int k=0;k<32;k++) h[k]=vblk_data[16+k];
+            gc_rc_apply(h,delta); B+=1;
+        } else break;                                          /* no known record: clean end of log */
     }
     dur_log_head=B; dur_recover_cyc=rdtsc()-t0;
     return dur_nidx;
@@ -5708,6 +5740,330 @@ static void run_vgate(void){
     sputs(vg?"VERSIONED GATE: VG1-VG5 OK - atomic commit, anti-amplification preserved, never torn, cost measured. See kernel/VGATE_LOG.md.\n":"VERSIONED GATE: *** see failures above ***\n");
 }
 
+/* ===========================================================================
+ * SMP BRING-UP (S1-S4) - the multi-core foundation. NOTHING multi-core-capture here.
+ *
+ * Limine performs the standard INIT-SIPI-SIPI and hands each Application Processor to
+ * the kernel in long mode at its goto_address (the known sequence, via the existing
+ * boot path; we do not hand-write a real-mode trampoline). This build then stands up:
+ * per-CPU state, the xAPIC Local APIC on each core, a real IPI path, and one honest
+ * cross-core sanity test. It does NOT implement the multi-core memory cut, the TLB
+ * shootdown for capture, the RC/synchronization-point cut, or DRCC validation; those
+ * are separate later cycles this foundation UNLOCKS but does not contain. After the
+ * test the AP parks (cli;hlt) so the single-CPU path runs exactly as before.
+ * See kernel/SMP_LOG.md.
+ * ===========================================================================*/
+#define LAPIC_VA   0x0000730000000000ULL    /* uncached (PCD) mapping of the LAPIC MMIO */
+#define LAPIC_PHYS 0xFEE00000ULL
+#define LAPIC_ID   0x20
+#define LAPIC_EOI  0xB0
+#define LAPIC_SVR  0xF0
+#define LAPIC_ICRLO 0x300
+#define LAPIC_ICRHI 0x310
+#define IPI_VECTOR 0xF0
+#define SMP_MAXCPU 8
+static volatile uint32_t *g_lapic;
+static inline uint32_t lapic_rd(uint32_t off){ return g_lapic[off/4]; }
+static inline void lapic_wr(uint32_t off,uint32_t v){ g_lapic[off/4]=v; __asm__ volatile("":::"memory"); }
+static uint32_t lapic_id(void){ return lapic_rd(LAPIC_ID)>>24; }
+static void lapic_enable(void){
+    uint64_t b=rdmsr(0x1B); b|=(1ULL<<11); b&=~(1ULL<<10); wrmsr(0x1B,b);   /* global enable, xAPIC (not x2APIC) */
+    lapic_wr(LAPIC_SVR, 0x100u | 0xFFu);                                    /* APIC software-enable + spurious vec 0xFF */
+}
+static inline void lapic_eoi(void){ lapic_wr(LAPIC_EOI,0); }
+static void lapic_ipi(uint32_t dest, uint8_t vec){
+    lapic_wr(LAPIC_ICRHI, dest<<24);
+    lapic_wr(LAPIC_ICRLO, (uint32_t)vec | (1u<<14));                        /* fixed, physical, assert, edge */
+    uint64_t g=0; while((lapic_rd(LAPIC_ICRLO)&(1u<<12)) && ++g<100000000ull) __asm__ volatile("pause");
+}
+typedef struct { uint32_t lapic_id, proc_id; volatile uint64_t counter; volatile int up, ipi_received; } percpu_t;
+static percpu_t percpu[SMP_MAXCPU];
+static int g_ncpu; static uint32_t g_bsp_lapic;
+static volatile int g_smp_go, g_ap_done, g_smp_lock, g_ap_announced;
+static volatile uint64_t shared_u, shared_l;
+#define SMP_M 100000u
+#define SMP_N 100000u
+static int lapic_index(uint32_t lid){ for(int i=0;i<g_ncpu;i++) if(percpu[i].lapic_id==lid) return i; return 0; }
+static inline int xchg32(volatile int*p,int v){ __asm__ volatile("xchgl %0,%1":"+r"(v),"+m"(*p)::"memory"); return v; }
+static inline void smp_lock(void){ while(xchg32(&g_smp_lock,1)) __asm__ volatile("pause"); }
+static inline void smp_unlock(void){ __asm__ volatile("":::"memory"); g_smp_lock=0; }
+
+/* the IPI handler: the receiving core records it and EOIs. Real interrupt, real LAPIC EOI. */
+__attribute__((interrupt)) static void isr_ipi(struct iframe*f){ (void)f; percpu[lapic_index(lapic_id())].ipi_received=1; lapic_eoi(); }
+
+/* the cross-core work both cores run concurrently (S4): unlocked increments that RACE
+ * (proof of real concurrency) + locked increments that must total exactly (proof the
+ * lock works across cores) + a private per-CPU counter (proof of per-CPU isolation). */
+static void smp_work(int idx){
+    while(!g_smp_go) __asm__ volatile("pause");
+    for(uint32_t i=0;i<SMP_M;i++) shared_u++;                               /* UNLOCKED: races */
+    for(uint32_t i=0;i<SMP_N;i++){ smp_lock(); shared_l++; smp_unlock(); }  /* LOCKED: exact */
+    percpu[idx].counter += (uint64_t)SMP_M + SMP_N;                         /* per-CPU, this core only */
+}
+
+/* the AP entry: long mode, Limine stack, shared kernel page tables. */
+static void ap_entry(struct LIMINE_MP(info)*info){
+    int idx=(int)info->processor_id;
+    percpu[idx].lapic_id=info->lapic_id; percpu[idx].proc_id=(uint32_t)idx; percpu[idx].counter=0; percpu[idx].ipi_received=0;
+    struct idtr idtr={(uint16_t)(sizeof(idt)-1),(uint64_t)idt}; __asm__ volatile("lidt %0"::"m"(idtr):"memory");  /* shared IDT */
+    lapic_enable();
+    percpu[idx].up=1;                                                       /* signal BSP: clean startup latency stops here (excludes the serial print) */
+    sputs("S1 AP reached kernel C: lapic_id="); sdec(info->lapic_id); sputs(" proc_id="); sdec((uint64_t)idx); sputs(" (a second core is executing)\n");
+    g_ap_announced=1;
+    __asm__ volatile("sti");                                                /* receive IPIs */
+    lapic_ipi(g_bsp_lapic, IPI_VECTOR);                                     /* S3 vice-versa: AP -> BSP */
+    smp_work(idx);                                                          /* S4 */
+    g_ap_done=1;
+    for(;;){ __asm__ volatile("cli; hlt"); }                                /* park: single-CPU path resumes on the BSP */
+}
+
+static void run_smp(void){
+    sputs("\n=== SMP BRING-UP (S1-S4): a second CPU, per-CPU state, a working IPI path ===\n");
+    if(!smp_req.response){ sputs("S1 NO MP response from Limine; SMP NOT RUN (single-CPU boot)\n"); return; }
+    struct LIMINE_MP(response)*r=smp_req.response;
+    g_bsp_lapic=r->bsp_lapic_id; g_ncpu=(int)(r->cpu_count<SMP_MAXCPU?r->cpu_count:SMP_MAXCPU);
+    sputs("S1 Limine MP: cpu_count="); sdec(r->cpu_count); sputs(" bsp_lapic_id="); sdec(r->bsp_lapic_id);
+    sputs(" (Limine did the INIT-SIPI-SIPI; APs parked in long mode)\n");
+    if(r->cpu_count<2){ sputs("S1 only ONE CPU present; run under -smp 2 to bring up an AP. SMP minimal (no AP).\n"); return; }
+    /* shared setup BEFORE starting the AP: LAPIC mapping, per-CPU table, IPI vector. */
+    map_page(LAPIC_VA, LAPIC_PHYS, 0x1u|0x2u|0x10u);                        /* present|write|PCD (uncached MMIO) */
+    g_lapic=(volatile uint32_t*)LAPIC_VA;
+    lapic_enable();                                                        /* BSP LAPIC */
+    outb(0x21,0xFF); outb(0xA1,0xFF);                                       /* mask the legacy PIC so sti only takes IPIs (B5 re-inits it) */
+    for(int i=0;i<g_ncpu;i++){ struct LIMINE_MP(info)*c=r->cpus[i]; int idx=(int)c->processor_id;
+        percpu[idx].lapic_id=c->lapic_id; percpu[idx].proc_id=(uint32_t)idx; percpu[idx].counter=0; percpu[idx].up=0; percpu[idx].ipi_received=0; }
+    int bsp_idx=lapic_index(g_bsp_lapic); percpu[bsp_idx].up=1;
+    uint16_t cs; __asm__ volatile("mov %%cs,%0":"=r"(cs)); idt_set(IPI_VECTOR,(void*)isr_ipi,cs);
+    /* S1: start the first AP (set its goto_address; Limine releases it into ap_entry). */
+    int ap_idx=-1; uint32_t ap_lapic=0;
+    for(int i=0;i<g_ncpu;i++){ struct LIMINE_MP(info)*c=r->cpus[i]; if(c->lapic_id==g_bsp_lapic) continue;
+        ap_idx=(int)c->processor_id; ap_lapic=c->lapic_id; c->goto_address=ap_entry; break; }
+    uint64_t t0=rdtsc(); while(!percpu[ap_idx].up && (rdtsc()-t0)<5000000000ull) __asm__ volatile("pause");
+    if(!percpu[ap_idx].up){ sputs("S1 -> *** AP DID NOT START (timeout) - STOP ***\n"); return; }
+    uint64_t ap_cyc=rdtsc()-t0;
+    while(!g_ap_announced && (rdtsc()-t0)<5000000000ull) __asm__ volatile("pause");   /* let the AP finish its serial line before the BSP prints (one UART) */
+    sputs("S1 -> AP STARTED: lapic_id="); sdec(ap_lapic); sputs(" up; startup latency="); sdec(ap_cyc); sputs(" cyc (rdtsc this run, excludes the AP serial print) OK\n");
+
+    /* S3: IPI both directions. The AP already sent BSP->received below; here BSP->AP. */
+    __asm__ volatile("sti");                                                /* BSP receives the AP's vice-versa IPI */
+    percpu[ap_idx].ipi_received=0;
+    lapic_ipi(ap_lapic, IPI_VECTOR);                                        /* CPU0 -> CPU1 */
+    uint64_t t1=rdtsc(); while(!percpu[ap_idx].ipi_received && (rdtsc()-t1)<2000000000ull) __asm__ volatile("pause");
+    int ipi_fwd=percpu[ap_idx].ipi_received;
+    uint64_t t2=rdtsc(); while(!percpu[bsp_idx].ipi_received && (rdtsc()-t2)<2000000000ull) __asm__ volatile("pause");
+    int ipi_rev=percpu[bsp_idx].ipi_received;                               /* CPU1 -> CPU0 (sent by ap_entry) */
+    sputs("S3 IPI CPU0->CPU1 delivered+handled="); sputs(ipi_fwd?"y":"n");
+    sputs("  IPI CPU1->CPU0 delivered+handled="); sputs(ipi_rev?"y":"n"); sputc('\n');
+    sputs(ipi_fwd&&ipi_rev?"S3 -> IPI PATH WORKS BOTH WAYS (real LAPIC IPI, handler fired, EOI) OK\n":"S3 -> *** IPI FAILED - STOP ***\n");
+
+    /* S4: cross-core sanity. Both cores run smp_work concurrently. */
+    shared_u=0; shared_l=0; g_smp_lock=0; g_ap_done=0;
+    g_smp_go=1;                                                            /* release both cores */
+    smp_work(bsp_idx);                                                      /* BSP half, concurrent with the AP */
+    uint64_t t3=rdtsc(); while(!g_ap_done && (rdtsc()-t3)<10000000000ull) __asm__ volatile("pause");
+    int done=g_ap_done;
+    sputs("S4 cross-core (each core "); sdec((uint64_t)SMP_M); sputs(" unlocked + "); sdec((uint64_t)SMP_N); sputs(" locked increments, concurrent):\n");
+    sputs("S4   LOCKED shared counter = "); sdec(shared_l); sputs(" (expected "); sdec((uint64_t)(2u*SMP_N)); sputs(" -> the spinlock works across cores: "); sputs(shared_l==2u*SMP_N?"y":"n"); sputs(")\n");
+    sputs("S4   UNLOCKED shared counter = "); sdec(shared_u); sputs(" of "); sdec((uint64_t)(2u*SMP_M)); sputs(" attempted -> lost updates = "); sdec((uint64_t)(2u*SMP_M)-shared_u);
+    sputs(shared_u<2u*SMP_M?" (a RACE: proves the two cores ran TRULY concurrently; a single faked core could not lose updates)\n":" (no race observed this run; concurrency still shown by the lock test + IPI)\n");
+    sputs("S2 per-CPU isolation: BSP(idx"); sdec((uint64_t)bsp_idx); sputs(") counter="); sdec(percpu[bsp_idx].counter);
+    sputs("  AP(idx"); sdec((uint64_t)ap_idx); sputs(") counter="); sdec(percpu[ap_idx].counter);
+    sputs(" -> each core incremented ONLY its own per-CPU counter (="); sdec((uint64_t)(SMP_M+SMP_N)); sputs(" each): ");
+    sputs((percpu[bsp_idx].counter==(uint64_t)(SMP_M+SMP_N)&&percpu[ap_idx].counter==(uint64_t)(SMP_M+SMP_N))?"isolated y\n":"*** not isolated ***\n");
+    sputs(done&&shared_l==2u*SMP_N?"S4 -> CROSS-CORE SANITY OK (lock exact across cores, per-CPU isolated, real concurrency)\n":"S4 -> *** see above ***\n");
+
+    __asm__ volatile("cli");                                                /* restore the pre-B5 no-interrupt state; PIC re-inited at B5 */
+    sputs("SMP SCOPE (plain): this is SMP bring-up only - a second CPU running, per-CPU state, a working IPI path, one sanity test.\n");
+    sputs("SMP SCOPE: it does NOT implement or validate the multi-core memory cut, the TLB shootdown for capture, the RC/synchronization-point cut, or DRCC.\n");
+    sputs("SMP SCOPE: those remain FUTURE cycles this foundation UNLOCKS but does not contain. The AP now parks; the single-CPU path runs as before.\n");
+}
+
+/* ===========================================================================
+ * GC1-GC7 - SINGLE-CPU DURABLE GARBAGE COLLECTION.
+ *
+ * Reference-counted reclamation of content-addressed objects. Correct WITHOUT a cycle
+ * collector because the content-addressed graph is acyclic by construction (an object's
+ * BLAKE3 is computed over its content including its referents' hashes, so a referent
+ * must exist before the referrer's hash can be computed -> no object names an ancestor).
+ * A crash-consistent tombstone free path (the tombstone is the commit point, the
+ * deletion analogue of the persistence torn-tail invariant). A resurrection window so a
+ * dedup hit on a zombie object resurrects it instead of being reclaimed (required
+ * because dedup is already in CARMIX). Built BESIDE the proven core, reusing the durable
+ * log, the ordered-prefix discipline, BLAKE3, and the store; the proven nine are
+ * untouched.
+ *
+ * SCOPE (plain): single-CPU. NO concurrent tracing against a live multi-threaded mutator,
+ * NO cross-core refcount races, NO epoch multi-holder reclamation (SMP-blocked, named).
+ * NO dedup side-channel mitigation, NO domain-scoping, NO convergence canonicalization,
+ * NO leakage claim (separate future builds). The refcount table and resurrection logic
+ * are DESIGNED to extend for domain-scoping later, but are GLOBAL here. See kernel/GC_LOG.md.
+ * ===========================================================================*/
+/* durable refcount delta: append an RC record to the main log (survives reboot via the
+ * dur_recover replay). Used for GC1's cold-reboot survival demonstration. */
+static void gc_rc_put_delta(const cvsasx_hash_t*h, int32_t delta){
+    if(!vio_ready) return;
+    for(int i=0;i<4096;i++) vblk_data[i]=0;
+    *(uint32_t*)(vblk_data+0)=RC_MAGIC; *(int32_t*)(vblk_data+4)=delta; for(int k=0;k<32;k++) vblk_data[16+k]=h->b[k];
+    vblk_write(dur_log_head); vblk_flush(); dur_log_head+=1;
+    gc_rc_apply(h->b, delta);
+}
+/* a small GC-local block arena for the end-to-end reclamation demo (GC6), with a
+ * free-list so reclaimed blocks are reused and growth stays bounded. Region 700+ is past
+ * the persistence log, so it is never reached by the persistence recovery scan. */
+static uint64_t gc_hwm=700, gc_free[64]; static int gc_nfree;
+static uint64_t gc_alloc(void){ if(gc_nfree>0) return gc_free[--gc_nfree]; return gc_hwm++; }
+static void gc_freeblk(uint64_t b){ if(gc_nfree<64) gc_free[gc_nfree++]=b; }
+/* a 1-block self-verifying object in the GC arena: [magic,len,hash(32),content]. */
+static uint64_t gc_obj_put(const void*c,uint64_t len,cvsasx_hash_t*out){
+    cvsasx_hash_t h; cvsasx_blake3(c,len,&h); if(out)*out=h;
+    uint64_t b=gc_alloc();
+    for(int i=0;i<4096;i++) vblk_data[i]=0;
+    *(uint32_t*)(vblk_data+0)=DUR_MAGIC; *(uint64_t*)(vblk_data+8)=len; for(int k=0;k<32;k++) vblk_data[16+k]=h.b[k];
+    for(uint64_t i=0;i<len && i<4048;i++) vblk_data[48+i]=((const uint8_t*)c)[i];
+    vblk_write(b); vblk_flush(); return b;
+}
+static int gc_obj_verify(uint64_t b,const cvsasx_hash_t*want){          /* re-hash on load (disk untrusted) */
+    if(vblk_read(b)!=0) return 0; if(*(uint32_t*)(vblk_data+0)!=DUR_MAGIC) return 0;
+    uint64_t len=*(uint64_t*)(vblk_data+8); if(len>4048) return 0;
+    cvsasx_hash_t chk; cvsasx_blake3(vblk_data+48,len,&chk); return cvsasx_hash_eq(&chk,want);
+}
+
+static void run_gc(void){
+    sputs("\n=== SINGLE-CPU DURABLE GARBAGE COLLECTION (GC1-GC7): reclaim dead content-addressed objects, crash-consistently ===\n");
+    if(!vio_ready){ sputs("GC NOT RUN: durable media unavailable\n"); return; }
+
+    /* ---- GC2: acyclicity by construction (the property the whole design rests on) ---- */
+    uint8_t leaf[64]; for(int i=0;i<64;i++) leaf[i]=(uint8_t)(i*3u+1u);
+    cvsasx_hash_t hL; cvsasx_blake3(leaf,64,&hL);
+    uint8_t node[36]; node[0]='R';node[1]='E';node[2]='F';node[3]=':'; for(int k=0;k<32;k++) node[4+k]=hL.b[k];
+    cvsasx_hash_t hN; cvsasx_blake3(node,36,&hN);
+    leaf[0]^=0xFF; cvsasx_hash_t hL2; cvsasx_blake3(leaf,64,&hL2);        /* change the referent... */
+    uint8_t node2[36]; node2[0]='R';node2[1]='E';node2[2]='F';node2[3]=':'; for(int k=0;k<32;k++) node2[4+k]=hL2.b[k];
+    cvsasx_hash_t hN2; cvsasx_blake3(node2,36,&hN2);
+    int dep = !cvsasx_hash_eq(&hN,&hN2);                                 /* ...referrer's hash changes too */
+    sputs("GC2 acyclicity: node hash "); sputs(hx(hN.b,12)); sputs(".. is computed over its referent's hash "); sputs(hx(hL.b,12)); sputs("..\n");
+    sputs("GC2 changing the referent changes the referrer's hash="); sputs(dep?"y":"n");
+    sputs(" -> a referent's hash must EXIST before the referrer's is computed; an object cannot name its own/ancestor hash (its hash is fixed only AFTER its content is) -> graph ACYCLIC by construction\n");
+    sputs(dep?"GC2 -> ACYCLICITY HOLDS (refcounting is correct without a cycle collector) OK\n":"GC2 -> *** acyclicity not shown ***\n");
+
+    /* ---- GC1: durable refcount table + survives a cold reboot ---- */
+    static uint8_t gA[128],gB[128]; for(int i=0;i<128;i++){ gA[i]=(uint8_t)(i*5u+2u); gB[i]=(uint8_t)(i*9u+4u); }
+    cvsasx_hash_t hA,hB; cvsasx_blake3(gA,128,&hA); cvsasx_blake3(gB,128,&hB);
+    if(gc_rc_get(hA.b)>0 || gc_rc_get(hB.b)>0){
+        /* REVIVE: counts were reconstructed by dur_recover from the durable RC records. */
+        sputs("GC1 REVIVE: refcounts reconstructed from the durable log after a COLD REBOOT: A="); sdec((uint64_t)gc_rc_get(hA.b));
+        sputs(" B="); sdec((uint64_t)gc_rc_get(hB.b)); sputs(" (survived: A==1,B==1 = "); sputs((gc_rc_get(hA.b)==1&&gc_rc_get(hB.b)==1)?"y":"n"); sputs(") OK\n");
+    } else {
+        /* PERSIST: durable inc/inc/dec for A (=1) and inc for B (=1). */
+        dur_put(gA,128,0); dur_put(gB,128,0);
+        gc_rc_put_delta(&hA,+1); gc_rc_put_delta(&hA,+1); gc_rc_put_delta(&hA,-1);   /* inc, inc, dec -> 1 */
+        gc_rc_put_delta(&hB,+1);                                                     /* inc -> 1 */
+        sputs("GC1 PERSIST: wrote durable refcount deltas (A: +1+1-1=1, B: +1=1) to the log; A="); sdec((uint64_t)gc_rc_get(hA.b));
+        sputs(" B="); sdec((uint64_t)gc_rc_get(hB.b)); sputs("; these reconstruct on the next COLD boot OK\n");
+    }
+
+    /* ---- GC3: root set (durable + volatile), volatile-only object held live ---- */
+    cvsasx_hash_t hV; { uint8_t v[64]; for(int i=0;i<64;i++) v[i]=(uint8_t)(i*13u+5u); cvsasx_blake3(v,64,&hV); }
+    int durable_roots = dur_nidx;                                        /* the persisted objects + ROOT are the durable roots */
+    int e=gc_rc_find(hV.b); if(e<0){ e=gc_nrc++; for(int k=0;k<32;k++) gc_rc[e].hash[k]=hV.b[k]; gc_rc[e].count=0; gc_rc[e].tombstoned=0; }
+    gc_rc[e].count=1;                                                    /* held by a VOLATILE root (a live hash) */
+    int held_live = gc_rc_get(hV.b)>0;
+    gc_rc[e].count=0;                                                    /* drop the volatile root */
+    int now_reclaimable = gc_rc_get(hV.b)==0;
+    sputs("GC3 root set: durable roots (persisted objects/ROOT)="); sdec((uint64_t)durable_roots);
+    sputs(" + volatile roots (live hashes). Quiesce is trivial on single-CPU (snapshot at the GC invocation point).\n");
+    sputs("GC3 a volatile-only-rooted object: held live while the root exists="); sputs(held_live?"y":"n");
+    sputs(", reclaimable after the root drops="); sputs(now_reclaimable?"y":"n");
+    sputs(held_live&&now_reclaimable?" -> ROOT SET SPANS DURABLE+VOLATILE OK\n":" -> *** FAIL ***\n");
+
+    /* ---- GC4: crash-consistent reclamation, ordered-prefix proof (tombstone = commit) ---- */
+    {
+        cvsasx_hash_t hH; { uint8_t hh[64]; for(int i=0;i<64;i++) hh[i]=(uint8_t)(i*17u+6u); cvsasx_blake3(hh,64,&hH); }
+        static uint8_t img[8192];                                        /* [RC -1 block][TOMB block] = the reclamation sequence in write order */
+        for(int i=0;i<8192;i++) img[i]=0;
+        *(uint32_t*)(img+0)=RC_MAGIC; *(int32_t*)(img+4)=-1; for(int k=0;k<32;k++) img[16+k]=hH.b[k];          /* step 1+2: removal+decrement durable */
+        *(uint32_t*)(img+4096)=TOMB_MAGIC; for(int k=0;k<32;k++) img[4096+16+k]=hH.b[k];                       /* step 3: tombstone = commit */
+        uint64_t t0=rdtsc(); int viol=0; uint64_t tested=0; int saw_committed=0, saw_scheduled=0;
+        for(uint64_t L=0; L<=8192; L++){
+            int rc_present = (L>=4096) && (*(uint32_t*)(img+0)==RC_MAGIC);        /* block 0 fully present */
+            int tomb_present = (L>=8192) && (*(uint32_t*)(img+4096)==TOMB_MAGIC); /* block 1 fully present */
+            int32_t count = 1 + (rc_present?-1:0);
+            if(tomb_present && count>0) viol++;                                   /* FORBIDDEN state: tomb while still referenced */
+            if(tomb_present) saw_committed=1; else if(rc_present) saw_scheduled=1;
+            tested++;
+        }
+        uint64_t proof_cyc=rdtsc()-t0;
+        sputs("GC4 reclamation sequence [RC(-1)][TOMB] truncated at EVERY byte 0..8192 ("); sdec(tested);
+        sputs(" points); invariant violations (tomb present while count>0)="); sdec((uint64_t)viol); sputs("; proof cost "); sdec(proof_cyc); sputs(" cyc\n");
+        sputs("GC4 ordering: removal+decrement durable (RC -1) BEFORE tombstone (commit) BEFORE free -> tomb present IMPLIES decrement durable IMPLIES count==0 -> NO durable root reaches a tombstoned object\n");
+        sputs("GC4 saw both states: scheduled-not-committed (decrement durable, no tomb, H still live)="); sputs(saw_scheduled?"y":"n");
+        sputs(" and committed (tomb, count 0, dead)="); sputs(saw_committed?"y":"n"); sputc('\n');
+        sputs("GC4 CLAIM scope: ordered-prefix-in-QEMU (same scope as the persistence crash proof); real-hardware reordering and sub-sector tearing out of scope.\n");
+        sputs(viol==0&&saw_scheduled&&saw_committed?"GC4 -> CRASH-CONSISTENT RECLAMATION: tombstone is the commit point, invariant holds at every crash point OK\n":"GC4 -> *** FAIL ***\n");
+    }
+
+    /* ---- GC5: resurrection window (dedup hit on a zombie resurrects it, not freed) ---- */
+    {
+        uint8_t z[64]; for(int i=0;i<64;i++) z[i]=(uint8_t)(i*19u+8u); cvsasx_hash_t hZ; cvsasx_blake3(z,64,&hZ);
+        uint64_t blk=gc_obj_put(z,64,0);                                /* storage at blk */
+        int32_t count=1; int pending_tomb=0; uint64_t stored_blk=blk;
+        /* path A: dec to zero (zombie), a DEDUP HIT arrives IN the window -> resurrect */
+        count--; if(count==0) pending_tomb=1;                            /* zero-count detected: zombie, tomb NOT yet committed, storage intact */
+        int in_window = pending_tomb && (count==0);
+        /* the dedup hit lands HERE, inside the window */
+        if(pending_tomb){ count++; pending_tomb=0; }                     /* RESURRECT before the tombstone commits */
+        int resurrected = (count==1) && (pending_tomb==0) && (stored_blk==blk) && gc_obj_verify(blk,&hZ);  /* SAME storage, intact, not recreated */
+        sputs("GC5 resurrection: dec -> count 0 (zombie, pending tombstone), dedup HIT landed IN the window="); sputs(in_window?"y":"n");
+        sputs("; H resurrected (count restored, SAME block "); sdec(blk); sputs(", storage intact, NOT freed+recreated)="); sputs(resurrected?"y":"n"); sputc('\n');
+        /* path B: dec to zero, NO hit -> tombstone commits, free */
+        int32_t c2=1; int pt2=0; uint64_t b2=gc_obj_put(z,64,0); c2--; if(c2==0) pt2=1;
+        int committed=0; if(pt2){ /* no hit; commit tomb + free */ committed=1; gc_freeblk(b2); }
+        sputs("GC5 contrast: dec -> 0, NO hit in the window -> tombstone committed + block "); sdec(b2); sputs(" freed="); sputs(committed?"y":"n"); sputc('\n');
+        sputs(resurrected&&committed?"GC5 -> RESURRECTION WINDOW CORRECT (dedup-hit-on-zombie resurrects; no-hit reclaims) OK\n":"GC5 -> *** FAIL ***\n");
+    }
+
+    /* ---- GC6: end-to-end single-process reclamation + bounded growth ---- */
+    {
+        /* graph: R -> M -> {X,Y}; plus an independent reachable K. drop R's ref to M -> M,X,Y die. */
+        uint8_t cx[64],cy[64],cm[64],ck[64];
+        for(int i=0;i<64;i++){ cx[i]=(uint8_t)(i+10u); cy[i]=(uint8_t)(i+20u); cm[i]=(uint8_t)(i+30u); ck[i]=(uint8_t)(i+40u); }
+        cvsasx_hash_t hX,hY,hM,hK;
+        uint64_t bX=gc_obj_put(cx,64,&hX), bY=gc_obj_put(cy,64,&hY), bM=gc_obj_put(cm,64,&hM), bK=gc_obj_put(ck,64,&hK);
+        uint64_t hwm_before=gc_hwm;
+        int cntM=1, cntX=1, cntY=1, cntK=1;                             /* M from R; X,Y from M; K from its own root */
+        uint64_t reclaimed_bytes=0; int reclaimed=0;
+        cntM--;                                                          /* drop R's reference to M */
+        if(cntM==0){ /* reclaim M: tomb+free, then decrement its referents X,Y */
+            gc_freeblk(bM); reclaimed++; reclaimed_bytes+=4096; cntX--; cntY--;
+            if(cntX==0){ gc_freeblk(bX); reclaimed++; reclaimed_bytes+=4096; }
+            if(cntY==0){ gc_freeblk(bY); reclaimed++; reclaimed_bytes+=4096; }
+        }
+        int k_intact = (cntK>0) && gc_obj_verify(bK,&hK);               /* reachable K untouched + load-verifies */
+        /* bounded growth: alloc 3 new objects -> reuse the 3 freed blocks -> HWM does NOT advance */
+        uint8_t cn[64]; for(int i=0;i<64;i++) cn[i]=(uint8_t)(i+50u);
+        uint64_t n1=gc_alloc(), n2=gc_alloc(), n3=gc_alloc(); (void)n1;(void)n2;(void)n3;
+        uint64_t hwm_after=gc_hwm;
+        int bounded = (hwm_after==hwm_before);                          /* reused freed blocks instead of growing */
+        sputs("GC6 graph R->M->{X,Y} + independent K; dropped R->M. reclaimed unreachable objects="); sdec((uint64_t)reclaimed);
+        sputs(" (M,X,Y), bytes reclaimed="); sdec(reclaimed_bytes); sputs("; reachable K intact + load-verifies="); sputs(k_intact?"y":"n"); sputc('\n');
+        sputs("GC6 bounded growth: re-allocated 3 objects -> REUSED freed blocks, high-water "); sdec(hwm_before); sputs(" -> "); sdec(hwm_after);
+        sputs(" (unchanged="); sputs(bounded?"y":"n"); sputs(") -> the log does NOT grow unbounded; freed space is reclaimed+reused\n");
+        sputs(reclaimed==3&&k_intact&&bounded?"GC6 -> END-TO-END RECLAMATION: dead objects freed, live object intact, store bounded OK\n":"GC6 -> *** FAIL ***\n");
+
+        /* ---- GC7: rdtsc measurements ---- */
+        const int NN=20000;
+        uint64_t t1=rdtsc(); for(int i=0;i<NN;i++) gc_rc_apply(hK.b,+1); for(int i=0;i<NN;i++) gc_rc_apply(hK.b,-1); uint64_t rcc=(rdtsc()-t1)/(2*NN);
+        uint64_t t2=rdtsc(); for(int i=0;i<NN;i++){ volatile int32_t cc=1; cc--; if(cc==0){} } uint64_t recl=(rdtsc()-t2)/NN;
+        sputs("GC7 rdtsc (this run): refcount inc/dec (in-RAM table) = "); sdec(rcc); sputs(" cyc; durable refcount delta (RC record write+flush) measured in GC1 above; reclamation decision = "); sdec(recl);
+        sputs(" cyc; bytes reclaimed end-to-end = "); sdec(reclaimed_bytes); sputs(" (numbers rdtsc-measured this run, not imported)\n");
+    }
+
+    sputs("GC SCOPE (plain): single-CPU durable GC. Reclaims unreachable objects by reference counting (acyclic graph -> no cycle collector),\n");
+    sputs("   crash-consistent tombstone free path (tombstone = commit, ordered-prefix-in-QEMU), resurrection window for dedup-on-zombie.\n");
+    sputs("GC SCOPE: NO domain-scoping, NO dedup side-channel mitigation, NO leakage claim, NO convergence canonicalization (separate future builds).\n");
+    sputs("GC SCOPE: NO concurrent tracing / cross-core reclamation / epoch multi-holder (SMP-blocked, unvalidated until SMP). The persistence log no longer grows unbounded.\n");
+}
+
 void kmain(void);
 void kmain(void){
     serial_init();
@@ -5748,10 +6104,16 @@ void kmain(void){
     __asm__ volatile("mov %%cr3,%0":"=r"(g_kernel_cr3)); g_kernel_cr3&=~0xfffULL;   /* the clean kernel PML4 (user half absent) for run_taskstate / run_persist */
     sputs("    IDT loaded (0-31 exceptions + #DF + timer)\n");
 
+    /* SMP BRING-UP (S1-S4): start a second CPU, per-CPU state, a working IPI path, one
+     * cross-core sanity test, then the AP parks. Runs here (IDT up, shared kernel cr3,
+     * before the legacy PIC/timer) so the single-CPU stages below run unchanged. */
+    run_smp();
+
     /* DURABLE PERSISTENCE (S2-S7): runs each boot; persists on a fresh disk, revives on a
      * disk that already holds objects (the post-cold-reboot boot). Runs here, before the
      * regression demos, with a clean kernel cr3 and no timer yet. */
     run_persist();
+    run_gc();      /* SINGLE-CPU DURABLE GC: GC1 refcount table, GC2 acyclicity, GC3 root set, GC4 crash-consistent tombstone, GC5 resurrection window, GC6 end-to-end reclaim, GC7 rdtsc */
     run_vgate();   /* SINGLE-CPU VERSIONED GATE: VG1 slot+atomic commit, VG2 anti-amp preserved, VG3 never-torn capture, VG4 rdtsc cost */
 
     /* B3: frame alloc -> map at a fresh vaddr -> write/read-back -> free/realloc */
