@@ -85,8 +85,8 @@ it. docs/THE_CONTRIBUTION.md gives the precise prior-art difference.
 | Signed cross-machine authorization with real Ed25519. One legitimate migration accepted, seven adversaries each rejected by a distinct reason. | Observed between two emulator instances. | kernel/net_repro.sh |
 | Key lifecycle. A source key is learned by authority-signed enrollment, rotated and revoked under the authority key, monotonic epochs against replay and downgrade. Six lifecycle attacks each rejected by a distinct reason. | Observed between two emulator instances. | kernel/net_repro.sh |
 | Software-rendered desktop. Boot, framebuffer, console with scrolling, windows with focus, drag, and resize, driven by PS/2 keyboard and mouse. | Observed by framebuffer pixel readback in an emulator. | kernel self-tests |
-| Task substrate. The kernel creates tasks, switches between them with a real assembly context switch, runs the proven remat path inside a task across a switch, and preempts a non-yielding task on the timer interrupt. The scheduling policy is an isolated round-robin placeholder. | Observed by serial trace in an emulator. | kernel scheduler self-test |
-| Task as a content-addressed object. A task's registers and stack hash into the proven store, activate-by-hash dematerializes and rematerializes it through that hash, and a task resumes from its hash alone, so persistence is a no-op. | Observed by serial trace in an emulator. | kernel unified-substrate self-test |
+| Task substrate. The kernel creates tasks, switches between them with a real assembly context switch, runs the content-addressed remat path inside a task across a switch, and preempts a non-yielding task on the timer interrupt. The scheduling policy is an isolated round-robin placeholder. | Observed by serial trace in an emulator. | kernel scheduler self-test |
+| Task as a content-addressed object. A task's registers and stack hash into the content-addressed store, activate-by-hash dematerializes and rematerializes it through that hash, and a task resumes from its hash alone, so persistence is a no-op. | Observed by serial trace in an emulator. | kernel unified-substrate self-test |
 | The cost crossover, measured. A raw register switch is a flat cost near 1400 cycles, while activate-by-hash is two to three orders of magnitude more at every dirty-set size, so the fast path stays for rapid switching and content-addressing is used only at coarse boundaries. | Measured with rdtsc in an emulator. | kernel unified-substrate self-test |
 | Residency manager. Physical memory is a content-addressed cache over the store. Fault-in materializes a frame from a hash and verifies it, identical content is shared by hash as one frame, eviction writes a dirty victim back to the store, and the hardware page-table dirty bit is measured against the software diff (it agrees and is six to seven times cheaper). | Observed and measured in an emulator. | kernel residency self-test |
 | Rematerializing fault handler. A not-present access traps through the page-fault vector and is serviced by a BLAKE3-verified materialize-by-hash that gates resume. Content that fails verification is refused at the fault boundary, and identical content is shared on the fault path. | Observed by serial trace in an emulator. | kernel fault-handler self-test |
@@ -147,7 +147,7 @@ in full in docs/ROADMAP.md.
   identity proofing, or an out-of-band bootstrap of that first key, and persistence of the trust
   state across a reboot, are not built. See docs/SECURITY_MODEL.md.
 
-The honesty of this list is what makes the proven parts credible.
+The honesty of this list is what makes the machine-checked and tested parts credible.
 
 ## Build and run
 

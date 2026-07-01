@@ -65,7 +65,7 @@ gate/executor.c.
 
 The checker is the trusted computing base of the gate. Its guarantee holds relative to the set of
 operations it models. The static elision pass (gate/optimize.c) drops a runtime bounds check only
-for an access it has proven in bounds, and the checker rejects the elided opcodes in untrusted
+for an access it has shown in bounds, and the checker rejects the elided opcodes in untrusted
 input so they cannot be injected.
 
 ## Software capability backend (carmix/)
@@ -121,7 +121,7 @@ save and restore in switch_to are the seam, and the policy is a deliberate place
 
 On top of this the kernel makes a task a content-addressed object. The remat_root handle now holds
 the BLAKE3 hash of a task's state, its registers and the used part of its stack, serialized into the
-proven store. A context switch can then run as activate-by-hash, the task is dematerialized to a
+content-addressed store. A context switch can then run as activate-by-hash, the task is dematerialized to a
 hash and later materialized back from the store, which is rematerialization applied to task state.
 The same state hashes to the same handle and different state to a different handle. Persistence falls
 out of this, a task dropped and resumed from only its hash and the store resumes correctly, the live
@@ -139,7 +139,7 @@ rematerialization at switch frequency.
 
 ## Residency manager (kernel/kernel.c)
 
-Physical memory is managed as a content-addressed cache over the proven store. The classification of
+Physical memory is managed as a content-addressed cache over the content-addressed store. The classification of
 each operation is fixed. Fresh allocation stays conventional. Fault-in and sharing collapse into
 rematerialization. Free, eviction, and defragmentation partially collapse. Mapping stays
 conventional.
@@ -237,7 +237,7 @@ its authority is bounded at birth. An over-ceiling or unauthorized request is re
 gate that refuses a migration. Loading the same image twice gives two processes whose read-only code
 resolves to one physical frame by hash while their writable data and stacks are private. Loading
 therefore joins faulting, migrating, and crossing as one operation, rematerialization under the
-proven gate, with integrity gated by construction. The image is embedded in the kernel because there
+re-mint gate, with integrity gated by construction. The image is embedded in the kernel because there
 is no filesystem yet, and the loaded program is a static executable.
 
 ## Concurrent processes and descheduling as rematerialization (kernel/kernel.c)
@@ -252,7 +252,7 @@ resident, the scheduler dematerializes its schedulable state to a hash in the st
 frames, so that not running and not resident become different states. When the scheduler selects it
 again, the state is rematerialized from the hash with verification and the process resumes where it
 left off, its counter surviving the round trip. Descheduling joins faulting, migrating, crossing, and
-loading as rematerialization under the proven path.
+loading as rematerialization under the same re-mint path.
 
 The cost is measured. Resuming a resident process is a register and page-table-root restore near ten
 thousand cycles, resuming a dematerialized process is a store fetch, a verification, and a remap near
@@ -350,7 +350,7 @@ revoked, else revoked-key. These two reasons are distinct from each other and fr
 The authority key is the one baked root of trust whose bootstrap is out of scope. See
 docs/SECURITY_MODEL.md.
 
-The proven modules ship exactly as verified. The kernel, the network harness, the proofs, and the
+The core capability modules ship exactly as reviewed. The kernel, the network harness, the proofs, and the
 documentation are the new code that uses them.
 
 ## Diagrams

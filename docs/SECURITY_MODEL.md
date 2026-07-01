@@ -78,8 +78,8 @@ real deployment requires them.
 
 - The root of trust. The destination's first authority public key is baked in. How a destination
   obtains and proves that first key, through a certificate authority, identity proofing, or an
-  out-of-band channel, is the one irreducible bootstrap assumption. The lifecycle is proven given a
-  trustworthy authority key, not how that key is established.
+  out-of-band channel, is the one irreducible bootstrap assumption. The lifecycle is designed and
+  tested against attack tables given a trustworthy authority key, not how that key is established.
 - Persistent trust and nonce state. The trust store and the used-nonce set live in memory. The
   kernel has no disk, so a restart re-bootstraps from the baked authority key at epoch zero. A real
   system must persist the current key, the epoch, the revoked set, and the seen nonces without

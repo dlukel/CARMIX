@@ -45,7 +45,7 @@ principle. A context switch, a page fault, a cross-machine migration, a
 user and kernel crossing, a program load, and a process deschedule are treated
 as one operation, the rematerialization of content-addressed state under a
 freshly minted capability whose authority cannot exceed the source authority,
-over BLAKE3 hashes. The contribution is this principle and its verified
+over BLAKE3 hashes. The contribution is this principle and its tested
 demonstration, not feature completeness. The system boots on x86-64 through a
 standard bootloader, runs a capability-guarded WebAssembly executor inside the
 kernel, rematerializes computation state on one machine and across two machines,
@@ -56,19 +56,20 @@ to close the cross-domain timing channel, brings up a second CPU as a multi-core
 foundation, and ships a machine-checked Coq proof of its core authority
 guarantee. The proof is axiom-free except for one stated collision-resistance
 hypothesis. To keep the claims separable, every result is placed in one of three
-maturity tiers. Tier 1 is built in \carmix{}, verified, and rdtsc-measured.
-Tier 2 is proven theory not yet validated on \carmix{}. Tier 3 is a research
+maturity tiers. Tier 1 is built in \carmix{}, C-tested, and rdtsc-measured.
+Tier 2 is paper-argued theory not yet validated on \carmix{}. Tier 3 is a research
 verdict or formal result whose implementation is not built. The Deterministically
-Reproducible Consistent Cut result is Tier 2, and its validation gap has narrowed
-now that the SMP foundation exists, but the multi-core consistent capture is not
-yet demonstrated. The deduplication impossibility bound, the content-addressed
+Reproducible Consistent Cut result is Tier 2, paper-argued, with a first measured
+exercise (U-3, CV8) covering the exercised workloads and schedules only and a
+universal proof pending; its validation gap has narrowed now that the SMP
+foundation exists, but the multi-core consistent capture is not yet demonstrated. The deduplication impossibility bound, the content-addressed
 convergence verdict, and the userland phasing are Tier 3. Every runtime number
 reported here was observed in the QEMU emulator and is quoted from the captured
 serial transcript. \carmix{} is roughly forty to forty-five percent of the way to
 a general-purpose operating system. It is a research prototype, not a finished
 operating system, and the Limitations section states in full what is not built.
 The honesty of that list, and of the tier labels, is what is meant to make the
-proven parts credible.
+machine-checked and tested parts credible.
 \end{abstract}
 
 \section{Introduction}
@@ -104,11 +105,11 @@ proves and its one assumption, and reports the measured numbers from the
 emulator with honest framing of what each shows.
 
 This report stratifies its claims by maturity, so that no result reads as more
-finished than it is. \textbf{Tier 1} is built in \carmix{}, verified by its
+finished than it is. \textbf{Tier 1} is built in \carmix{}, exercised by its
 self-tests, committed to the public repository at
 \texttt{github.com/dlukel/CARMIX}, and rdtsc-measured in the emulator. The
 Architecture and Evaluation sections are Tier 1 unless a sentence states
-otherwise. \textbf{Tier 2} is proven theory that \carmix{} does not yet validate
+otherwise. \textbf{Tier 2} is paper-argued theory that \carmix{} does not yet validate
 in running code. \textbf{Tier 3} is a research verdict or formal result,
 including clean impossibility and undecidability findings, whose implementation
 is not built or is only partially started. The Tier 2 and Tier 3 results have
@@ -242,7 +243,7 @@ The kernel boots on x86-64 through the Limine boot protocol, which hands it long
 mode, page tables, a memory map, and a linear framebuffer. Everything above the
 entry point is written for \carmix{}. The boot milestones B0 through B5 confirm
 serial output, long mode (\texttt{CS=0x28}, \texttt{EFER.LMA=1}), a physical frame
-allocator with read-back, a $1280\times800\times32$ framebuffer proven by pixel
+allocator with read-back, a $1280\times800\times32$ framebuffer demonstrated by pixel
 read-back, and a PIT timer. The gate and the software backend, linked into the
 kernel, run a WebAssembly task and draw its result (E1, result $=51$), and the
 anti-amplification property holds in the kernel with one control accept and six
@@ -257,7 +258,7 @@ three-leaf change reports three).
 A software compositor draws a background and windows back to front with a
 save-under cursor, driven by polled PS/2 keyboard and mouse. Windows support
 focus raise on click, drag by the titlebar, and resize by a corner grip, each
-proven by framebuffer pixel read-back. In the headless self-test run these events
+demonstrated by framebuffer pixel read-back. In the headless self-test run these events
 are scripted and labelled as such. Only the final shell stage takes live PS/2
 input. The desktop draws \carmix{}'s own windows in software and does not run
 third-party graphical applications.
@@ -308,7 +309,7 @@ round-robin and is a deliberate placeholder.
 \subsection{The unified content-addressed task substrate}
 
 On top of the substrate a task is made a content-addressed object. Its registers
-and the used part of its stack hash into the proven store, the same state hashing
+and the used part of its stack hash into the content-addressed store, the same state hashing
 to the same handle and different state to a different handle (U0). Activate-by-hash
 dematerializes the task to a hash and materializes it back, and the counter
 survives the round trip (U1). Persistence falls out of this: a task dropped and
@@ -565,7 +566,7 @@ buffers, the active buffer selected by the low bit of the version. A replacement
 is written to the inactive buffer, and the commit is one naturally-aligned
 eight-byte store to the version word, which x86-64 makes atomic (VG1). The
 anti-amplification check is the existing gate, reused unchanged, so the committed
-capability is exactly what the proven check produces and never wider, and a
+capability is exactly what the C-tested re-mint check produces and never wider, and a
 request for wider bounds or an added permission is refused with its distinct
 status while the active capability is left unchanged (VG2). Driven through
 sixty-four surrender-and-replace operations with captures fired at many points
@@ -587,7 +588,7 @@ A second CPU is brought up, giving \carmix{} a genuine multi-core foundation
 with multi-threaded TCG, so the two virtual CPUs execute on separate host threads
 and are genuinely parallel. Limine performs the standard INIT-SIPI-SIPI and hands
 each application processor to the kernel in long mode, and the second core reaches
-kernel C code and announces its LAPIC id on serial, which is observable proof a
+kernel C code and announces its LAPIC id on serial, which is observable evidence a
 second core is executing (S1). Each CPU has its own per-CPU record and increments
 only its own counter (S2). The Local APIC is initialized in xAPIC mode on each
 core, and a real inter-processor interrupt is delivered and handled in both
@@ -973,7 +974,7 @@ raw compute speed, cold-start migration, or operating-system completeness.
 
 \section{Formal Results Not Yet Validated on \carmix{} (Tier 2)}
 
-The result in this section is proven theory. The SMP foundation of the earlier
+The result in this section is paper-argued theory. The SMP foundation of the earlier
 sections has narrowed its validation gap, but \carmix{} does not yet exhibit it in
 running code, so it is Tier 2 and not Tier 1.
 
@@ -1020,7 +1021,7 @@ The formal finding, borrowed and applied from the Armknecht et al. bound, is tha
 zero cross-domain leakage with nonzero cross-domain sharing is impossible. Any
 system that shares stored content across a trust boundary leaks across that
 boundary, so the only leak-free option for the cross-domain channel is to not
-share across it. This is the proven boundary. Its prescribed fix,
+share across it. This is the argued impossibility boundary. Its prescribed fix,
 domain-partitioned deduplication, is built and measured and is the Tier 1 result
 in the Architecture, which closes the cross-domain channel at the measured cost of
 duplicate cross-domain storage, exactly the trade the bound makes unavoidable. The
@@ -1091,7 +1092,7 @@ capability slots stay resident and are not yet part of it.
 rematerialization milestone calls the same C page-fault service routine the live
 vector runs, rather than triggering a live fault on a freshly-unmapped low virtual
 address, because a live touch there halts the boot on the single-stack handler.
-The serial line says so on the wire, and the live page-fault entry is proven
+The serial line says so on the wire, and the live page-fault entry is demonstrated
 separately by F1, US0, and C0.
 \item \textbf{Recoverable nested faults are not supported.} A fault during fault
 handling fails closed rather than recovering. Making it recoverable needs a
@@ -1103,16 +1104,17 @@ control, not a proven-optimal fairness algorithm.
 \item \textbf{Deduplication leakage is partly closed, not eliminated.}
 Domain-partitioned deduplication closes the cross-domain store-timing channel at a
 measured storage cost (Tier 1), and the cross-domain leak-freedom rests on the
-proven impossibility bound (Tier 3). The within-domain timing channel remains and
+argued impossibility bound (Tier 3). The within-domain timing channel remains and
 is accepted, because the observer is already in that domain. The bounded-residual
 mitigations, timing normalization and a randomized threshold, are not built, and a
 concurrent cross-core attacker is not exercised because it depends on the SMP work.
 \item \textbf{SMP is a foundation only.} A second CPU is up with per-CPU state, a
 working inter-processor interrupt path, and a cross-core test that shows genuine
 parallelism (Tier 1). The multi-core consistent capture and the DRCC result are
-not validated on it. The DRCC result is proven theory whose validation gap has
-narrowed now that the foundation exists, but \carmix{} does not yet exhibit the
-multi-core cut (Tier 2).
+not validated on it. The DRCC result is paper-argued theory with a first measured
+exercise (U-3, CV8) covering the exercised workloads and schedules only and a
+universal proof pending; its validation gap has narrowed now that the foundation
+exists, but \carmix{} does not yet exhibit the multi-core cut (Tier 2).
 \item \textbf{Garbage collection and convergence have limits.} The durable
 collector is single-CPU. Concurrent tracing against a live multi-threaded mutator
 and cross-core reclamation are not built and wait on the SMP work.
@@ -1232,7 +1234,7 @@ context switch, a page fault, a cross-machine migration, a user and kernel
 crossing, a program load, and a process deschedule are one operation: the
 rematerialization of content-addressed state under a re-minted anti-amplification
 capability ceiling, over BLAKE3 hashes. The contribution is the principle and its
-verified demonstration. The system boots, runs a capability-guarded WebAssembly
+tested demonstration. The system boots, runs a capability-guarded WebAssembly
 executor, rematerializes state on one machine and across two, persists a
 content-addressed object and a whole process across a genuine cold reboot,
 reclaims unreachable objects with a durable collector, partitions deduplication by
