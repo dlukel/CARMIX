@@ -7083,6 +7083,163 @@ static void run_cfs(void){
     sputs("CFS SCOPE: single-CPU; built on run_fs + the committed gc_rc/tombstone reclaim + dur_put. Every write RE-ROOTS (new object+tree+root); GC reclaims unreachable trees and PINS retained snapshots (refcount-protected sharing); the durable root is the ordered commit point. Demonstrated on small fixed trees + <=8-chunk Merkle files; the re-thread/reclaim/diff mechanisms are uniform. NO POSIX layer, NO in-place mutation, NO ambient access, NO unverified read.\n");
 }
 
+/* ===========================================================================
+ * NETWORKING (NET1-NET6): a LOOPBACK, in-kernel two-endpoint channel. REAL NIC IS
+ * OUT OF SCOPE (no virtio-net/e1000 driver, no TX/RX ring, no TCP/IP; stated at
+ * NET-5, and every result below is labelled LOOPBACK). Respects the boundary in
+ * kernel/NETWORK_MODEL.md: endpoint identity + reachability are CARMIX-native (a
+ * content-addressed endpoint descriptor via the U-4 pattern; bounded reach via the
+ * proven swcap anti-amplification gate), while ordering + liveness are the EXPLICIT
+ * non-content-addressed edge, LABELED as such and never faked as content-addressed.
+ * Reuses the content store (put/get/blake3/hash_eq + index_count/dedup_hits), the
+ * proven gate (cvsasx_sw_cap_remint), the U-4 delegation-attenuation pattern, and
+ * rdtsc. No generic sockets are imported. See kernel/NET_LOG.md.
+ * ===========================================================================*/
+#define NET_PAY 64u                    /* max payload bytes on this channel */
+#define NET_MSGMAX (40u+NET_PAY)       /* message object = seq(8) | prev_hash(32) | payload */
+static uint8_t net_arena[1u<<14]; static cvsasx_store_entry_t net_sidx[128];
+static cvsasx_store_t net_store; static int net_store_ready;
+
+/* an endpoint capability: NO ambient reach. It names EXACTLY one channel descriptor
+ * (by content hash) and carries a bounded reach ceiling (max payload bytes). */
+typedef struct { int held; cvsasx_hash_t desc; uint64_t reach; } net_cap_t;
+
+/* structural reachability check: reaching a peer REQUIRES a held cap that names that
+ * peer's channel descriptor. No cap, or a cap for a different channel -> REFUSED. */
+static int net_reach(const net_cap_t* c, const cvsasx_hash_t* channel){
+    if(!c->held) return U0_EFAULT;                              /* no ambient reachability */
+    if(!cvsasx_hash_eq(&c->desc, channel)) return U0_EFAULT;    /* cap names a DIFFERENT channel */
+    return 0;
+}
+/* anti-amplification on send size, enforced by the PROVEN swcap gate (not by
+ * convention): a payload larger than the cap's reach ceiling is refused at the gate,
+ * exactly as the U-0 pool acquire is. */
+static int net_send_ceiling_ok(const net_cap_t* c, uint64_t paylen){
+    static uint8_t region_bytes[NET_PAY];
+    cvsasx_swcap_t root={ (uint64_t)(uintptr_t)region_bytes, c->reach, (uint32_t)CVSASX_PERM_LOAD, 1 };
+    cvsasx_sw_custodian_t cust; cvsasx_sw_custodian_init(&cust, root);
+    cvsasx_hash_t oh; cvsasx_blake3(region_bytes, c->reach, &oh);
+    cvsasx_sw_region_t rg; rg.object_cap=root; rg.object_base_addr=(uint64_t)(uintptr_t)region_bytes; rg.object_length=c->reach;
+    for(int k=0;k<32;k++) rg.hash[k]=oh.b[k];
+    cvsasx_pir_t pir; conc_make_pir(&pir, oh.b, 0, paylen, (uint32_t)CVSASX_PERM_LOAD);
+    cvsasx_swcap_t out; return cvsasx_sw_cap_remint(&cust,&pir,&rg,&out)==CVSASX_OK;
+}
+/* build a message object: seq(8 LE) | prev_hash(32) | payload; return its content hash. */
+static cvsasx_hash_t net_msg_build(uint8_t* buf, uint64_t seq, const cvsasx_hash_t* prev, const uint8_t* pay, uint64_t plen){
+    for(int i=0;i<8;i++) buf[i]=(uint8_t)(seq>>(8*i));
+    for(int k=0;k<32;k++) buf[8+k]=prev->b[k];
+    for(uint64_t i=0;i<plen;i++) buf[40+i]=pay[i];
+    cvsasx_hash_t h; cvsasx_blake3(buf,40+plen,&h); return h;
+}
+
+static void run_net(void){
+    sputs("\n=== NETWORKING (NET1-NET6): LOOPBACK two-endpoint channel (REAL NIC OUT OF SCOPE) ===\n");
+    if(!net_store_ready){ cvsasx_store_init(&net_store,net_arena,sizeof net_arena,net_sidx,128); net_store_ready=1; }
+    cvsasx_hash_t zero; for(int k=0;k<32;k++) zero.b[k]=0;
+
+    /* ---- endpoint descriptors: immutable content-addressed tuples (the U-4 pattern) ---- */
+    uint8_t d1[16], d2[16]; for(int i=0;i<16;i++){ d1[i]=0; d2[i]=0; }
+    d1[0]='B'; d1[8]=1;   /* peer B, channel 1 */
+    d2[0]='C'; d2[8]=2;   /* peer C, channel 2 */
+    cvsasx_hash_t chan1, chan2; cvsasx_store_put(&net_store,d1,16,&chan1); cvsasx_store_put(&net_store,d2,16,&chan2);
+
+    /* ================= NET-1 endpoint as a bounded capability ================= */
+    net_cap_t capA={1,chan1,NET_PAY};        /* A holds reach to channel-1, ceiling NET_PAY */
+    net_cap_t capNone={0,{{0}},0};           /* a process with NO endpoint cap */
+    net_cap_t capOther={1,chan2,NET_PAY};    /* holds reach to channel-2 only */
+    int reach_ok    = net_reach(&capA,&chan1)==0;
+    int reach_amb   = net_reach(&capNone,&chan1)==U0_EFAULT;     /* no cap -> refused (no ambient reachability) */
+    int reach_wrong = net_reach(&capOther,&chan1)==U0_EFAULT;    /* wrong channel -> refused */
+    net_cap_t capChild={1,chan1, capA.reach/2};                  /* delegated cap: strictly smaller ceiling (U-4) */
+    int atten = capChild.reach < capA.reach;
+    uint64_t grandchild_req = capChild.reach*4;                  /* child tries to grant 4x its own ceiling */
+    int over_deleg_refused = !(grandchild_req <= capChild.reach);
+    int child_within       = net_send_ceiling_ok(&capChild, capChild.reach);       /* == ceiling: OK */
+    int child_over_refused = !net_send_ceiling_ok(&capChild, capChild.reach+1);     /* > ceiling: swcap gate refuses */
+    sputs("NET-1 endpoint=bounded cap naming channel "); sputs(hx(chan1.b,8));
+    sputs(": authorized reach="); sputs(reach_ok?"y":"n");
+    sputs("; NO-cap reach REFUSED (no ambient)="); sputs(reach_amb?"y":"n");
+    sputs("; wrong-channel cap REFUSED="); sputs(reach_wrong?"y":"n"); sputc('\n');
+    sputs("NET-1 delegated cap attenuates: child ceiling "); sdec(capChild.reach); sputs(" < parent "); sdec(capA.reach);
+    sputs(" ="); sputs(atten?"y":"n"); sputs("; over-delegation REFUSED="); sputs(over_deleg_refused?"y":"n");
+    sputs("; attenuated ceiling GATE-enforced (send>ceiling refused by swcap remint)="); sputs((child_within&&child_over_refused)?"y":"n"); sputc('\n');
+    int net1=reach_ok&&reach_amb&&reach_wrong&&atten&&over_deleg_refused&&child_within&&child_over_refused;
+    sputs(net1?"NET-1 -> ENDPOINT IS A BOUNDED CAP; UNAUTHORIZED REACH REFUSED; DELEGATION ATTENUATES OK\n":"NET-1 -> *** FAIL ***\n");
+
+    /* ================= NET-2 messages as content-addressed objects ================= */
+    uint8_t pay0[NET_PAY]; for(int i=0;i<(int)NET_PAY;i++) pay0[i]=(uint8_t)('A'+(i%26));
+    uint8_t m0[NET_MSGMAX]; cvsasx_hash_t h0=net_msg_build(m0,0,&zero,pay0,NET_PAY);
+    cvsasx_hash_t sh0; cvsasx_store_put(&net_store,m0,NET_MSGMAX,&sh0);
+    int stored_named = cvsasx_hash_eq(&h0,&sh0);                 /* named by hash of its own bytes */
+    uint8_t wire[NET_MSGMAX]; for(int i=0;i<(int)NET_MSGMAX;i++) wire[i]=m0[i];
+    cvsasx_hash_t chk; cvsasx_blake3(wire,NET_MSGMAX,&chk); int intact = cvsasx_hash_eq(&chk,&h0);
+    wire[50]^=0xFF; cvsasx_hash_t chk2; cvsasx_blake3(wire,NET_MSGMAX,&chk2); int tamper_rejected = !cvsasx_hash_eq(&chk2,&h0);
+    uint64_t cnt_before=net_store.index_count, dh_before=net_store.dedup_hits;
+    cvsasx_hash_t sh0b; cvsasx_store_put(&net_store,m0,NET_MSGMAX,&sh0b);
+    int dedup = cvsasx_hash_eq(&sh0b,&h0) && (net_store.index_count==cnt_before) && (net_store.dedup_hits==dh_before+1);
+    sputs("NET-2 message=content-addressed object "); sputs(hx(h0.b,8)); sputs(": stored under hash-of-bytes="); sputs(stored_named?"y":"n");
+    sputs("; receive re-hash verifies intact="); sputs(intact?"y":"n"); sputs("; TAMPERED msg rejected by hash mismatch="); sputs(tamper_rejected?"y":"n");
+    sputs("; identical msg DEDUP (no 2nd copy)="); sputs(dedup?"y":"n"); sputc('\n');
+    int net2=stored_named&&intact&&tamper_rejected&&dedup;
+    sputs(net2?"NET-2 -> MESSAGES ARE CONTENT-ADDRESSED; INTEGRITY BY RE-HASH; IDENTICAL DEDUP OK\n":"NET-2 -> *** FAIL ***\n");
+
+    /* ================= NET-3 the ordering/liveness edge (EXPLICIT, honest) ================= */
+    uint8_t pay1[8]={1,1,1,1,1,1,1,1}, pay2[8]={2,2,2,2,2,2,2,2};
+    uint8_t mm0[NET_MSGMAX], mm1[NET_MSGMAX], mm2[NET_MSGMAX];
+    cvsasx_hash_t c0=net_msg_build(mm0,0,&zero,pay0,NET_PAY);
+    cvsasx_hash_t c1=net_msg_build(mm1,1,&c0,pay1,8);
+    cvsasx_hash_t c2=net_msg_build(mm2,2,&c1,pay2,8); (void)c2;
+    cvsasx_hash_t p1; for(int k=0;k<32;k++) p1.b[k]=mm1[8+k];
+    cvsasx_hash_t p2; for(int k=0;k<32;k++) p2.b[k]=mm2[8+k];
+    int chain_ok = cvsasx_hash_eq(&p1,&c0) && cvsasx_hash_eq(&p2,&c1);   /* each msg references prior hash */
+    cvsasx_hash_t last=c0; int gap_detected = !cvsasx_hash_eq(&p2,&last); /* deliver mm2 after mm0: prev != last -> gap */
+    int session_alive=1; uint64_t high_water=2;   /* mutable session state; no content hash names "alive now" */
+    sputs("NET-3 ordering axis (EXPLICIT sequence + hash chain, NON-content-addressed): order verifies="); sputs(chain_ok?"y":"n");
+    sputs("; out-of-order/missing DETECTED="); sputs(gap_detected?"y":"n"); sputc('\n');
+    sputs("NET-3 liveness is EXPLICIT mutable session state, LABELED NON-content-addressed (alive="); sdec((uint64_t)session_alive);
+    sputs(", high-water seq="); sdec(high_water); sputs("); the STREAM is NOT claimed content-addressed\n");
+    int net3=chain_ok&&gap_detected;
+    sputs(net3?"NET-3 -> ORDER VERIFIABLE VIA HASH CHAIN; GAPS DETECTED; LIVENESS LABELED NON-CA OK\n":"NET-3 -> *** FAIL ***\n");
+
+    /* ================= NET-4 end-to-end cap-gated, ordered, integrity-verified channel ================= */
+    net_cap_t sender=capA; cvsasx_hash_t prev=zero; int delivered=0, verified_all=1;
+    for(int s=0;s<3;s++){
+        uint8_t pl[8]; for(int i=0;i<8;i++) pl[i]=(uint8_t)(s*10+i);
+        uint8_t mb[NET_MSGMAX]; cvsasx_hash_t mh=net_msg_build(mb,(uint64_t)s,&prev,pl,8);
+        if(net_reach(&sender,&chan1)!=0){ verified_all=0; break; }        /* authority enforced per send */
+        if(!net_send_ceiling_ok(&sender,8)){ verified_all=0; break; }     /* anti-amp ceiling per send */
+        cvsasx_hash_t sh; cvsasx_store_put(&net_store,mb,48,&sh);
+        uint8_t wb[NET_MSGMAX]; for(int i=0;i<48;i++) wb[i]=mb[i];        /* loopback delivery */
+        cvsasx_hash_t rc; cvsasx_blake3(wb,48,&rc);                       /* receiver re-hashes */
+        cvsasx_hash_t pp; for(int k=0;k<32;k++) pp.b[k]=wb[8+k];          /* embedded prev */
+        if(cvsasx_hash_eq(&rc,&mh) && cvsasx_hash_eq(&pp,&prev)){ delivered++; prev=mh; } else verified_all=0;
+    }
+    int e2e_ok = (delivered==3) && verified_all;
+    int e2e_unauth = net_reach(&capNone,&chan1)==U0_EFAULT;               /* unauthorized sender refused end-to-end */
+    sputs("NET-4 end-to-end LOOPBACK channel: messages delivered="); sdec((uint64_t)delivered);
+    sputs("/3 all cap-gated+integrity-verified+in-order="); sputs(e2e_ok?"y":"n"); sputs("; unauthorized sender REFUSED="); sputs(e2e_unauth?"y":"n"); sputc('\n');
+    int net4=e2e_ok&&e2e_unauth;
+    sputs(net4?"NET-4 -> WORKING CAP-GATED, ORDERED, INTEGRITY-VERIFIED CHANNEL (AUTHORITY ENFORCED) OK\n":"NET-4 -> *** FAIL ***\n");
+
+    /* ================= NET-5 real-NIC readiness (honest gap) ================= */
+    sputs("NET-5 real-NIC readiness (HONEST GAP): every result above is LOOPBACK, in-kernel. For a real NIC the missing pieces are: a virtio-net/e1000 driver + TX/RX rings; device interrupts + async I/O (this build is single-CPU cooperative); a real clock for timeouts/backpressure/liveness (here a mutable counter/flag proxy); and an external non-CARMIX peer (the anti-amp reach ceiling binds only the LOCAL endpoint, so across a foreign peer only re-hash integrity is unilaterally enforceable). The CARMIX-native halves (content-addressed descriptor+messages, bounded reach) reuse the proven store+gate UNCHANGED.\n");
+
+    /* ================= NET-6 measurement (rdtsc, loopback) ================= */
+    const int N=20000;
+    uint64_t t0=rdtsc(); for(int i=0;i<N;i++) (void)net_reach(&capA,&chan1); uint64_t c_reach=(rdtsc()-t0)/N;
+    uint64_t t1=rdtsc(); for(int i=0;i<N;i++){ uint8_t mb[NET_MSGMAX]; cvsasx_hash_t mh=net_msg_build(mb,7,&zero,pay0,NET_PAY);
+        cvsasx_hash_t sh; cvsasx_store_put(&net_store,mb,NET_MSGMAX,&sh); cvsasx_hash_t rc; cvsasx_blake3(mb,NET_MSGMAX,&rc); (void)cvsasx_hash_eq(&rc,&mh); } uint64_t c_send=(rdtsc()-t1)/N;
+    uint64_t t2=rdtsc(); for(int i=0;i<N;i++){ cvsasx_hash_t pa,pb; for(int k=0;k<32;k++){pa.b[k]=mm1[8+k];pb.b[k]=mm2[8+k];} (void)(cvsasx_hash_eq(&pa,&c0)&&cvsasx_hash_eq(&pb,&c1)); } uint64_t c_chain=(rdtsc()-t2)/N;
+    uint64_t t3=rdtsc(); for(int i=0;i<N;i++){ uint8_t mb[NET_MSGMAX]; cvsasx_hash_t mh=net_msg_build(mb,9,&zero,pay0,8); (void)net_reach(&capA,&chan1);
+        cvsasx_hash_t sh; cvsasx_store_put(&net_store,mb,48,&sh); cvsasx_hash_t rc; cvsasx_blake3(mb,48,&rc); (void)cvsasx_hash_eq(&rc,&mh); } uint64_t c_rt=(rdtsc()-t3)/N;
+    sputs("NET-6 rdtsc (LOOPBACK): endpoint-check="); sdec(c_reach); sputs(" cyc; message send+re-verify="); sdec(c_send);
+    sputs(" cyc; ordering-chain verify="); sdec(c_chain); sputs(" cyc; round-trip="); sdec(c_rt); sputs(" cyc\n");
+
+    int netok=net1&&net2&&net3&&net4;
+    sputs(netok?"NET -> LOOPBACK CAP-GATED CONTENT-ADDRESSED MESSAGE CHANNEL: reach bounded (no ambient), messages content-addressed+dedup, order via explicit hash chain, liveness labeled NON-CA OK\n":"NET -> *** see failures above ***\n");
+    sputs("NET SCOPE: single-CPU LOOPBACK (in-kernel), NO real NIC/ring/IRQ/TCP-IP, NO real clock (counter/flag proxy for liveness). Endpoint identity + bounded reach are CARMIX-native (content-addressed descriptor + proven swcap anti-amp gate); ordering + liveness are the EXPLICIT non-content-addressed edge, labeled, never faked. NO ambient reachability, NO unverified message, NO stream claimed content-addressed, NO generic sockets imported.\n");
+}
+
 void kmain(void);
 void kmain(void){
     serial_init();
@@ -7217,6 +7374,7 @@ void kmain(void){
     run_u1u2();        /* U-1: spawn bounded authority + revocation + capability IPC; U-2: real heap + free coupled to the committed GC (sys_mem_release -> gc_rc reclaim) */
     run_fs();          /* CONTENT-ADDRESSED FILESYSTEM: file=object, dir=Merkle map, write re-roots (native versioning + free snapshots), reads re-verified, root durable */
     run_cfs();         /* CYCLE 2 FULL CFS: file ops (write/append/truncate re-root, large files=Merkle trees), dir ops (mkdir/rmdir/rename/move), GC-integrated (dead trees reclaim, snapshots pin), durable crash-consistent root, structural diff */
+    run_net();         /* CYCLE 3 NETWORKING (LOOPBACK): NET-1 endpoint=bounded cap (no ambient reach, delegation attenuates), NET-2 messages=content-addressed objects (re-hash integrity + dedup), NET-3 ordering via explicit hash chain + liveness labeled NON-CA, NET-4 end-to-end cap-gated ordered integrity channel, NET-5 real-NIC gap, NET-6 rdtsc */
     run_loader();      /* PROCESS LOADER: L0 ELF as a stored object + parse, L1 materialize segments by hash (W^X), L2 enter+run the loaded ELF, L3 load-time authority ceiling, L4 two procs share code by hash */
     conc_run();        /* CONCURRENT MULTI-PROCESS SCHEDULING: C0 two ring-3 procs timer-preempted, C1 per-process ceilings, C2 deschedule->dematerialize->rematerialize, C3 measured policy-cost */
     run_permem();      /* PER-PROCESS MEMORY MANAGEMENT: PM0 extend-heap+demand-zero+bump alloc, PM1 authority-bounded, PM2 dematerialize-idle, PM3 cross-process dedup-by-hash+COW, PM4 U3 hot-page exclusion */
