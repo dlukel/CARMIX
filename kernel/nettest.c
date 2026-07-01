@@ -733,6 +733,8 @@ static uint32_t migrate_verify_lifecycle(const uint8_t signed_msg[SIGNED_LEN], c
 
 static void d_source(const cvsasx_oid_t *base_root);   /* fwd */
 static void d_dest(const cvsasx_oid_t *base_root);
+static void am_source(const cvsasx_oid_t *base_root);  /* Step 14 fwd (distrusting, attestation-gated) */
+static void am_dest(const cvsasx_oid_t *base_root);
 static void k_source(const cvsasx_oid_t *base_root);   /* Step 12 fwd */
 static void k_dest(const cvsasx_oid_t *base_root);
 static void dm_source(const cvsasx_oid_t *base_root);  /* Step 13 fwd (authority-set migration) */
@@ -803,6 +805,7 @@ static void run_source(void){
     /* ===== STEP 12 K: key-lifecycle suite (A side). Bound to the cold-sync root. */
     k_source(&root);
     dm_source(&root);   /* Step 13: authority-SET migration, AFTER k (matches dm_dest ordering on B) */
+    am_source(&root);   /* Step 14: distrusting attestation-gated migration (emulated root) */
     sputs("##### A DONE - all stages observed #####\n");
 }
 
@@ -901,6 +904,7 @@ static void run_dest(void){
     k_dest(&b2_root);
     /* ===== STEP 13 DM: authority-SET migration (B side). Bound to the same root. */
     dm_dest(&b2_root);
+    am_dest(&b2_root);   /* Step 14: distrusting attestation-gated migration (emulated root) */
     sputs("##### B DONE - all stages observed #####\n");
 }
 
@@ -1190,6 +1194,126 @@ static void dm_dest(const cvsasx_oid_t *base_root){
         "DISTRIBUTED ANTI-AMPLIFICATION (trusted cluster): a migrant cannot arrive with more authority than A signed; a post-sign amplification breaks the Ed25519 and is rejected\n":
         "*** FAIL - authority-set gate not sound ***\n");
     sputs("  DM SCOPE: trusted-cluster (B trusts A's pre-shared key, assumes A honest about the set it signs); NOT the distrusting case (that needs hardware attestation); single-CPU per machine; the two machines are TWO QEMU instances sharing one ivshmem region.\n");
+}
+
+/* ===========================================================================
+ * STEP 14 - DISTRUSTING (attestation-gated) MIGRATION. Step 13 was trusted-cluster:
+ * B trusted A's key. Here B does NOT trust A. B honors the migrant only if an
+ * ATTESTATION QUOTE verifies: a signed binding of (A's measured code identity ||
+ * the canonical authority set || the content-addressed state root). B checks the
+ * quote signature under a trusted quoting key, that the measurement is one B ACCEPTS
+ * (the distrusting check, which trusted-cluster did not have), and that the attested
+ * state root matches the root B independently re-verified by re-hash. Only then does
+ * B re-mint bounded by the anti-amp gate. Because state is content-addressed, B needs
+ * ZERO trust in A for the state (it re-hashes), so attestation only anchors the
+ * AUTHORITY, the exact residue.
+ *
+ * ROOT IS EMULATED: the measurement register and the quoting key are SOFTWARE (the
+ * quoting key is the existing AUTH keypair standing in for a hardware root). This
+ * demonstrates the PROTOCOL and the VERIFICATION FLOW, NOT hardware attestation
+ * security. A real distrusting adversary controlling A's machine could forge a
+ * SOFTWARE root, which is exactly why real security needs a HARDWARE root (TPM/SGX/
+ * SEV/TDX), which needs physical hardware CARMIX cannot boot on yet. That is FUTURE
+ * WORK. Built here: the distrusting protocol with an emulated root. See
+ * kernel/MIGRATION_DISTRUST_LOG.md.
+ * ===========================================================================*/
+#define AM_QUOTE_BODY (32u + DM_SET_BYTES + 32u)   /* meas(32) || authset(132) || state_root(32) = 196 */
+#define AM_SIGNED_LEN (64u + AM_QUOTE_BODY)         /* sig(64) || body(196) = 260 */
+#define AM_MSG_OFF   0x7000
+#define AM_ROOT_OFF  0x7120
+#define AM_CASE_OFF  0x7140
+#define AM_SEQA_OFF  0x7148
+#define AM_SEQB_OFF  0x7150
+#define AM_VERD_OFF  0x7158
+#define AM_NREM_OFF  0x7160
+static inline volatile uint64_t* am_seqA(void){ return (volatile uint64_t*)(SHM+AM_SEQA_OFF); }
+static inline volatile uint64_t* am_seqB(void){ return (volatile uint64_t*)(SHM+AM_SEQB_OFF); }
+static inline volatile uint32_t* am_verd(void){ return (volatile uint32_t*)(SHM+AM_VERD_OFF); }
+static inline volatile uint32_t* am_nrem(void){ return (volatile uint32_t*)(SHM+AM_NREM_OFF); }
+/* EMULATED software measurement register: A's measured migrant code identity. */
+static const uint8_t AM_MEASURE[32]={ 'C','A','R','M','I','X','-','m','i','g','r','a','n','t','-','v','1',0,0,0,0,0,0,0,0,0,0,0,0,0,0,0 };
+/* B's accepted code identities (the distrusting reference). Here: exactly AM_MEASURE. */
+static int am_accepted(const uint8_t m[32]){ for(int i=0;i<32;i++) if(m[i]!=AM_MEASURE[i]) return 0; return 1; }
+/* distinct AM verdicts */
+enum { AV_ACCEPT=0, AV_FORGED=1, AV_UNRECOGNIZED=2, AV_BINDING=3, AV_ANTIAMP=4 };
+static const char* av_name(uint32_t v){ switch(v){ case AV_ACCEPT:return "ACCEPT"; case AV_FORGED:return "REJECT forged-quote [bad quoting sig]";
+    case AV_UNRECOGNIZED:return "REJECT unrecognized-measurement [distrust: code identity not accepted]";
+    case AV_BINDING:return "REJECT mismatched-binding [attested root != re-verified root]"; case AV_ANTIAMP:return "REJECT anti-amp"; default:return "??"; } }
+
+/* A: measure, quote (meas||authset||stateroot) signed by the emulated quoting key. */
+static void am_source(const cvsasx_oid_t *base_root){
+    sputs("\n##### STEP 14: DISTRUSTING (attestation-gated) MIGRATION, EMULATED ROOT #####\n");
+    sputs("AM0 [A] EMULATED root: software measurement register + software quoting key (the AUTH keypair). NOT hardware attestation.\n");
+    dm_cap_t set[DM_NCAP];
+    for(int i=0;i<32;i++){ set[0].hash[i]=base_root->b[i]; set[1].hash[i]=base_root->b[i]^0x11; set[2].hash[i]=base_root->b[i]^0x22; }
+    set[0].rights=CVSASX_PERM_LOAD; set[0].length=128; set[1].rights=CVSASX_PERM_LOAD|CVSASX_PERM_STORE; set[1].length=64; set[2].rights=CVSASX_PERM_LOAD; set[2].length=256;
+    uint8_t flat[DM_SET_BYTES]; dm_set_pack(set,DM_NCAP,flat);
+    static const char* LBL[4]={"AMcase0 LEGIT quote (accepted identity)","AM-adv1 forged quote (wrong quoting key)",
+                               "AM-adv2 unrecognized measurement (unapproved code)","AM-adv3 mismatched binding (wrong state root)"};
+    /* DA-B6 measure: measurement + quote-gen (single shot). */
+    { uint64_t t0=rdtsc(); cvsasx_hash_t mh; cvsasx_blake3(AM_MEASURE,32,&mh); uint64_t mc=rdtsc()-t0; (void)mh;
+      uint8_t body[AM_QUOTE_BODY]; for(int i=0;i<32;i++) body[i]=AM_MEASURE[i]; for(uint32_t i=0;i<DM_SET_BYTES;i++) body[32+i]=flat[i]; for(int i=0;i<32;i++) body[32+DM_SET_BYTES+i]=base_root->b[i];
+      uint8_t sm[AM_SIGNED_LEN]; unsigned long long sl=0; uint8_t sk[64]; for(int j=0;j<64;j++) sk[j]=AUTH_SK[j];
+      uint64_t t1=rdtsc(); crypto_sign(sm,&sl,body,AM_QUOTE_BODY,sk); uint64_t qc=rdtsc()-t1;
+      sputs("AM6 [A] rdtsc: measurement="); sdec(mc); sputs(" cyc; quote generation (Ed25519 sign over meas||authset||root)="); sdec(qc); sputs(" cyc\n"); }
+    for(uint32_t c=0;c<4;c++){
+        uint8_t body[AM_QUOTE_BODY];
+        for(int i=0;i<32;i++) body[i]=AM_MEASURE[i];
+        if(c==2) body[0]^=0xFF;                                    /* unrecognized measurement (unapproved code identity), still validly signed */
+        for(uint32_t i=0;i<DM_SET_BYTES;i++) body[32+i]=flat[i];
+        for(int i=0;i<32;i++) body[32+DM_SET_BYTES+i]=base_root->b[i];
+        if(c==3) body[32+DM_SET_BYTES]^=0xFF;                      /* attest a WRONG state root (mismatched binding) */
+        uint8_t sk[64]; for(int j=0;j<64;j++) sk[j]=(c==1)?WRONG_SK[j]:AUTH_SK[j];   /* forged quote uses the wrong key */
+        uint8_t sm[AM_SIGNED_LEN]; unsigned long long sl=0; crypto_sign(sm,&sl,body,AM_QUOTE_BODY,sk);
+        bcopy_to(SHM+AM_MSG_OFF, sm, AM_SIGNED_LEN); bcopy_to(SHM+AM_ROOT_OFF, base_root->b, 32);
+        *(volatile uint32_t*)(SHM+AM_CASE_OFF)=c; mfence(); *am_seqA()=(uint64_t)(c+1); mfence();
+        if(!wait_seq_ge(am_seqB(),(uint64_t)(c+1),WAIT_BUDGET)){ sputs("AM [A] TIMEOUT case "); sdec(c); sputc('\n'); hcf(); }
+        sputs("AM [A] "); sputs(LBL[c]); sputs("  -> B verdict: "); sputs(av_name(*am_verd())); sputs("  |C_B'|="); sdec(*am_nrem()); sputc('\n');
+    }
+    sputs("AM [A] distrusting suite complete.\n");
+}
+/* B (distrusting): verify quote sig under the trusted quoting key, require an ACCEPTED
+ * measurement, require the attested state root to match B's re-verified root, then bounded
+ * re-mint. Every failure rejects fail-closed, re-minting nothing. */
+static void am_dest(const cvsasx_oid_t *base_root){
+    sputs("\n##### STEP 14: DISTRUSTING MIGRATION (B does NOT trust A; attestation gate, EMULATED root) #####\n");
+    sputs("AM [B] gate order: (1)quote signature under the trusted quoting key (2)measurement ACCEPTED (distrust) (3)attested root == re-verified root (4)bounded re-mint. EMULATED root: real security needs hardware, future work.\n");
+    static const char* CID[4]={"AMcase0 LEGIT","AM-adv1 forged-quote","AM-adv2 unrecognized-measurement","AM-adv3 mismatched-binding"};
+    uint32_t got[4], nrem[4]; uint64_t vcyc=0;
+    for(uint32_t c=0;c<4;c++){
+        if(!wait_seq_ge(am_seqA(),(uint64_t)(c+1),WAIT_BUDGET)){ sputs("AM [B] TIMEOUT case "); sdec(c); sputc('\n'); hcf(); }
+        uint8_t sm[AM_SIGNED_LEN]; bcopy_from(sm, SHM+AM_MSG_OFF, AM_SIGNED_LEN);
+        uint8_t rec[AM_SIGNED_LEN]; unsigned long long rl=0;
+        uint64_t tv=rdtsc(); int okc=crypto_sign_open(rec,&rl,sm,AM_SIGNED_LEN,AUTH_PK); if(c==0) vcyc=rdtsc()-tv;   /* trusted quoting key */
+        uint32_t v; uint32_t nr=0;
+        uint8_t troot[32]; bcopy_from(troot, SHM+AM_ROOT_OFF, 32);   /* the state root actually transferred (B re-verifies the state itself by re-hash in b_sync) */
+        if(okc!=0 || rl!=AM_QUOTE_BODY){ v=AV_FORGED; }                                   /* (1) forged/invalid quote */
+        else {
+            uint8_t meas[32]; for(int i=0;i<32;i++) meas[i]=rec[i];
+            uint8_t aroot[32]; for(int i=0;i<32;i++) aroot[i]=rec[32+DM_SET_BYTES+i];
+            if(!am_accepted(meas)){ v=AV_UNRECOGNIZED; }                                  /* (2) distrust: code identity not accepted */
+            else { int rootmatch=1; for(int i=0;i<32;i++) if(aroot[i]!=troot[i]){ rootmatch=0; break; }  /* (3) attested root == transferred root */
+                if(!rootmatch){ v=AV_BINDING; }
+                else { v=AV_ACCEPT;                                                        /* (4) bounded re-mint of the attested set */
+                    for(uint32_t k=0;k<DM_NCAP;k++){ uint32_t b=32+k*DM_CAP_BYTES; uint64_t len=0; for(int i=0;i<8;i++) len|=(uint64_t)rec[b+36+i]<<(8*i);
+                        if(dm_remint(len,base_root)!=AV_ACCEPT){ v=AV_ANTIAMP; break; } nr++; } } }
+        }
+        got[c]=v; nrem[c]=nr; *am_nrem()=nr; *am_verd()=v; mfence(); *am_seqB()=(uint64_t)(c+1); mfence();
+        sputs("  ["); sputs(CID[c]); sputs("] -> "); sputs(av_name(v)); sputs("  |C_B'|="); sdec(nr);
+        sputs(c==0?"  (attested authority re-minted; state re-verified by re-hash, zero trust in A for state)\n":"  (fail-closed: nothing re-minted)\n");
+    }
+    sputs("AM6 [B] rdtsc: quote verification (Ed25519 open over the quote)="); sdec(vcyc); sputs(" cyc\n");
+    int legit=(got[0]==AV_ACCEPT)&&(nrem[0]==DM_NCAP);
+    int rej=(got[1]!=AV_ACCEPT)&&(got[2]!=AV_ACCEPT)&&(got[3]!=AV_ACCEPT)&&(nrem[1]==0)&&(nrem[2]==0)&&(nrem[3]==0);
+    int core=(got[2]==AV_UNRECOGNIZED);   /* the distrusting heart: unrecognized identity rejected */
+    sputs("\n===== AM DISTRUSTING TABLE (EMULATED root; protocol real, hardware security future work) =====\n");
+    sputs("  legit quote ACCEPT, attested authority re-minted (C_B'=3)? "); sputs(legit?"y":"n");
+    sputs("   forged quote + unrecognized measurement + mismatched binding all REJECTED fail-closed? "); sputs(rej?"y":"n");
+    sputs("\n  unrecognized-measurement rejected (the distrusting property trusted-cluster LACKED)? "); sputs(core?"y":"n");
+    sputs("\n  -> "); sputs((legit&&rej&&core)?
+        "DISTRUSTING PROTOCOL BUILT (emulated root): B honors a migrant only under an accepted attested identity + re-verifiable content; state re-verified by re-hash so attestation anchors only the authority. Real hardware-anchored security is FUTURE WORK on physical bring-up.\n":
+        "*** FAIL - distrusting gate not sound ***\n");
+    sputs("  AM SCOPE: the ROOT is EMULATED (software), NOT a hardware root of trust. The protocol + verification flow are real; hardware attestation security needs physical hardware, future work.\n");
 }
 
 void kmain(void);
