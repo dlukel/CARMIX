@@ -7739,6 +7739,203 @@ static void run_drv(void){
     sputs("DRV SCOPE (honest): single-CPU; DEMONSTRATED - real Limine framebuffer + real PS/2 controller, caps minted through the PROVEN anti-amp gate, every access swcap-checked, out-of-/foreign-region + over-wide bind REFUSED, frame re-verifiable by hash. DEFERRED - interrupt-driven delivery (keyboard is polled here; keypress delivery is event-driven so headless count may be 0), real DMA engine (the DMA window is a bounded RAM buffer modeling a device's DMA region), USB/xHCI HID. The BOUNDARY is honest: the cap bounds LOCAL driver authority; it does not model the device's own bus-master reach.\n");
 }
 
+/* ===========================================================================
+ * CARMIX-NATIVE REMATERIALIZATION GRAPHICS (GFX1-GFX5). NOT a ported compositor.
+ * Invented from the three CARMIX primitives: content-addressing, anti-amplification
+ * capabilities, and rematerialization. The screen has NO ambient authority.
+ *
+ *   - A SURFACE is a pixel buffer that is (a) hash-named in the content store and
+ *     (b) reachable ONLY through a SURFACE CAPABILITY: a cvsasx_swcap_t minted over
+ *     the surface bytes through the PROVEN anti-amp gate (reusing drv_mint). A
+ *     process draws to / reads a surface ONLY if it holds that surface's cap; any
+ *     other surface's bytes are out of the cap region -> REFUSED (no ambient screen).
+ *   - A FRAME is the composite of the authorized surfaces: a content-addressed
+ *     object (hash of the composition). Identical composites dedup by hash.
+ *   - PRESENT writes a frame to the REAL Limine framebuffer THROUGH Cycle 6's DISPLAY
+ *     device cap (drv_reg[0], bound by run_drv) - the framebuffer is itself capability
+ *     bounded, so a process without the display cap cannot reach the screen.
+ *   - INPUT EVENTS are hash-named objects appended to an ordered log (reuse the store).
+ *   - REMATERIALIZE: a PAST frame is recovered DIRECTLY by its hash (store_get +
+ *     re-hash CONFIRMS it is the actual frame) - time-travel of UI state, NOT replay
+ *     (nothing is re-composited). This is the Cycle 4 debugging model applied to pixels.
+ *
+ * Reuses ONLY existing primitives: the content store, the swcap gate via drv_mint /
+ * drv_access, and the DRV display cap + drv_fb_px. No proven-core file touched.
+ * Single-CPU; see kernel/GFX_LOG.md.
+ * ===========================================================================*/
+#define GFX_SW 16u
+#define GFX_SH 16u
+#define GFX_SPX (GFX_SW*GFX_SH)            /* pixels per 16x16 surface */
+#define GFX_FW 32u
+#define GFX_FH 16u
+#define GFX_FPX (GFX_FW*GFX_FH)            /* a 32x16 composited frame (surfA|surfB) */
+static uint8_t gfx_arena[1u<<15]; static cvsasx_store_entry_t gfx_sidx[96];
+static cvsasx_store_t gfx_store; static int gfx_store_ready;
+
+typedef struct { uint32_t* px; uint64_t bytes; cvsasx_swcap_t cap; cvsasx_hash_t hash; } gfx_surf_t;
+
+/* open a surface: hash-name its bytes AND mint a surface cap bounded to EXACTLY the
+ * surface buffer through the proven anti-amp gate (drv_mint). */
+static int gfx_surf_open(gfx_surf_t* s, uint32_t* buf, uint64_t px){
+    s->px=buf; s->bytes=px*4u;
+    cvsasx_store_put(&gfx_store, buf, s->bytes, &s->hash);
+    return drv_mint((uint64_t)(uintptr_t)buf, s->bytes, s->bytes,
+                    (uint32_t)(CVSASX_PERM_LOAD|CVSASX_PERM_STORE), &s->hash, &s->cap);
+}
+/* touch a surface pixel THROUGH a cap: authorized only if 'cap' covers that byte. */
+static int gfx_touch(const cvsasx_swcap_t* cap, uint32_t* buf, uint32_t idx, uint32_t color){
+    uint64_t abs=(uint64_t)(uintptr_t)buf + (uint64_t)idx*4u;
+    if(!drv_access(cap, abs, 4, CVSASX_PERM_STORE)) return 0;
+    buf[idx]=color; return 1;
+}
+static int gfx_peek(const cvsasx_swcap_t* cap, const uint32_t* buf, uint32_t idx, uint32_t* out){
+    uint64_t abs=(uint64_t)(uintptr_t)buf + (uint64_t)idx*4u;
+    if(!drv_access(cap, abs, 4, CVSASX_PERM_LOAD)) return 0;
+    *out=buf[idx]; return 1;
+}
+/* composite the two authorized surfaces side-by-side into a 32x16 frame (reads gated by each surface cap). */
+static int gfx_composite(const gfx_surf_t* a, const gfx_surf_t* b, uint32_t* frame){
+    for(uint32_t j=0;j<GFX_SH;j++) for(uint32_t i=0;i<GFX_SW;i++){
+        uint32_t p;
+        if(!gfx_peek(&a->cap,a->px,j*GFX_SW+i,&p)) return 0; frame[j*GFX_FW+i]=p;
+        if(!gfx_peek(&b->cap,b->px,j*GFX_SW+i,&p)) return 0; frame[j*GFX_FW+GFX_SW+i]=p;
+    }
+    return 1;
+}
+/* present a frame to the REAL framebuffer THROUGH the DRV display device cap. */
+static int gfx_present(const drv_dev_t* disp, const uint32_t* frame, uint32_t ox, uint32_t oy){
+    for(uint32_t j=0;j<GFX_FH;j++) for(uint32_t i=0;i<GFX_FW;i++)
+        if(!drv_fb_px(disp, ox+i, oy+j, frame[j*GFX_FW+i])) return 0;
+    return 1;
+}
+/* the input event log: each event a hash-named object; the log preserves order. */
+typedef struct { uint8_t type, code; uint16_t x, y, tick, pad; } gfx_evt_t;   /* 10 bytes */
+static cvsasx_hash_t gfx_evlog[64]; static int gfx_evn;
+static cvsasx_hash_t gfx_evt_append(uint8_t type,uint8_t code,uint16_t x,uint16_t y,uint16_t tick){
+    gfx_evt_t e; e.type=type; e.code=code; e.x=x; e.y=y; e.tick=tick; e.pad=0;
+    cvsasx_hash_t h; cvsasx_store_put(&gfx_store,&e,sizeof e,&h);
+    if(gfx_evn<64) gfx_evlog[gfx_evn++]=h;   /* ordered log; bytes dedup in the store */
+    return h;
+}
+
+static void run_gfx(void){
+    sputs("\n=== CARMIX-NATIVE REMATERIALIZATION GRAPHICS (GFX1-GFX5) - content-addressed surfaces/frames/events, capability-mediated compositor, NO ambient screen ===\n");
+    if(!FB){ sputs("GFX SKIP: no framebuffer (headless w/o FB) -> NOT RUN\n"); return; }
+    if(drv_n<1 || !drv_reg[0].bound){ sputs("GFX SKIP: DRV display cap not bound (run_drv did not run) -> NOT RUN\n"); return; }
+    if(!gfx_store_ready){ cvsasx_store_init(&gfx_store,gfx_arena,sizeof gfx_arena,gfx_sidx,96); gfx_store_ready=1; }
+    drv_dev_t* disp=&drv_reg[0];   /* the REAL Limine framebuffer device cap from Cycle 6 */
+
+    /* backing buffers for two surfaces (owned by a process P). */
+    static uint32_t bufA[GFX_SPX], bufB[GFX_SPX];
+    gfx_surf_t A, B;
+    int oa=gfx_surf_open(&A,bufA,GFX_SPX), ob=gfx_surf_open(&B,bufB,GFX_SPX);
+
+    /* draw into each surface ONLY through its own surface cap. */
+    int draw_ok=1;
+    for(uint32_t k=0;k<GFX_SPX;k++){ draw_ok &= gfx_touch(&A.cap,bufA,k,0x00204080u+k*0x000101u); }
+    for(uint32_t k=0;k<GFX_SPX;k++){ draw_ok &= gfx_touch(&B.cap,bufB,k,0x00801040u+k*0x000100u); }
+    /* re-hash-name the drawn surfaces (content changed -> new content addresses). */
+    cvsasx_store_put(&gfx_store,bufA,A.bytes,&A.hash);
+    cvsasx_store_put(&gfx_store,bufB,B.bytes,&B.hash);
+
+    /* ---------------- GFX-1: surfaces, frames, input events ARE content-addressed objects ---------------- */
+    static uint32_t frame[GFX_FPX];
+    int comp1=gfx_composite(&A,&B,frame);
+    cvsasx_hash_t fh; cvsasx_store_put(&gfx_store,frame,sizeof frame,&fh);          /* frame = hash of its composition */
+    /* re-read the surfaces + re-composite + re-hash: a frame is re-derivable to the SAME content address. */
+    static uint32_t frameR[GFX_FPX]; int compR=gfx_composite(&A,&B,frameR);
+    cvsasx_hash_t rh; cvsasx_blake3(frameR,sizeof frameR,&rh); int frame_verifies=compR&&cvsasx_hash_eq(&rh,&fh);
+    /* identical composite -> store DEDUP (no 2nd copy). */
+    uint64_t ic0=gfx_store.index_count, dh0=gfx_store.dedup_hits;
+    cvsasx_hash_t fh2; cvsasx_store_put(&gfx_store,frameR,sizeof frameR,&fh2);
+    int frame_dedup=cvsasx_hash_eq(&fh2,&fh)&&gfx_store.index_count==ic0&&gfx_store.dedup_hits==dh0+1;
+    /* input events: hash-named objects in an ordered log; a repeated event dedups by hash. */
+    gfx_evn=0;
+    cvsasx_hash_t e0=gfx_evt_append(1,0x1e,64,520,(uint16_t)ticks);      /* key 'a' down */
+    cvsasx_hash_t e1=gfx_evt_append(2,0,96,528,(uint16_t)ticks);         /* pointer move */
+    uint64_t eic=gfx_store.index_count, edh=gfx_store.dedup_hits;
+    cvsasx_hash_t e2=gfx_evt_append(1,0x1e,64,520,(uint16_t)ticks);      /* SAME as e0 -> dedup */
+    int evt_ca=!cvsasx_hash_eq(&e0,&e1)&&cvsasx_hash_eq(&e2,&e0)&&(gfx_store.index_count==eic)&&(gfx_store.dedup_hits==edh+1)&&(gfx_evn==3);
+    sputs("GFX-1 surfA="); sputs(hx(A.hash.b,6)); sputs(" surfB="); sputs(hx(B.hash.b,6)); sputs(" -> composited FRAME="); sputs(hx(fh.b,8)); sputc('\n');
+    sputs("GFX-1 frame re-composite+re-hash == frame hash="); sputs(frame_verifies?"y":"n");
+    sputs("; identical frame DEDUP (no 2nd copy)="); sputs(frame_dedup?"y":"n");
+    sputs("; input events hash-named in ordered log (len="); sdec((uint64_t)gfx_evn); sputs("), repeat event dedups by hash="); sputs(evt_ca?"y":"n"); sputc('\n');
+    int gfx1=oa&&ob&&draw_ok&&comp1&&frame_verifies&&frame_dedup&&evt_ca;
+    sputs(gfx1?"GFX-1 -> SURFACES/FRAMES/EVENTS ARE CONTENT-ADDRESSED OBJECTS (frame = hash of composition; identical frames dedup) OK\n":"GFX-1 -> *** FAIL ***\n");
+
+    /* ---------------- GFX-2: capability-mediated compositor -> REAL present to the framebuffer ---------------- */
+    /* process P holds {A.cap, B.cap} + the display cap; composite the authorized surfaces, present to the screen. */
+    uint32_t ox=64, oy=520;
+    int present_ok=gfx_present(disp,frame,ox,oy);                                    /* through the DISPLAY device cap */
+    /* verify the composite really reached the framebuffer: read back FB pixels, compare to the frame. */
+    int fb_matches=1; for(uint32_t j=0;j<GFX_FH&&fb_matches;j++) for(uint32_t i=0;i<GFX_FW;i++)
+        if(get_px(ox+i,oy+j)!=frame[j*GFX_FW+i]){ fb_matches=0; break; }
+    sputs("GFX-2 compositor: authorized surfaces {A,B} composited + presented to the REAL framebuffer @"); sdec(ox); sputc(','); sdec(oy);
+    sputs(" via the DISPLAY device cap; framebuffer readback == composited frame="); sputs(fb_matches?"y":"n"); sputc('\n');
+    int gfx2=present_ok&&fb_matches;
+    sputs(gfx2?"GFX-2 -> CAPABILITY-MEDIATED COMPOSITE PRESENTED (surfaces drawn via surface caps, frame to screen via the display cap) OK\n":"GFX-2 -> *** FAIL ***\n");
+
+    /* ---------------- GFX-3: anti-amplification at the graphics layer (no ambient screen/input) ---------------- */
+    /* P holds A.cap. Reaching surface B (which P has NO cap for) is out of A.cap's region -> REFUSED at the gate. */
+    int in_auth   = gfx_touch(&A.cap,bufA,0,0x00FFFFFFu);                             /* own surface: OK */
+    int out_write = !gfx_touch(&A.cap,bufB,0,0x00FFFFFFu);                            /* foreign surface write: REFUSED */
+    uint32_t sink; int out_read = !gfx_peek(&A.cap,bufB,0,&sink);                     /* foreign surface read: REFUSED */
+    int no_ambient_fb = !drv_access(&A.cap,(uint64_t)(uintptr_t)FB->address,4,CVSASX_PERM_STORE); /* a surface cap can NOT reach the screen */
+    sputs("GFX-3 anti-amp: in-authority draw (own surface) OK="); sputs(in_auth?"y":"n");
+    sputs("; out-of-authority surface WRITE REFUSED="); sputs(out_write?"y":"n");
+    sputs("; out-of-authority surface READ REFUSED="); sputs(out_read?"y":"n");
+    sputs("; surface cap can NOT reach the framebuffer (no ambient screen)="); sputs(no_ambient_fb?"y":"n"); sputc('\n');
+    int gfx3=in_auth&&out_write&&out_read&&no_ambient_fb;
+    sputs(gfx3?"GFX-3 -> NO AMBIENT SCREEN/INPUT AUTHORITY: touching a surface without its cap is REFUSED by the swcap gate OK\n":"GFX-3 -> *** FAIL ***\n");
+    /* restore the pixel we flipped so the frame hashes below stay meaningful. */
+    gfx_touch(&A.cap,bufA,0,0x00204080u);
+
+    /* ---------------- GFX-4: rematerialization of visual state (time-travel of UI, NOT replay) ---------------- */
+    /* record the PAST frame's hash (fh). Mutate surface A, re-composite -> a DIFFERENT current frame. */
+    gfx_touch(&A.cap,bufA,GFX_SPX/2,0x0000FF00u); cvsasx_store_put(&gfx_store,bufA,A.bytes,&A.hash);
+    static uint32_t frameNow[GFX_FPX]; gfx_composite(&A,&B,frameNow);
+    cvsasx_hash_t nowh; cvsasx_store_put(&gfx_store,frameNow,sizeof frameNow,&nowh);
+    int state_moved=!cvsasx_hash_eq(&nowh,&fh);
+    /* RE-MATERIALIZE the PAST frame DIRECTLY by its hash: fetch bytes, re-hash, confirm they ARE fh. */
+    const void* pb; size_t pl; int fetched=(cvsasx_store_get(&gfx_store,&fh,&pb,&pl)==CVSASX_STORE_OK);
+    cvsasx_hash_t chk; if(fetched) cvsasx_blake3(pb,pl,&chk);
+    int remat_confirms=fetched&&(pl==sizeof frame)&&cvsasx_hash_eq(&chk,&fh);
+    int is_past_not_now=remat_confirms&&!cvsasx_hash_eq(&chk,&nowh);                  /* the recovered frame is the PAST, not the current one */
+    /* re-present the RE-MATERIALIZED past frame to the screen: the display time-travels to an earlier UI state. */
+    int re_present=gfx_present(disp,(const uint32_t*)pb,ox,oy);
+    int back_to_past=1; for(uint32_t j=0;j<GFX_FH&&back_to_past;j++) for(uint32_t i=0;i<GFX_FW;i++)
+        if(get_px(ox+i,oy+j)!=frame[j*GFX_FW+i]){ back_to_past=0; break; }
+    sputs("GFX-4 past frame "); sputs(hx(fh.b,8)); sputs(" vs current "); sputs(hx(nowh.b,8)); sputs(" (surface mutated -> UI state moved="); sputs(state_moved?"y":"n"); sputs(")\n");
+    sputs("GFX-4 re-materialize past frame BY HASH: fetched "); sdec((uint64_t)pl); sputs(" bytes, re-hash == recorded hash="); sputs(remat_confirms?"y":"n");
+    sputs(" (the ACTUAL past frame recovered by NAMING it - NOTHING re-composited -> NOT replay); recovered==past not current="); sputs(is_past_not_now?"y":"n"); sputc('\n');
+    sputs("GFX-4 re-presented the re-materialized past frame -> the display time-travels to the earlier UI state (framebuffer==past frame="); sputs(re_present&&back_to_past?"y":"n"); sputs("); this is the Cycle 4 debugging model applied to pixels\n");
+    int gfx4=state_moved&&remat_confirms&&is_past_not_now&&re_present&&back_to_past;
+    sputs(gfx4?"GFX-4 -> VISUAL STATE RE-MATERIALIZED BY HASH (re-hash-confirmed, past != current, NOT replay) OK\n":"GFX-4 -> *** FAIL ***\n");
+
+    /* ---------------- GFX-5: measure (rdtsc, QEMU, this run) + a safe content-addressed present optimization ---------------- */
+    const int N=8000; volatile int s=0;
+    uint64_t t0=rdtsc(); for(int i=0;i<N;i++){ cvsasx_hash_t h; cvsasx_store_put(&gfx_store,bufA,A.bytes,&h); s+=h.b[0]; } uint64_t c_surf=(rdtsc()-t0)/N;
+    uint64_t t1=rdtsc(); for(int i=0;i<N;i++){ gfx_composite(&A,&B,frameR); cvsasx_hash_t h; cvsasx_blake3(frameR,sizeof frameR,&h); s+=h.b[0]; } uint64_t c_comp=(rdtsc()-t1)/N;
+    uint64_t t2=rdtsc(); for(int i=0;i<N;i++){ s+=gfx_present(disp,frame,ox,oy); } uint64_t c_pres=(rdtsc()-t2)/N;
+    uint64_t t3=rdtsc(); for(int i=0;i<N;i++){ cvsasx_hash_t h=gfx_evt_append(2,0,(uint16_t)i,(uint16_t)i,(uint16_t)i); s+=h.b[0]; } uint64_t c_evt=(rdtsc()-t3)/N;
+    uint64_t t4=rdtsc(); for(int i=0;i<N;i++){ const void* b; size_t l; cvsasx_store_get(&gfx_store,&fh,&b,&l); cvsasx_hash_t h; cvsasx_blake3(b,l,&h); s+=cvsasx_hash_eq(&h,&fh); } uint64_t c_remat=(rdtsc()-t4)/N;
+    /* OPTIMIZATION (safe, content-addressed): the compositor ALREADY produced this frame's hash (fh), so
+     * present-if-changed compares that known hash to the last-presented hash - NO re-hash - and skips the
+     * blit when they match (the identical frame is already on screen). Present-if-changed vs present-always. */
+    cvsasx_hash_t last=nowh; uint64_t t5=rdtsc(); for(int i=0;i<N;i++){
+        if(!cvsasx_hash_eq(&fh,&last)){ s+=gfx_present(disp,frame,ox,oy); last=fh; } else s+=1; } uint64_t c_dedup=(rdtsc()-t5)/N;
+    (void)s;
+    sputs("GFX-5 rdtsc (QEMU, this run): surface-store="); sdec(c_surf); sputs(" composite-frame(+hash)="); sdec(c_comp);
+    sputs(" present-to-fb(32x16)="); sdec(c_pres); sputs(" input-event-append="); sdec(c_evt); sputs(" re-materialize-by-hash="); sdec(c_remat); sputs(" cyc\n");
+    sputs("GFX-5 OPTIMIZE present hot path (content-addressed skip, hash known from composite): present-always="); sdec(c_pres); sputs(" cyc -> present-if-changed(identical frame)="); sdec(c_dedup);
+    sputs(" cyc (a re-present of an unchanged frame collapses to ONE 32-byte hash compare; correctness = content-addressing)\n");
+
+    int gfxok=gfx1&&gfx2&&gfx3&&gfx4;
+    sputs(gfxok?"GFX -> REMATERIALIZATION GRAPHICS: content-addressed surfaces/frames/events, capability-mediated compositor presents to the cap-bounded framebuffer, out-of-authority REFUSED, past visual state re-materialized by hash OK\n":"GFX -> *** see failures above ***\n");
+    sputs("GFX DISPROVED: ambient screen/input (a surface without its cap is REFUSED, a surface cap can NOT reach the framebuffer); ported compositor (no window manager - a frame IS the hash of its composition, present is capability-gated); frames-not-content-addressed (a frame is a stored object re-derivable+dedup'd by hash); replay-masquerading (the past frame is FETCHED by hash + re-hash-confirmed, nothing re-composited).\n");
+    sputs("GFX SCOPE (honest): single-CPU. DEMONSTRATED - the content-addressed surface/frame/event model, the capability-mediated compositor, anti-amp refusal of out-of-authority access, and by-hash re-materialization of past visual state, all on the REAL Limine framebuffer via the proven anti-amp gate + Cycle 6 display cap. DEFERRED/BOUNDARY - a real on-hardware display (headless QEMU's framebuffer is a linear buffer we write + read back; no real monitor is observed here); live input is event-driven (events here are synthesized, hash-named honestly); alpha/z-order blending beyond side-by-side composition. Live input liveness itself is not a stored object (as Cycle 6 labeled it).\n");
+}
+
 void kmain(void);
 void kmain(void){
     serial_init();
@@ -7877,6 +8074,7 @@ void kmain(void){
     run_dbg();         /* CYCLE 4 REMATERIALIZATION DEBUGGING: DBG1 time-travel by hash (re-hash-confirmed, not replay), DBG2 structural diff (prune by hash), DBG3 honest provenance (external edge said so), DBG4 divergence via DAG query, DBG5 limits ENFORCED (no un-send/no reproduce/no real-time), DBG6 rdtsc */
     run_net();         /* CYCLE 3 NETWORKING (LOOPBACK): NET-1 endpoint=bounded cap (no ambient reach, delegation attenuates), NET-2 messages=content-addressed objects (re-hash integrity + dedup), NET-3 ordering via explicit hash chain + liveness labeled NON-CA, NET-4 end-to-end cap-gated ordered integrity channel, NET-5 real-NIC gap, NET-6 rdtsc */
     run_drv();         /* CYCLE 6 DRIVER FRAMEWORK: DRV1 device-cap (bounded MMIO+IRQ+DMA) via the proven swcap gate + registration/binding (granted ONLY its device, out-of-region REFUSED), DRV2 second driver (PS/2 input, genuinely functions), DRV3 content-addressed framebuffer frame (re-verifiable by hash), DRV4 two drivers coexist + mutual isolation (anti-amp), DRV5 rdtsc */
+    run_gfx();         /* CARMIX-NATIVE REMATERIALIZATION GRAPHICS: GFX1 content-addressed surfaces/frames/input-events, GFX2 capability-mediated compositor presents to the cap-bounded framebuffer, GFX3 anti-amp (out-of-authority surface REFUSED, no ambient screen), GFX4 re-materialize past visual state by hash (re-hash-confirmed, not replay), GFX5 rdtsc + content-addressed present skip */
     run_loader();      /* PROCESS LOADER: L0 ELF as a stored object + parse, L1 materialize segments by hash (W^X), L2 enter+run the loaded ELF, L3 load-time authority ceiling, L4 two procs share code by hash */
     conc_run();        /* CONCURRENT MULTI-PROCESS SCHEDULING: C0 two ring-3 procs timer-preempted, C1 per-process ceilings, C2 deschedule->dematerialize->rematerialize, C3 measured policy-cost */
     run_permem();      /* PER-PROCESS MEMORY MANAGEMENT: PM0 extend-heap+demand-zero+bump alloc, PM1 authority-bounded, PM2 dematerialize-idle, PM3 cross-process dedup-by-hash+COW, PM4 U3 hot-page exclusion */
