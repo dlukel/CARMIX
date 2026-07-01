@@ -8432,6 +8432,84 @@ static void run_cv(void){
     sputs("=== CV-CORE complete ===\n");
 }
 
+/* ===========================================================================
+ * CV8 (CV-DRCC, STAGE 2): the FIRST measured exercise of the multi-core DRCC
+ * theory on the two REAL cores. A data-race-free workload (each core mutates
+ * a DISJOINT slot, concurrently, across both cores) canonicalizes - with
+ * run_cv's own cv_canon over the reachable graph - to ONE identical name every
+ * run. A racy control (both cores race the SAME slot unlocked) DIVERGES to
+ * many names. REUSE ONLY: u3_drf + the ap_kick/ap_wait cross-core dispatch
+ * (the SAME real 2-core path U-3/CU-4 use), cv_canon/cv_new/cv_reach, gc_rc,
+ * cvsasx_blake3/hash_eq. Nothing new invented; no proven-core file touched.
+ * PLACEMENT: called from kmain in the LIVE-AP window (after run_cu, before
+ * run_u3u4 parks the AP), the only window where a second core actually runs.
+ * SCOPE: VALID FOR THESE EXERCISED WORKLOADS AND SCHEDULES ONLY, not a
+ * universal proof; reachable-state STRUCTURAL (not observational) equivalence.
+ * ===========================================================================*/
+static void run_cv8(void){
+    sputs("\n=== CV8 (CV-DRCC): concurrent convergence on TWO REAL cores - DRF -> ONE canonical name, racy -> DIVERGES ===\n");
+    int bsp=lapic_index(g_bsp_lapic), ap=g_ap_idx;
+    if(g_ncpu<2 || g_ap_shutdown || !percpu[ap].up){
+        sputs("CV8 NOT RUN: second core not live in this window (needs SMP + the AP worker loop up) -> STOP, CV-DRCC cannot be claimed\n");
+        return;
+    }
+    cv_store_once();
+    uint32_t PL=(uint32_t)CVSASX_PERM_LOAD;
+    /* one reusable 3-node graph: root -> {slot0-leaf, slot1-leaf}. Each run overwrites the
+     * leaf DATA with the final reachable slot bytes and re-canonicalizes (cv_pool untouched
+     * by run_cv, which runs later; only 3 nodes consumed). */
+    int root=cv_new("cv8-root",PL,64,0,CV_DOM_1);
+    int s0=cv_new("cv8-slot0",PL,32,0,CV_DOM_1);
+    int s1=cv_new("cv8-slot1",PL,32,0,CV_DOM_1);
+    cv_link(root,s0); cv_link(root,s1);
+
+    const int N=12;                                  /* N >= 10 */
+    cvsasx_hash_t drf_set[16]; int drf_n=0; uint64_t drf_canon_cyc=0;
+    cvsasx_hash_t racy_set[16]; int racy_n=0; uint64_t racy_canon_cyc=0;
+
+    for(int mode=0;mode<2;mode++){                   /* 0 = DRF (disjoint), 1 = racy (shared, unsynchronized) */
+        for(int run=0;run<N;run++){
+            for(int s=0;s<2;s++) for(int k=0;k<32;k++) u3_slot[s][k]=0;
+            /* the multi-process workload: AP + BSP run u3_drf CONCURRENTLY on both real cores. */
+            u3_racy=mode; u3_dr_go=0; int gg=g_ap_gen; ap_kick(u3_drf); u3_dr_go=1; u3_drf(bsp); ap_wait(gg);
+            /* load the FINAL REACHABLE state into the graph, then canonicalize with run_cv's form. */
+            for(int k=0;k<32;k++){ cv_pool[s0].data[k]=u3_slot[0][k]; cv_pool[s1].data[k]=u3_slot[1][k]; }
+            cv_pool[s0].dlen=32; cv_pool[s1].dlen=32;
+            cv_reach(root); cv_reach(s0); cv_reach(s1);   /* reachable via the committed gc_rc oracle */
+            uint64_t t=rdtsc(); cvsasx_hash_t h=cv_canon(root); uint64_t cyc=rdtsc()-t;
+            cvsasx_hash_t*set= mode? racy_set : drf_set; int*n= mode? &racy_n : &drf_n;
+            if(mode) racy_canon_cyc+=cyc; else drf_canon_cyc+=cyc;
+            int seen=0; for(int j=0;j<*n;j++) if(cvsasx_hash_eq(&set[j],&h)) seen=1;
+            if(!seen && *n<16) set[(*n)++]=h;
+        }
+    }
+
+    /* full N-run hash SETS (observed truth). */
+    sputs("CV8 DRF  workload (each core mutates its OWN disjoint slot, concurrent on 2 cores), N="); sdec((uint64_t)N);
+    sputs(" runs -> distinct canonical names="); sdec((uint64_t)drf_n); sputc('\n');
+    for(int j=0;j<drf_n;j++){ sputs("CV8   DRF  set["); sdec((uint64_t)j); sputs("]="); sputs(hx(drf_set[j].b,16)); sputc('\n'); }
+    sputs("CV8 RACY workload (both cores race the SAME slot UNLOCKED - the SMP lost-update proof), N="); sdec((uint64_t)N);
+    sputs(" runs -> distinct canonical names="); sdec((uint64_t)racy_n); sputc('\n');
+    for(int j=0;j<racy_n;j++){ sputs("CV8   RACY set["); sdec((uint64_t)j); sputs("]="); sputs(hx(racy_set[j].b,16)); sputc('\n'); }
+
+    /* MEASURE (rdtsc this run): per-run canonicalization cost. */
+    sputs("CV8 MEASURE (rdtsc this run): per-run canonicalization DRF="); sdec(drf_canon_cyc/(uint64_t)N);
+    sputs(" cyc  racy="); sdec(racy_canon_cyc/(uint64_t)N); sputs(" cyc (final reachable graph, 3 nodes)\n");
+
+    int drf_converged=(drf_n==1), racy_diverged=(racy_n>1);
+    if(!racy_diverged){
+        sputs("CV8 -> *** RACY CONTROL DID NOT DIVERGE: the harness is NOT exercising real concurrency; CV-DRCC CANNOT be claimed -> STOP ***\n");
+        return;
+    }
+    if(!drf_converged){
+        sputs("CV8 -> *** DRF WORKLOAD DID NOT CONVERGE TO ONE NAME: reachable-state convergence FAILED -> STOP ***\n");
+        return;
+    }
+    sputs("CV8 -> DRF converges to ONE canonical name across all "); sdec((uint64_t)N);
+    sputs(" runs; the racy control DIVERGES ("); sdec((uint64_t)racy_n); sputs(" names) -> real 2-core concurrency confirmed OK\n");
+    sputs("CV8 SCOPE: FIRST measured exercise of the multi-core DRCC theory, VALID FOR THESE EXERCISED WORKLOADS AND SCHEDULES ONLY - not a universal proof. Reachable-state STRUCTURAL equivalence (authority IN the name), NOT observational. Real 2-core MTTCG via ap_kick/ap_wait.\n");
+}
+
 void kmain(void);
 void kmain(void){
     g_boot_tsc=rdtsc();   /* INT: earliest measurable point, for boot-to-desktop */
@@ -8478,6 +8556,7 @@ void kmain(void){
      * before the legacy PIC/timer) so the single-CPU stages below run unchanged. */
     run_smp();
     run_cu();     /* CYCLE 5: core userland completion - runs while the AP worker loop is live (before run_u3u4 parks it), reusing U-0..U-4 + FS + GC + the cross-core dispatch */
+    run_cv8();    /* CV8 (CV-DRCC STAGE 2): DRF converges / racy diverges on the two REAL cores - MUST run in this live-AP window (before run_u3u4 parks the AP) */
     run_u3u4();   /* U-3: concurrency across cores + DRCC first exercise; U-4: Merkle-DAG namespace + delegation attenuation chain */
 
     /* DURABLE PERSISTENCE (S2-S7): runs each boot; persists on a fresh disk, revives on a

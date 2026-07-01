@@ -112,3 +112,81 @@ Reachable-state structural equivalence only. Observational equivalence is undeci
 permanently out of scope. Single machine, single CPU. Stage 2 (CV8, concurrent convergence on the
 two real cores, the first measured exercise of the multi-core DRCC theory) is gated on committed
 U-3, which is present (7689692), and follows on top of this committed Stage 1.
+
+# CV8 - CV-DRCC (Stage 2): first measured exercise of the multi-core DRCC theory
+
+Stage 2 runs run_cv's SAME canonical form (cv_canon) over the reachable graph left by a workload
+that runs on BOTH real cores. It is placed in kmain in the LIVE-AP window - after run_cu, before
+run_u3u4 parks the AP - the only window where a second core actually executes. The cross-core
+dispatch is the committed real 2-core path (ap_kick / ap_wait + u3_drf, the same U-3/CU-4 use),
+under MTTCG (-accel tcg,thread=multi, -smp 2). Nothing new invented; no proven-core file touched
+(kernel/kernel.c only). AP startup latency this run = 434204 cyc (rdtsc), second core confirmed
+executing.
+
+## The two workloads (real concurrency, one converges, one diverges)
+
+- DRF: each core writes ITS OWN disjoint 32-byte slot (u3_drf, racy=0), concurrently across the
+  two cores - no shared mutable state, no data race. The final reachable state (both slots) is
+  loaded into a 3-node graph (root -> slot0-leaf, slot1-leaf), the leaves are marked reachable via
+  the committed gc_rc oracle, and the graph is canonicalized with cv_canon.
+- Racy control: both cores race the SAME slot UNLOCKED (u3_drf, racy=1) - the SMP lost-update
+  proof. The torn slot is canonicalized the same way.
+- Each workload is repeated N=12 times (N >= 10). The full N-run canonical-hash SET is printed for
+  both.
+
+## What was observed (real serial, this run)
+
+```
+CV8 DRF  workload (each core mutates its OWN disjoint slot, concurrent on 2 cores), N=12 runs -> distinct canonical names=1
+CV8   DRF  set[0]=fe59feafdda3f9141125bec12c5cb43f
+CV8 RACY workload (both cores race the SAME slot UNLOCKED - the SMP lost-update proof), N=12 runs -> distinct canonical names=12
+CV8   RACY set[0]=b9c490b37594c3a64d2a5ad1ee4b7aa0
+CV8   RACY set[1]=2b7f8fdbe931e9767e8d0e65468a5d00
+CV8   RACY set[2]=db8baac0eaf7b4382e8531582f3dc404
+CV8   RACY set[3]=4abc7888fb628f8ea7a57b6b55d6140a
+CV8   RACY set[4]=ce2db9986e2854611584af3dad236a86
+CV8   RACY set[5]=b09c6d37d3727a3b16cd89f8bf7b7ba3
+CV8   RACY set[6]=431015a58294c6ae2148d7b9ad0fcf17
+CV8   RACY set[7]=cb19aec618734c625a4349954634f975
+CV8   RACY set[8]=f605e108adcd14cf5122f9ea08bf6cd0
+CV8   RACY set[9]=c629b081e59df05d9e4c01db94ac98b8
+CV8   RACY set[10]=0def5b0741cd0e06e9302d4e399bcec3
+CV8   RACY set[11]=da57fe38dfde981d5db708ef480ab974
+CV8 MEASURE (rdtsc this run): per-run canonicalization DRF=285383 cyc  racy=273623 cyc (final reachable graph, 3 nodes)
+CV8 -> DRF converges to ONE canonical name across all 12 runs; the racy control DIVERGES (12 names) -> real 2-core concurrency confirmed OK
+```
+
+- The DRF workload converged to ONE canonical name across all 12 runs (hash set size 1). The whole
+  N-run DRF hash set is exactly {fe59feafdda3f9141125bec12c5cb43f}.
+- The racy control DIVERGED to 12 distinct canonical names (hash set size 12, every run different).
+  The divergence is what proves the harness is exercising REAL cross-core concurrency: a single
+  core could not tear the shared slot into 12 different results. Had the racy control not diverged,
+  CV8 would have been reported failed (harness not real concurrency) and nothing committed.
+
+## Measurement (rdtsc, this run)
+
+```
+CV8 per-run canonicalization DRF = 285383 cyc  racy = 273623 cyc  (3-node reachable graph)
+AP startup latency = 434204 cyc
+```
+
+Per-run canonicalization is measured on the final reachable graph each run; DRF and racy cost the
+same order (the racy torn slot is the same graph shape), so the divergence is purely in the CONTENT
+the two cores raced to, not in canonicalization cost.
+
+## Regression
+
+The full single boot re-ran green with exactly one fail-marker, the accepted pre-existing PM0
+stall (INT-1 self-check confirms "exactly ONE accepted fail-marker line (the PM0 stall) OK"). The
+M0 pool-exhaustion negative and the F2 materialize-verify negative reached their fail-closed lines.
+U-3 (U3-1, U3-3, U-3 COMPLETE) and CV-CORE (Stage 1, CV1-CV7) still pass unchanged, and gc_rc
+stayed at 63/256 after all stages.
+
+## DRCC scope (D9, non-negotiable)
+
+This is the FIRST measured exercise of the multi-core DRCC theory. It is VALID FOR THE EXERCISED
+WORKLOADS AND SCHEDULES ONLY - not a universal proof. It shows, on the two real cores under this
+run's schedules, that a data-race-free workload reaches ONE content-addressed reachable state
+(convergence) while a genuinely racy workload does not (divergence). The claim remains
+reachable-state STRUCTURAL equivalence with authority in the name, NEVER observational/behavioral
+equivalence (that boundary is CV6, undecidable, permanently out of scope).
