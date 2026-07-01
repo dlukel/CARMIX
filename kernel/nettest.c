@@ -77,6 +77,7 @@ static char hexbuf[65];
 static const char* hx(const uint8_t*b,int n){ const char*d="0123456789abcdef"; int j=0; for(int i=0;i<n;i++){ hexbuf[j++]=d[b[i]>>4]; hexbuf[j++]=d[b[i]&15]; } hexbuf[j]=0; return hexbuf; }
 static inline void hcf(void){ for(;;) __asm__ volatile("cli; hlt"); }
 static inline void cpu_pause(void){ __asm__ volatile("pause"); }
+static inline uint64_t rdtsc(void){ uint32_t a,d; __asm__ volatile("rdtsc":"=a"(a),"=d"(d)); return ((uint64_t)d<<32)|a; }
 
 static uint64_t hhdm_off;
 static inline void* P2V(uint64_t p){ return (void*)(p + hhdm_off); }
@@ -514,6 +515,50 @@ static inline volatile uint32_t* k_verd(void){ return (volatile uint32_t*)(SHM+K
 #define K_LIFE 0u
 #define K_MIGR 1u
 
+/* ===========================================================================
+ * STEP 13 - AUTHORITY-SET MIGRATION (DM1-DM8). Step 10 signs a single authority
+ * ceiling. This generalizes to a process's whole AUTHORITY SET: N capabilities,
+ * each an object hash + rights + length, canonically serialized (sorted by hash,
+ * so the bytes are layout-independent), signed by A with the EXISTING Ed25519, and
+ * verified by B against A's pre-shared key. On success B re-mints EACH cap bounded
+ * by the SAME unmodified swcap anti-amp gate (the distributed analogue of the US3
+ * re-mint), minting NOTHING beyond the verified set (C_B' = C_A). Any post-sign
+ * change to the set (a widened or added cap = an amplification attempt), a wrong
+ * signing key, or a corrupt signature breaks the Ed25519 check, so B rejects
+ * fail-closed and re-mints nothing. TRUSTED-CLUSTER model: B trusts A's key and
+ * assumes A is honest about the set it signs. Reuses crypto_sign/crypto_sign_open,
+ * the swcap gate, and the ivshmem transfer. See kernel/MIGRATION_AUTHSET_LOG.md. */
+#define DM_NCAP       3u
+#define DM_CAP_BYTES  44u                          /* 32 hash + 4 rights + 8 length (LE) */
+#define DM_SET_BYTES  (DM_NCAP*DM_CAP_BYTES)       /* 132 */
+#define DM_SIGNED_LEN (64u + DM_SET_BYTES)         /* tweetnacl sm = sig(64) || set(132) = 196 */
+typedef struct { uint8_t hash[32]; uint32_t rights; uint64_t length; } dm_cap_t;
+#define DM_MSG_OFF   0x6000                         /* signed set message */
+#define DM_ROOT_OFF  0x6100                         /* served root (32) */
+#define DM_CASE_OFF  0x6120
+#define DM_SEQA_OFF  0x6128
+#define DM_SEQB_OFF  0x6130
+#define DM_VERD_OFF  0x6138
+#define DM_NREM_OFF  0x6140                         /* B reports how many caps it re-minted (|C_B'|) */
+static inline volatile uint32_t* dm_case(void){ return (volatile uint32_t*)(SHM+DM_CASE_OFF); }
+static inline volatile uint64_t* dm_seqA(void){ return (volatile uint64_t*)(SHM+DM_SEQA_OFF); }
+static inline volatile uint64_t* dm_seqB(void){ return (volatile uint64_t*)(SHM+DM_SEQB_OFF); }
+static inline volatile uint32_t* dm_verd(void){ return (volatile uint32_t*)(SHM+DM_VERD_OFF); }
+static inline volatile uint32_t* dm_nrem(void){ return (volatile uint32_t*)(SHM+DM_NREM_OFF); }
+/* order-compare two 32-byte hashes (canonical sort key). */
+static int dm_hcmp(const uint8_t a[32], const uint8_t b[32]){ for(int i=0;i<32;i++){ if(a[i]<b[i]) return -1; if(a[i]>b[i]) return 1; } return 0; }
+/* canonical serialization (DM1): sort the caps by hash, pack each hash||rights(LE)||length(LE).
+ * Same set -> same bytes, independent of the caller's ordering. */
+static void dm_set_pack(const dm_cap_t* in, uint32_t n, uint8_t out[DM_SET_BYTES]){
+    dm_cap_t s[DM_NCAP]; for(uint32_t i=0;i<n;i++) s[i]=in[i];
+    for(uint32_t i=0;i<n;i++) for(uint32_t j=0;j+1<n-i;j++) if(dm_hcmp(s[j].hash,s[j+1].hash)>0){ dm_cap_t t=s[j]; s[j]=s[j+1]; s[j+1]=t; }
+    for(uint32_t i=0;i<DM_SET_BYTES;i++) out[i]=0;
+    for(uint32_t k=0;k<n;k++){ uint32_t b=k*DM_CAP_BYTES;
+        for(int i=0;i<32;i++) out[b+i]=s[k].hash[i];
+        for(int i=0;i<4;i++) out[b+32+i]=(uint8_t)(s[k].rights>>(8*i));
+        for(int i=0;i<8;i++) out[b+36+i]=(uint8_t)(s[k].length>>(8*i)); }
+}
+
 /* distinct reject reasons (each adversary fails by its OWN check - E2 rigor).
  * Step 10 verdicts V_ACCEPT..V_ANTIAMP; Step 12 adds the 4 key-lifecycle verdicts. */
 enum { V_ACCEPT=0, V_BAD_SIG=1, V_ROOT_MISMATCH=2, V_WRONG_SCOPE=3, V_REPLAY_OR_EXPIRED=4, V_ANTIAMP=5,
@@ -690,6 +735,8 @@ static void d_source(const cvsasx_oid_t *base_root);   /* fwd */
 static void d_dest(const cvsasx_oid_t *base_root);
 static void k_source(const cvsasx_oid_t *base_root);   /* Step 12 fwd */
 static void k_dest(const cvsasx_oid_t *base_root);
+static void dm_source(const cvsasx_oid_t *base_root);  /* Step 13 fwd (authority-set migration) */
+static void dm_dest(const cvsasx_oid_t *base_root);
 
 /* ===========================================================================
  * MAIN - role select then run the stages.
@@ -755,6 +802,7 @@ static void run_source(void){
     d_source(&root);
     /* ===== STEP 12 K: key-lifecycle suite (A side). Bound to the cold-sync root. */
     k_source(&root);
+    dm_source(&root);   /* Step 13: authority-SET migration, AFTER k (matches dm_dest ordering on B) */
     sputs("##### A DONE - all stages observed #####\n");
 }
 
@@ -851,6 +899,8 @@ static void run_dest(void){
     d_dest(&b2_root);
     /* ===== STEP 12 K: key-lifecycle suite (B side). Bound to the same root. */
     k_dest(&b2_root);
+    /* ===== STEP 13 DM: authority-SET migration (B side). Bound to the same root. */
+    dm_dest(&b2_root);
     sputs("##### B DONE - all stages observed #####\n");
 }
 
@@ -1038,6 +1088,108 @@ static void k_dest(const cvsasx_oid_t *base_root){
     sputs("\n  -> "); sputs(pass?
         "KEY LIFECYCLE CLOSED: distribution+rotation+revocation enforced; anti-amp backstop intact\n":
         "*** FAIL - key-lifecycle gate not sound ***\n");
+}
+
+/* per-cap bounded re-mint for the authority SET: mint a cap of cap_len as a SUB-range
+ * of the source object (kept at its true length SRC_CEILING, so the region is well-formed),
+ * bounded by the UNMODIFIED swcap gate. cap_len <= SRC_CEILING ACCEPTS; a cap_len beyond
+ * the source authority REJECTS (BAD_BOUNDS = the anti-amp backstop). Distinct from
+ * antiamp_remint (which tests the whole-object ceiling); this tests a set member's length. */
+static uint32_t dm_remint(uint64_t cap_len, const cvsasx_oid_t *served_root){
+    cvsasx_swcap_t croot={ (uint64_t)(uintptr_t)remint_arena, SRC_CEILING,
+                           CVSASX_PERM_LOAD|CVSASX_PERM_STORE|CVSASX_PERM_GLOBAL, 1 };
+    cvsasx_sw_custodian_t cust; cvsasx_sw_custodian_init(&cust, croot);
+    cvsasx_sw_region_t reg; reg.object_cap=croot; reg.object_base_addr=(uint64_t)(uintptr_t)remint_arena; reg.object_length=SRC_CEILING; /* == object_cap.length (well-formed region) */
+    for(int i=0;i<(int)CVSASX_BLAKE3_LEN;i++) reg.hash[i]=served_root->b[i];
+    cvsasx_referent_t ref; for(int i=0;i<(int)CVSASX_BLAKE3_LEN;i++) ref.hash[i]=served_root->b[i];
+    ref.object_base_addr=(uint64_t)(uintptr_t)remint_arena; ref.object_length=SRC_CEILING;
+    cvsasx_pir_t pir; cvsasx_sw_cap_strip(croot,&ref,&pir);
+    pir.length = cap_len;              /* request THIS cap's sub-length; the gate bounds it by the source */
+    cvsasx_swcap_t out; cvsasx_status_t st = cvsasx_sw_cap_remint(&cust,&pir,&reg,&out);
+    return (st==CVSASX_OK && out.valid) ? V_ACCEPT : V_ANTIAMP;
+}
+
+/* A side: build the authority SET, sign it canonically, drive the 4 cases. */
+static void dm_source(const cvsasx_oid_t *base_root){
+    sputs("\n##### STEP 13: AUTHORITY-SET MIGRATION (canonical set, signed, bounded re-mint) #####\n");
+    dm_cap_t set[DM_NCAP];
+    for(int i=0;i<32;i++){ set[0].hash[i]=base_root->b[i]; set[1].hash[i]=base_root->b[i]^0x11; set[2].hash[i]=base_root->b[i]^0x22; }
+    set[0].rights=CVSASX_PERM_LOAD;                    set[0].length=128;
+    set[1].rights=CVSASX_PERM_LOAD|CVSASX_PERM_STORE;  set[1].length=64;
+    set[2].rights=CVSASX_PERM_LOAD;                    set[2].length=256;   /* all <= SRC_CEILING: within source authority */
+    /* DM1: canonical serialization - the set and a SHUFFLED copy pack to identical bytes. */
+    uint8_t flatA[DM_SET_BYTES], flatB[DM_SET_BYTES];
+    dm_set_pack(set, DM_NCAP, flatA);
+    dm_cap_t shuf[DM_NCAP]={set[2],set[0],set[1]}; dm_set_pack(shuf, DM_NCAP, flatB);
+    int canon=1; for(uint32_t i=0;i<DM_SET_BYTES;i++) if(flatA[i]!=flatB[i]){canon=0;break;}
+    sputs("DM1 [A] canonical authority-set serialization: 3 caps, "); sdec(DM_SET_BYTES);
+    sputs(" bytes; reserialize (incl a shuffled order) is byte-identical="); sputs(canon?"y":"n"); sputc('\n');
+    /* DM8 measure: serialize + Ed25519 sign. */
+    uint64_t t0=rdtsc(); for(int i=0;i<64;i++) dm_set_pack(set,DM_NCAP,flatA); uint64_t ser=(rdtsc()-t0)/64;
+    { uint8_t sm[DM_SIGNED_LEN]; unsigned long long sl=0; uint8_t sk[64]; for(int j=0;j<64;j++) sk[j]=SRC_SK[j];
+      uint64_t t1=rdtsc(); crypto_sign(sm,&sl,flatA,DM_SET_BYTES,sk); uint64_t sg=rdtsc()-t1;   /* single shot: Ed25519 is ~tens of Mcyc, well above rdtsc noise */
+      sputs("DM8 [A] rdtsc: serialize="); sdec(ser); sputs(" cyc; Ed25519 sign="); sdec(sg); sputs(" cyc\n"); }
+    /* DM2..DM6: publish each case; B verifies and gates. */
+    static const char* LBL[4]={"DMcase0 LEGIT set (3 caps, in-authority)","DM-adv1 wrong-key sign             ",
+                               "DM-adv2 tampered set (cap widened post-sign = amplify)","DM-adv3 corrupt signature          "};
+    for(uint32_t c=0;c<4;c++){
+        uint8_t flat[DM_SET_BYTES]; dm_set_pack(set,DM_NCAP,flat);
+        uint8_t sk[64]; for(int j=0;j<64;j++) sk[j]=(c==1)?WRONG_SK[j]:SRC_SK[j];
+        uint8_t signed_msg[DM_SIGNED_LEN]; unsigned long long smlen=0;
+        crypto_sign(signed_msg,&smlen,flat,DM_SET_BYTES,sk);           /* DM2: sign the canonical set */
+        if(c==2) signed_msg[64+36] ^= 0x02;   /* widen cap0's length field AFTER signing (amplification attempt) */
+        if(c==3) signed_msg[8]     ^= 0xFF;   /* corrupt the signature */
+        bcopy_to(SHM+DM_MSG_OFF, signed_msg, DM_SIGNED_LEN);
+        bcopy_to(SHM+DM_ROOT_OFF, base_root->b, 32);
+        *dm_case()=c; mfence(); *dm_seqA()=(uint64_t)(c+1); mfence();    /* absolute seq (no toggle race) */
+        if(!wait_seq_ge(dm_seqB(), (uint64_t)(c+1), WAIT_BUDGET)){ sputs("DM [A] TIMEOUT case "); sdec(c); sputc('\n'); hcf(); }
+        sputs("DM [A] "); sputs(LBL[c]); sputs("  -> B verdict: "); sputs(verd_name(*dm_verd()));
+        sputs("  |C_B'|="); sdec(*dm_nrem()); sputc('\n');
+    }
+    sputs("DM [A] authority-set suite complete.\n");
+}
+
+/* B side: verify the signature over the canonical set under A's pre-shared key, and
+ * ONLY on success re-mint each cap bounded by the unmodified swcap gate (mint nothing
+ * beyond the verified set). Any failure rejects fail-closed, re-minting nothing. */
+static void dm_dest(const cvsasx_oid_t *base_root){
+    sputs("\n##### STEP 13: AUTHORITY-SET MIGRATION (verify-before-remint, B side) #####\n");
+    sputs("DM4/DM5 [B] verify Ed25519 over the canonical set under A's pre-shared key, THEN re-mint each cap bounded by the anti-amp gate; nothing minted beyond the verified set\n");
+    static const char* CID[4]={"DMcase0 LEGIT","DM-adv1 wrong-key","DM-adv2 tampered-set","DM-adv3 corrupt-sig"};
+    uint32_t got[4], nrem[4]; uint64_t vcyc=0;
+    for(uint32_t c=0;c<4;c++){
+        if(!wait_seq_ge(dm_seqA(), (uint64_t)(c+1), WAIT_BUDGET)){ sputs("DM [B] TIMEOUT case "); sdec(c); sputc('\n'); hcf(); }
+        uint8_t signed_msg[DM_SIGNED_LEN]; bcopy_from(signed_msg, SHM+DM_MSG_OFF, DM_SIGNED_LEN);
+        uint8_t recovered[DM_SIGNED_LEN]; unsigned long long rlen=0;
+        uint64_t tv=rdtsc();
+        int okc = crypto_sign_open(recovered,&rlen,signed_msg,DM_SIGNED_LEN,SRC_PK);   /* DM4: REAL Ed25519, A's pre-shared key */
+        if(c==0) vcyc=rdtsc()-tv;
+        uint32_t v; uint32_t nr=0;
+        if(okc!=0 || rlen!=DM_SET_BYTES){ v=V_BAD_SIG; }   /* DM6/DM3: fail-closed, re-mint NOTHING */
+        else {
+            v=V_ACCEPT;                                    /* DM5: verified -> bounded re-mint of EACH cap */
+            for(uint32_t k=0;k<DM_NCAP;k++){ uint32_t b=k*DM_CAP_BYTES;
+                uint64_t len=0; for(int i=0;i<8;i++) len|=(uint64_t)recovered[b+36+i]<<(8*i);
+                if(dm_remint(len,base_root)!=V_ACCEPT){ v=V_ANTIAMP; break; }   /* bound each cap by the swcap gate over B's re-verified root */
+                nr++;   /* one local cap re-minted, bounded, for a verified set member (nothing beyond it) */
+            }
+        }
+        got[c]=v; nrem[c]=nr;
+        *dm_nrem()=nr; *dm_verd()=v; mfence(); *dm_seqB()=(uint64_t)(c+1); mfence();   /* absolute seq */
+        sputs("  ["); sputs(CID[c]); sputs("] -> "); sputs(verd_name(v)); sputs("  |C_B'|="); sdec(nr);
+        sputs(c==0?"  (== |C_A|=3, minted nothing beyond the verified set)\n":"  (fail-closed: nothing re-minted)\n");
+    }
+    { uint64_t t=rdtsc(); for(int i=0;i<16;i++) dm_remint(128,base_root); uint64_t rm=(rdtsc()-t)/16;
+      sputs("DM8 [B] rdtsc: Ed25519 verify="); sdec(vcyc); sputs(" cyc; per-cap bounded re-mint="); sdec(rm); sputs(" cyc\n"); }
+    int legit_ok=(got[0]==V_ACCEPT)&&(nrem[0]==DM_NCAP);
+    int adv_rej=(got[1]!=V_ACCEPT)&&(got[2]!=V_ACCEPT)&&(got[3]!=V_ACCEPT)&&(nrem[1]==0)&&(nrem[2]==0)&&(nrem[3]==0);
+    sputs("\n===== DM AUTHORITY-SET TABLE (trusted cluster: C_B' subset-or-equal C_A, B mints nothing) =====\n");
+    sputs("  legit set ACCEPT, C_B'=C_A (3 caps), minted nothing beyond? "); sputs(legit_ok?"y":"n");
+    sputs("   all 3 adversaries (wrong-key, tampered-set, corrupt-sig) REJECTED fail-closed (nothing re-minted)? "); sputs(adv_rej?"y":"n");
+    sputs("\n  -> "); sputs((legit_ok&&adv_rej)?
+        "DISTRIBUTED ANTI-AMPLIFICATION (trusted cluster): a migrant cannot arrive with more authority than A signed; a post-sign amplification breaks the Ed25519 and is rejected\n":
+        "*** FAIL - authority-set gate not sound ***\n");
+    sputs("  DM SCOPE: trusted-cluster (B trusts A's pre-shared key, assumes A honest about the set it signs); NOT the distrusting case (that needs hardware attestation); single-CPU per machine; the two machines are TWO QEMU instances sharing one ivshmem region.\n");
 }
 
 void kmain(void);

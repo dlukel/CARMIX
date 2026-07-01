@@ -68,10 +68,10 @@ LOGA="$HERE/serial_A.log"; LOGB="$HERE/serial_B.log"
 rm -f "$LOGA" "$LOGB"
 
 # A first (claims magic), give it a moment to zero+claim, then B.
-timeout 40 "$QEMU" $QFLAGS $IV -serial "file:$LOGA" >/dev/null 2>&1 &
+timeout 90 "$QEMU" $QFLAGS $IV -serial "file:$LOGA" >/dev/null 2>&1 &
 PA=$!
 sleep 2
-timeout 40 "$QEMU" $QFLAGS $IV -serial "file:$LOGB" >/dev/null 2>&1 &
+timeout 90 "$QEMU" $QFLAGS $IV -serial "file:$LOGB" >/dev/null 2>&1 &
 PB=$!
 
 # host-level proof both attach the same file:
