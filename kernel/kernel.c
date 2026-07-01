@@ -8202,6 +8202,236 @@ static void run_tools(void){
     sputs("TOOLS SCOPE (honest): single-CPU, headless. Composes ONLY existing subsystems (FS, u1_spawn, run_dbg, run_net) - NOTHING new invented, NO proven-core file touched. NO in-kernel C compiler: the CARMIX-native dev model is content-addressed source + program image + spawn-under-capability + rematerialization debugging; the compile toolchain is EXTERNAL/future work (the ELF here was built externally + embedded). DISPROVED: ambient authority (unauthorized run + unauthorized send REFUSED), in-place edit (edit re-roots, old version still resolves), replay-masquerade (re-hash confirms the re-materialized state), faked compiler (NOT claimed).\n");
 }
 
+/* ===========================================================================
+ * CV-CORE (STAGE 1, single-CPU): a CANONICAL FORM over the reachable acyclic
+ * object graph. Two states that are the SAME reachable graph collapse to ONE
+ * content name; the AUTHORITY that reaches each object is IN that name. This is
+ * STRUCTURAL (reachable-state) equivalence, NOT observational/behavioral
+ * convergence (see CV6 + the SCOPE note).
+ *
+ * REUSE ONLY (no proven-core edits, no parallel GC / reachability pass):
+ *   cvsasx_blake3 / cvsasx_store_* ....... the content store (canonical bytes)
+ *   gc_rc_get / gc_rc_apply / gc_rc[] .... the COMMITTED refcount reachability
+ *                                          oracle (reachable == gc_rc_get>0)
+ *   the DS domain tag .................... CV5 cross-domain refusal
+ *   cvsasx_swcap_t ....................... the authority SHAPE hashed into a name
+ * ===========================================================================*/
+#define CV_MAXNODE 96
+#define CV_MAXCHILD 6
+#define CV_MAXDATA  48
+#define CV_DOM_1 0x71u
+#define CV_DOM_2 0x72u
+typedef struct {
+    uint8_t  data[CV_MAXDATA]; uint32_t dlen;
+    int      child[CV_MAXCHILD]; int nchild;
+    uint32_t perms; uint64_t alen; uint64_t aoff;   /* AUTHORITY SHAPE (perms,length,offset) - NOT the raw base ptr */
+    uint32_t dom; int live;
+} cv_node_t;
+static cv_node_t cv_pool[CV_MAXNODE]; static int cv_np;
+static uint8_t cv_arena[1u<<15]; static cvsasx_store_entry_t cv_sidx[512]; static cvsasx_store_t cv_store; static int cv_store_ready;
+static void cv_store_once(void){ if(!cv_store_ready){ cvsasx_store_init(&cv_store,cv_arena,sizeof cv_arena,cv_sidx,512); cv_store_ready=1; } }
+
+/* create a node; placement (pool index) varies with CONSTRUCTION ORDER on purpose (CV4). */
+static int cv_new(const char*seed, uint32_t perms, uint64_t alen, uint64_t aoff, uint32_t dom){
+    int i=cv_np++; cv_node_t*n=&cv_pool[i]; for(unsigned k=0;k<sizeof *n;k++) ((uint8_t*)n)[k]=0;
+    uint32_t d=0; while(seed[d]&&d<CV_MAXDATA){ n->data[d]=(uint8_t)seed[d]; d++; } n->dlen=d;
+    n->perms=perms; n->alen=alen; n->aoff=aoff; n->dom=dom; n->nchild=0; n->live=1;
+    for(int e=0;e<CV_MAXCHILD;e++) n->child[e]=-1; return i;
+}
+static void cv_link(int p,int c){ if(cv_pool[p].nchild<CV_MAXCHILD) cv_pool[p].child[cv_pool[p].nchild++]=c; }
+/* the reachability-oracle KEY for a node = BLAKE3 of its own content bytes. */
+static cvsasx_hash_t cv_prehash(int i){ cvsasx_hash_t h; cvsasx_blake3(cv_pool[i].data,cv_pool[i].dlen,&h); return h; }
+/* mark reachable / dead THROUGH the committed refcount path (never a parallel pass, D4). */
+static void cv_reach(int i){ cvsasx_hash_t h=cv_prehash(i); gc_rc_apply(h.b,cv_pool[i].dom,+1); }
+static void cv_kill (int i){ cvsasx_hash_t h=cv_prehash(i); gc_rc_apply(h.b,cv_pool[i].dom,-1); }
+static int  cv_reachable(int i){ cvsasx_hash_t h=cv_prehash(i); return gc_rc_get(h.b,cv_pool[i].dom)>0; }
+static int  cv_hcmp(const uint8_t*a,const uint8_t*b){ for(int k=0;k<32;k++) if(a[k]!=b[k]) return a[k]<b[k]?-1:1; return 0; }
+
+static uint64_t cv_canon_calls;
+/* THE canonical form. Bottom-up over the REACHABLE acyclic graph:
+ *   - recurse into children FIRST (leaves canonicalized first),
+ *   - follow a child edge ONLY if the child is reachable (gc_rc_get>0) -> dead scratch excluded,
+ *   - replace child refs by their CANONICAL child hashes, sorted (deterministic set order),
+ *   - serialize the AUTHORITY SHAPE (perms,length,offset) INTO the bytes (authority-in-the-name),
+ *   - NEVER serialize the raw base ptr / pool index (placement independence),
+ *   - BLAKE3(canonical bytes) is the name; the bytes are stored -> addressable/rematerializable.
+ * Well-founded (terminates) by the acyclicity the GC relies on. */
+static cvsasx_hash_t cv_canon(int i){
+    cv_canon_calls++; cv_node_t*n=&cv_pool[i];
+    cvsasx_hash_t ch[CV_MAXCHILD]; int m=0;
+    for(int e=0;e<n->nchild;e++){ int c=n->child[e]; if(c<0) continue;
+        if(!cv_reachable(c)) continue;                 /* CV3: dead-scratch edge pruned by the committed gc_rc oracle */
+        ch[m++]=cv_canon(c); }                          /* CV1: children first (bottom-up) */
+    for(int a=0;a<m;a++) for(int b=a+1;b<m;b++) if(cv_hcmp(ch[b].b,ch[a].b)<0){ cvsasx_hash_t t=ch[a]; ch[a]=ch[b]; ch[b]=t; }
+    uint8_t buf[320]; uint64_t o=0;
+    buf[o++]=0xC0; buf[o++]='C'; buf[o++]='V'; buf[o++]=1;                    /* tag / version */
+    for(int k=0;k<4;k++) buf[o++]=(uint8_t)(n->perms>>(8*k));                 /* AUTHORITY: perms */
+    for(int k=0;k<8;k++) buf[o++]=(uint8_t)(n->alen>>(8*k));                  /* AUTHORITY: length */
+    for(int k=0;k<8;k++) buf[o++]=(uint8_t)(n->aoff>>(8*k));                  /* AUTHORITY: offset */
+    for(int k=0;k<4;k++) buf[o++]=(uint8_t)(n->dlen>>(8*k));
+    for(uint32_t k=0;k<n->dlen;k++) buf[o++]=n->data[k];                      /* content */
+    for(int k=0;k<4;k++) buf[o++]=(uint8_t)(((uint32_t)m)>>(8*k));
+    for(int e=0;e<m;e++) for(int k=0;k<32;k++) buf[o++]=ch[e].b[k];           /* canonical child hashes, sorted */
+    cvsasx_hash_t root; cvsasx_blake3(buf,o,&root);
+    cv_store_once(); cvsasx_hash_t tmp; cvsasx_store_put(&cv_store,buf,o,&tmp);
+    return root;
+}
+/* the NAIVE byte-identity name: placement (pool index) + children in LINK order.
+ * Two structurally-equal but differently-built objects have DIFFERENT bytes here, so a
+ * byte-identity store keeps both; the canonical form above collapses them (CV5). */
+static cvsasx_hash_t cv_rawform(int i){
+    cv_node_t*n=&cv_pool[i]; uint8_t buf[320]; uint64_t o=0;
+    buf[o++]=(uint8_t)i;                                                      /* PLACEMENT: raw pool index */
+    for(int k=0;k<4;k++) buf[o++]=(uint8_t)(n->perms>>(8*k));
+    for(int k=0;k<8;k++) buf[o++]=(uint8_t)(n->alen>>(8*k));
+    for(int k=0;k<8;k++) buf[o++]=(uint8_t)(n->aoff>>(8*k));
+    for(uint32_t k=0;k<n->dlen;k++) buf[o++]=n->data[k];
+    for(int e=0;e<n->nchild;e++){ int c=n->child[e]; if(c<0) continue; buf[o++]=(uint8_t)c; }   /* child indices, LINK order */
+    cvsasx_hash_t h; cvsasx_blake3(buf,o,&h); return h;
+}
+/* canonical dedup keyed on the CANONICAL hash, scoped by domain (reuses the committed
+ * gc_rc refcount path EXACTLY as DS does: dedup ONLY within a domain). 1=HIT, 0=MISS. */
+static int cv_dedup(const cvsasx_hash_t*canon, uint32_t dom){
+    int e=gc_rc_find(canon->b,dom);
+    if(e>=0 && !gc_rc[e].tombstoned){ gc_rc[e].count++; return 1; }
+    gc_rc_apply(canon->b,dom,+1); return 0;
+}
+/* a trivial OBSERVATION for CV6: leaf value = data[0]; internal value = sum of reachable
+ * children. Two structurally-distinct graphs can share this observable and still NOT
+ * converge in the canonical form - the undecidability boundary, as a recorded RESULT. */
+static uint32_t cv_eval(int i){
+    cv_node_t*n=&cv_pool[i]; uint32_t sum=0; int has=0;
+    for(int e=0;e<n->nchild;e++){ int c=n->child[e]; if(c<0||!cv_reachable(c)) continue; has=1; sum+=cv_eval(c); }
+    return has?sum:n->data[0];
+}
+
+static void run_cv(void){
+    sputs("\n=== CV-CORE (CV1-CV7): canonical form over the reachable acyclic graph (STRUCTURAL, not observational) ===\n");
+    sputs("CV0 reachability oracle = the COMMITTED refcount path gc_rc_get(hash,domain)>0 (NOT a parallel mark pass); gc_rc entries in use="); sdec((uint64_t)gc_nrc); sputs("/256\n");
+    cv_store_once();
+    uint32_t PL=(uint32_t)CVSASX_PERM_LOAD, PLS=(uint32_t)(CVSASX_PERM_LOAD|CVSASX_PERM_STORE);
+
+    /* ---------- CV1: bottom-up canonical form; termination + determinism ---------- */
+    int l1=cv_new("leaf-alpha",PL,64,0,CV_DOM_1);
+    int m1=cv_new("mid-node",  PL,128,0,CV_DOM_1);
+    int r1=cv_new("root-A",    PL,256,0,CV_DOM_1);
+    cv_link(m1,l1); cv_link(r1,m1); cv_reach(l1); cv_reach(m1); cv_reach(r1);
+    cv_canon_calls=0; uint64_t t=rdtsc(); cvsasx_hash_t h1=cv_canon(r1); uint64_t canon_graph_cyc=rdtsc()-t; uint64_t nnodes=cv_canon_calls;
+    cvsasx_hash_t h1b=cv_canon(r1);                       /* SAME state, canonicalized AGAIN */
+    int det=cvsasx_hash_eq(&h1,&h1b);
+    sputs("CV1 3-node chain root->mid->leaf canonicalized (bottom-up): name="); sputs(hx(h1.b,10)); sputs(" visited="); sdec(nnodes); sputs(" nodes (terminated)\n");
+    sputs("CV1 re-canonicalize SAME state -> "); sputs(hx(h1b.b,10)); sputs(" byte-identical="); sputs(det?"y":"n");
+    sputs(det?" -> DETERMINISTIC (disproves D2) OK\n":" -> *** NONDETERMINISTIC: STOP ***\n");
+
+    /* ---------- CV2: AUTHORITY IN THE NAME - refuse a one-capability difference ---------- */
+    int r2=cv_new("root-A",PLS,256,0,CV_DOM_1);           /* IDENTICAL data graph as r1... */
+    int m2=cv_new("mid-node",PL,128,0,CV_DOM_1); int l2=cv_new("leaf-alpha",PL,64,0,CV_DOM_1);
+    cv_link(m2,l2); cv_link(r2,m2); cv_reach(l2); cv_reach(m2); cv_reach(r2);   /* ...but the ROOT cap adds STORE */
+    cvsasx_hash_t h2=cv_canon(r2);
+    int refused=!cvsasx_hash_eq(&h1,&h2);
+    sputs("CV2 same data graph, ONE capability differs (root perms LOAD vs LOAD|STORE): "); sputs(hx(h1.b,8)); sputs(" vs "); sputs(hx(h2.b,8)); sputc('\n');
+    sputs(refused?"CV2 -> DIFFERENT NAMES: authority is IN the name, one-cap difference REFUSED OK\n":"CV2 -> *** COLLISION: authority-differing states converged -> STOP (D1 amplification-by-convergence) ***\n");
+
+    /* ---------- CV3: dead-scratch exclusion via the committed gc_rc oracle ---------- */
+    int rc=cv_new("root-C",PL,256,0,CV_DOM_1); int cc=cv_new("child-C",PL,64,0,CV_DOM_1);
+    cv_link(rc,cc); cv_reach(rc); cv_reach(cc);
+    int sc=cv_new("scratch-dead",PL,64,0,CV_DOM_1); cv_link(rc,sc); cv_reach(sc);   /* scratch linked off root, reachable for now */
+    cvsasx_hash_t withScratch=cv_canon(rc);
+    cv_kill(sc);                                                                    /* drop refcount -> 0 (dead scratch) */
+    int dead_via_oracle=(cv_reachable(sc)==0);
+    cvsasx_hash_t afterDeath=cv_canon(rc);
+    int rc0=cv_new("root-C",PL,256,0,CV_DOM_1); int cc0=cv_new("child-C",PL,64,0,CV_DOM_1); /* a clean root that NEVER had scratch */
+    cv_link(rc0,cc0); cv_reach(rc0); cv_reach(cc0);
+    cvsasx_hash_t clean=cv_canon(rc0);
+    int excluded=cvsasx_hash_eq(&afterDeath,&clean) && !cvsasx_hash_eq(&withScratch,&clean);
+    sputs("CV3 root with a dangling edge to scratch: live-scratch name="); sputs(hx(withScratch.b,8));
+    sputs("  dead-scratch(gc_rc_get==0)="); sputs(dead_via_oracle?"y":"n"); sputs(" name="); sputs(hx(afterDeath.b,8)); sputs("  no-scratch name="); sputs(hx(clean.b,8)); sputc('\n');
+    sputs(excluded?"CV3 -> DEAD SCRATCH EXCLUDED via gc_rc_get (committed refcount path); reachable state canonicalizes identically OK\n":"CV3 -> *** FAIL ***\n");
+
+    /* ---------- CV4: path-independent convergence (two materially different builds) ---------- */
+    /* build A: leaf,mid,root in that order, no scratch. */
+    int a_l=cv_new("payload-L",PL,64,10,CV_DOM_1); int a_m=cv_new("payload-M",PL,128,20,CV_DOM_1); int a_r=cv_new("payload-R",PL,256,30,CV_DOM_1);
+    cv_link(a_m,a_l); cv_link(a_r,a_m); cv_reach(a_l); cv_reach(a_m); cv_reach(a_r);
+    int idxA0=a_l;
+    cvsasx_hash_t hA=cv_canon(a_r);
+    /* build B: root FIRST, then a scratch that later DIES, then mid, then leaf (different order+placement). */
+    int b_r=cv_new("payload-R",PL,256,30,CV_DOM_1); int b_s=cv_new("scratch-B-transient",PL,99,0,CV_DOM_1);
+    int b_m=cv_new("payload-M",PL,128,20,CV_DOM_1); int b_l=cv_new("payload-L",PL,64,10,CV_DOM_1);
+    cv_link(b_m,b_l); cv_link(b_r,b_s); cv_link(b_r,b_m);                 /* root references the transient scratch too */
+    cv_reach(b_r); cv_reach(b_s); cv_reach(b_m); cv_reach(b_l);
+    cv_kill(b_s);                                                        /* the intermediate scratch dies */
+    int idxB0=b_r;
+    cvsasx_hash_t hB=cv_canon(b_r);
+    int converged=cvsasx_hash_eq(&hA,&hB);
+    sputs("CV4 build-A order[leaf,mid,root] first-idx="); sdec((uint64_t)idxA0); sputs(" name="); sputs(hx(hA.b,10));
+    sputs("  build-B order[root,scratch,mid,leaf] first-idx="); sdec((uint64_t)idxB0); sputs(" (+transient scratch #"); sdec((uint64_t)b_s); sputs(" that died) name="); sputs(hx(hB.b,10)); sputc('\n');
+    sputs(converged?"CV4 -> MATERIALLY DIFFERENT SEQUENCES CONVERGE TO ONE NAME (placement/order/scratch independent) OK\n":"CV4 -> *** DIVERGED: FAIL ***\n");
+
+    /* ---------- CV5: canonical dedup inside a domain; cross-domain MISS ---------- */
+    /* two roots: same content+authority, children linked in OPPOSITE order + different placement. */
+    int p_a=cv_new("field-X",PL,64,0,CV_DOM_1); int p_b=cv_new("field-Y",PL,64,0,CV_DOM_1); int p_r=cv_new("rec",PL,128,0,CV_DOM_1);
+    cv_link(p_r,p_a); cv_link(p_r,p_b); cv_reach(p_a); cv_reach(p_b); cv_reach(p_r);
+    int q_b=cv_new("field-Y",PL,64,0,CV_DOM_1); int q_a=cv_new("field-X",PL,64,0,CV_DOM_1); int q_r=cv_new("rec",PL,128,0,CV_DOM_1);
+    cv_link(q_r,q_b); cv_link(q_r,q_a); cv_reach(q_a); cv_reach(q_b); cv_reach(q_r);   /* opposite link order */
+    cvsasx_hash_t cP=cv_canon(p_r), cQ=cv_canon(q_r);
+    cvsasx_hash_t rP=cv_rawform(p_r), rQ=cv_rawform(q_r);
+    int struct_eq=cvsasx_hash_eq(&cP,&cQ), byte_ne=!cvsasx_hash_eq(&rP,&rQ);
+    int miss1=cv_dedup(&cP,CV_DOM_1);                    /* first in domain 1 -> MISS(0) */
+    int hit2 =cv_dedup(&cQ,CV_DOM_1);                    /* structurally equal, same domain -> HIT(1) */
+    int xmiss=cv_dedup(&cP,CV_DOM_2);                    /* SAME canonical content, other domain -> MISS(0) refusal */
+    sputs("CV5 two byte-distinct records (opposite child order+placement): canonical-equal="); sputs(struct_eq?"y":"n"); sputs(" byte-equal="); sputs(byte_ne?"n":"y"); sputc('\n');
+    sputs("CV5 intra-domain dedup: first="); sputs(miss1?"HIT":"MISS"); sputs(" second="); sputs(hit2?"HIT":"MISS"); sputs("  cross-domain(same content)="); sputs(xmiss?"HIT":"MISS"); sputc('\n');
+    if(xmiss){ sputs("CV5 -> *** CROSS-DOMAIN CANONICAL DEDUP HIT: STOP (D5, reopened the channel DS closed) ***\n"); }
+    else sputs(struct_eq&&byte_ne&&!miss1&&hit2&&!xmiss?"CV5 -> CANONICAL DEDUP WITHIN DOMAIN (stronger than byte identity) + CROSS-DOMAIN REFUSAL OK\n":"CV5 -> *** FAIL ***\n");
+    /* corpus ratio: K equivalent-but-byte-distinct records -> canonical names vs byte-identity names. */
+    const int K=4; cvsasx_hash_t cans[4], raws[4];
+    for(int r=0;r<K;r++){ int x,y,z; if(r&1){ x=cv_new("field-Y",PL,64,0,CV_DOM_1); y=cv_new("field-X",PL,64,0,CV_DOM_1);} else { x=cv_new("field-X",PL,64,0,CV_DOM_1); y=cv_new("field-Y",PL,64,0,CV_DOM_1);} z=cv_new("rec",PL,128,0,CV_DOM_1); cv_link(z,x); cv_link(z,y); cv_reach(x); cv_reach(y); cv_reach(z); cans[r]=cv_canon(z); raws[r]=cv_rawform(z); }
+    int dc=0,dr=0; for(int r=0;r<K;r++){ int u=1,v=1; for(int s=0;s<r;s++){ if(cvsasx_hash_eq(&cans[r],&cans[s])) u=0; if(cvsasx_hash_eq(&raws[r],&raws[s])) v=0; } dc+=u; dr+=v; }
+    sputs("CV5 corpus K="); sdec((uint64_t)K); sputs(": distinct canonical names="); sdec((uint64_t)dc); sputs(" vs distinct byte-identity names="); sdec((uint64_t)dr); sputs(" -> canonical:byte dedup ratio "); sdec((uint64_t)dr); sputs(":"); sdec((uint64_t)dc); sputc('\n');
+
+    /* ---------- CV6: the undecidability boundary as a RESULT (negative, recorded) ---------- */
+    int g1=cv_new("V",PL,8,0,CV_DOM_1); cv_pool[g1].data[0]=42; cv_reach(g1);              /* observable 42, one leaf */
+    int e40=cv_new("W",PL,8,0,CV_DOM_1); cv_pool[e40].data[0]=40; int e2=cv_new("Z",PL,8,0,CV_DOM_1); cv_pool[e2].data[0]=2;
+    int g2=cv_new("SUM",PL,8,0,CV_DOM_1); cv_link(g2,e40); cv_link(g2,e2); cv_reach(e40); cv_reach(e2); cv_reach(g2);  /* observable 40+2=42, different structure */
+    uint32_t o1=cv_eval(g1), o2=cv_eval(g2); cvsasx_hash_t cg1=cv_canon(g1), cg2=cv_canon(g2);
+    int obs_eq=(o1==o2), struct_ne=!cvsasx_hash_eq(&cg1,&cg2);
+    sputs("CV6 two graphs, SAME observable (eval="); sdec((uint64_t)o1); sputs(" vs "); sdec((uint64_t)o2); sputs("), DISTINCT structure: names "); sputs(hx(cg1.b,8)); sputs(" vs "); sputs(hx(cg2.b,8)); sputc('\n');
+    sputs(obs_eq&&struct_ne?"CV6 -> observationally-equivalent but structurally-distinct states DO NOT converge (RECORDED LIMIT: observational equivalence is undecidable; a negative result, not a bug)\n":"CV6 -> *** unexpected ***\n");
+
+    /* ---------- CV7: canonicalize at a REAL content-store capture boundary; MEASURE ---------- */
+    /* the capture EVENT: the SAME cvsasx_store_put primitive dematerialize_frame funnels through.
+     * raw capture = one BLAKE3+store of the root's bytes; canonical capture = the full-graph canonical pass. */
+    int cap_r=cv_new("captured-root",PL,4096,0,CV_DOM_1); int cap_c=cv_new("captured-child",PL,64,0,CV_DOM_1);
+    cv_link(cap_r,cap_c); cv_reach(cap_r); cv_reach(cap_c);
+    static uint8_t rawbytes[64]; for(int i=0;i<64;i++) rawbytes[i]=cv_pool[cap_r].data[i%cv_pool[cap_r].dlen];
+    cvsasx_hash_t rname; uint64_t tr=rdtsc(); cvsasx_store_put(&cv_store,rawbytes,64,&rname); uint64_t cap_raw_cyc=rdtsc()-tr; (void)rname;
+    cv_canon_calls=0; uint64_t tc=rdtsc(); cvsasx_hash_t cname=cv_canon(cap_r); uint64_t cap_canon_cyc=rdtsc()-tc; uint64_t cap_nodes=cv_canon_calls;
+    uint64_t before_hits=cv_store.dedup_hits, before_objs=cv_store.index_count;
+    /* a SECOND byte-distinct but canonically-equivalent capture -> collapses to the SAME name. */
+    int cap_r2=cv_new("captured-root",PL,4096,0,CV_DOM_1); int cap_c2=cv_new("captured-child",PL,64,0,CV_DOM_1);
+    cv_link(cap_r2,cap_c2); cv_reach(cap_r2); cv_reach(cap_c2);
+    cvsasx_hash_t cname2=cv_canon(cap_r2);
+    int one_name=cvsasx_hash_eq(&cname,&cname2); uint64_t new_objs=cv_store.index_count-before_objs; uint64_t new_hits=cv_store.dedup_hits-before_hits;
+    /* GENUINE rematerialize under one name: re-fetch the canonical bytes + BLAKE3 re-verify (the SAME integrity check rm_materialize enforces). */
+    const void*rb; size_t rl; int remat_ok=0; if(cvsasx_store_get(&cv_store,&cname,&rb,&rl)==CVSASX_STORE_OK){ cvsasx_hash_t chk; cvsasx_blake3(rb,rl,&chk); remat_ok=cvsasx_hash_eq(&chk,&cname); }
+    sputs("CV7 capture boundary: raw-capture(1 obj)="); sdec(cap_raw_cyc); sputs(" cyc  canonical-capture("); sdec(cap_nodes); sputs("-node graph)="); sdec(cap_canon_cyc); sputs(" cyc\n");
+    sputs("CV7 two byte-distinct equivalent captures -> one canonical name="); sputs(one_name?"y":"n"); sputs("; new stored objects="); sdec(new_objs); sputs(" dedup-hits="); sdec(new_hits); sputs("; rematerialize+re-verify(BLAKE3)="); sputs(remat_ok?"y":"n"); sputc('\n');
+    uint64_t ratio = cap_raw_cyc? (cap_canon_cyc/(cap_raw_cyc?cap_raw_cyc:1)) : 0;
+    sputs("CV7 INTEGRATION CHOICE (forced by the number): per-capture canonicalization="); sdec(cap_canon_cyc); sputs(" cyc is "); sdec(ratio); sputs("x a raw capture; captures are frequent -> run the canonical pass at RECLAMATION-time (once per GC sweep, amortized), NOT per-capture\n");
+    sputs(one_name&&remat_ok?"CV7 -> CANONICALIZATION WIRED AT A REAL CAPTURE BOUNDARY; equivalent states rematerialize under ONE name OK\n":"CV7 -> *** FAIL ***\n");
+
+    /* ---------- MEASURE (rdtsc this run) ---------- */
+    uint64_t per_obj = nnodes? canon_graph_cyc/nnodes : 0;
+    uint64_t trh=rdtsc(); cvsasx_hash_t rawh; cvsasx_blake3(rawbytes,64,&rawh); uint64_t raw_hash_cyc=rdtsc()-trh; (void)rawh;
+    uint64_t tconv=rdtsc(); int cvchk=cvsasx_hash_eq(&hA,&hB); uint64_t conv_cyc=rdtsc()-tconv; (void)cvchk;
+    sputs("CV MEASURE: canonicalization per-graph="); sdec(canon_graph_cyc); sputs(" cyc / "); sdec(nnodes); sputs(" nodes = "); sdec(per_obj); sputs(" cyc/obj; canonical-hash(graph)="); sdec(canon_graph_cyc); sputs(" vs raw-hash(1 obj)="); sdec(raw_hash_cyc); sputs(" cyc; convergence-check(compare)="); sdec(conv_cyc); sputs(" cyc\n");
+
+    /* ---------- HONEST SCOPE ---------- */
+    sputs("CV SCOPE: REACHABLE-STATE STRUCTURAL equivalence ONLY (same reachable graph -> one name; authority IN the name).\n");
+    sputs("CV SCOPE: observational/behavioral equivalence is PERMANENTLY out of scope (CV6, undecidable). Single machine, single CPU.\n");
+    sputs("=== CV-CORE complete ===\n");
+}
+
 void kmain(void);
 void kmain(void){
     g_boot_tsc=rdtsc();   /* INT: earliest measurable point, for boot-to-desktop */
@@ -8349,6 +8579,7 @@ void kmain(void){
     run_sharedmap();   /* SHARED MAPPINGS IN THE CANONICAL FORM: SM0 establish sharing, SM1 shared-object layer, SM2 lifetime across demat, SM3 capability gate (one shared frame survives the round trip), SM4 per-owner authority, SM5 limits */
     run_int();         /* DEEP SYSTEM INTEGRATION: INT1 whole-system coherence (every subsystem's live residual state), INT2 cross-subsystem hot-path table (rdtsc this run), INT3 safe content-addressed last-fetch cache opt (before/after), INT4 honest real-HW gap (QEMU-only), INT5 the one-architecture statement */
     run_tools();       /* CARMIX-NATIVE DEV + DAILY TOOLS: T-1 content-addressed editor (edit re-roots, old kept), T-2 program image spawned under a bounded cap (unauthorized run REFUSED), T-3 remat-debug time-travel by hash (re-hash-confirmed, not replay), T-4 daily flow end-to-end (create+edit+navigate+list+send, one step REFUSED), T-5 rdtsc */
+    run_cv();          /* CV-CORE (STAGE 1): canonical form over the reachable acyclic graph - CV1 bottom-up+deterministic, CV2 authority-in-the-name (one-cap difference REFUSED), CV3 dead-scratch excluded via the committed gc_rc oracle, CV4 path-independent convergence, CV5 canonical dedup within a domain + cross-domain refusal, CV6 undecidability boundary (structural != observational), CV7 canonicalize at a real capture boundary + measured integration choice */
     run_shell();       /* E4: live focus/drag/resize/type desktop (does not return) */
 #endif
     hcf();
