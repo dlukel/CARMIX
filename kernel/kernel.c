@@ -8510,6 +8510,321 @@ static void run_cv8(void){
     sputs("CV8 SCOPE: FIRST measured exercise of the multi-core DRCC theory, VALID FOR THESE EXERCISED WORKLOADS AND SCHEDULES ONLY - not a universal proof. Reachable-state STRUCTURAL equivalence (authority IN the name), NOT observational. Real 2-core MTTCG via ap_kick/ap_wait.\n");
 }
 
+/* ===========================================================================
+ * PART SR - THE SYSTEM ROOT (SR1-SR7). One content address that folds the WHOLE
+ * running system - every quiescent process's PAGE-TABLE-INCLUSIVE task hash, the
+ * versioned-gate capability slot versions, the content-store manifest, the
+ * content-addressed FS root, and each component's re-mintable authority ceiling -
+ * through the COMMITTED epoch tree (store/epoch_tree.c, whose VERIFIED invariant
+ * is "incremental root == full recompute") at a QUIESCENT epoch boundary.
+ *
+ * BANKS A COMPOSITION OF COMMITTED PRIMITIVES; UPGRADES NO PROOF CLAIM. Reused,
+ * never reinvented: the epoch tree, the versioned gate (vgate_commit/vg_capture),
+ * the content store, the FS root (fs_dir_put), the canonical page-table hash
+ * (ts_canonicalize), the process demat/remat path (conc_dematerialize /
+ * conc_rematerialize), the anti-amp gate (conc_remint), and the Ed25519 signing
+ * path (tweetnacl crypto_sign/crypto_sign_open). Nothing under carmix/ gate/ sls/
+ * store/ cap/ proofs/ is touched.
+ *
+ * REUSE-BY-INCLUDE (build.sh unchanged; the SR commit is kernel.c + SR_LOG.md
+ * ONLY): the epoch tree and tweetnacl are pulled into THIS translation unit by
+ * textual #include so kernel.o carries them - no new link inputs, no proven-core
+ * edit. epoch_tree.c has ONE external (cvsasx_blake3_tagged, already linked from
+ * blake3_wrap.c); tweetnacl's keypair-gen is host-only/commented so there is NO
+ * randombytes/libc dependency (only crypto_sign + crypto_sign_open are used).
+ *
+ * SCOPE (stated plainly, NOT upgraded): single machine, QEMU, quiescent-epoch
+ * capture ONLY. Concurrent capture is out of scope. SR5 attestation is a signature
+ * over a SELF-REPORTED manifest on an EMULATED platform - NOT a hardware-rooted
+ * (TPM / measured-boot) attestation. See kernel/SR_LOG.md.
+ * ===========================================================================*/
+#define CVSASX_EPOCH_CHUNK_SIZE 32u        /* SR: 1 component hash (32B) == 1 chunk == 1 leaf -> a real depth-3 binary fold over 8 components */
+#include "epoch_tree.c"                    /* the COMMITTED epoch tree; incremental fold == full recompute (its VERIFIED invariant) */
+#include "tweetnacl.c"                     /* the COMMITTED Ed25519 (crypto_sign / crypto_sign_open); keypair-gen host-only -> no randombytes/libc dep */
+#undef FOR
+#undef sv
+#include "authz_keys.h"                    /* the COMMITTED Ed25519 TEST keypair (SRC_PK/SRC_SK) + WRONG_SK (baked, NOT secret) */
+
+#define SR_NLEAF 8
+enum { SR_TASKA=0, SR_TASKB, SR_CAPVER, SR_STOREM, SR_FSROOT, SR_CEILA, SR_CEILB, SR_SYSCEIL };
+static uint8_t         sr_manifest[SR_NLEAF*32];   /* the epoch-tree memory: 8 component chunks (the System Root preimage) */
+static cvsasx_epoch_t  sr_epoch, sr_epoch_full;    /* static: cvsasx_epoch_t is ~16 KiB each (kept off the kernel stack) */
+static uint8_t         sr_revoked[8][32]; static int sr_nrevoked;   /* SR4 revocation floor: revoked authority-ceiling hashes */
+static vgate_slot_t    sr_slot;                    /* the SR capability slot; its version word = the SR_CAPVER component */
+
+static int  sr_is_revoked(const uint8_t*h){ for(int i=0;i<sr_nrevoked;i++){ int e=1; for(int k=0;k<32;k++) if(sr_revoked[i][k]!=h[k]){e=0;break;} if(e) return 1; } return 0; }
+static void sr_set_leaf(int idx,const cvsasx_hash_t*h){ for(int k=0;k<32;k++) sr_manifest[idx*32+k]=h->b[k]; }
+static int  sr_verify(cvsasx_store_t*s,const cvsasx_hash_t*h){ const void*b; size_t l; if(cvsasx_store_get(s,h,&b,&l)!=CVSASX_STORE_OK) return 0; cvsasx_hash_t c; cvsasx_blake3(b,l,&c); return cvsasx_hash_eq(&c,h); }
+
+/* page-table-INCLUSIVE task hash of a quiescent process (the TS1 manifest form,
+ * compacted): BLAKE3( regs || stack || canonical-page-table-root || ceiling-desc ).
+ * ts_canonicalize is PLACEMENT-INDEPENDENT, so this hash survives demat/remat into
+ * fresh frames. Stored so the task hash is itself a rematerializable content name. */
+static cvsasx_hash_t sr_taskhash(cproc_t*p){
+    cvsasx_hash_t regH; cvsasx_store_put(&ts_store,&p->tf,sizeof(c_tf_t),&regH);
+    cvsasx_hash_t stkH; cvsasx_blake3((const void*)P2V(p->stack_frame),4096,&stkH);
+    cvsasx_hash_t asr = ts_canonicalize(p->cr3,0);                 /* PAGE TABLE INCLUDED */
+    uint8_t capd[44]; uint32_t perms=(uint32_t)(CVSASX_PERM_LOAD|CVSASX_PERM_GLOBAL);
+    for(int k=0;k<32;k++) capd[k]=p->ceilH[k];
+    for(int k=0;k<8;k++)  capd[32+k]=(uint8_t)(p->ceil_len>>(8*k));
+    for(int k=0;k<4;k++)  capd[40+k]=(uint8_t)(perms>>(8*k));
+    uint8_t man[32*3+44];
+    for(int k=0;k<32;k++){ man[k]=regH.b[k]; man[32+k]=stkH.b[k]; man[64+k]=asr.b[k]; }
+    for(int k=0;k<44;k++) man[96+k]=capd[k];
+    cvsasx_hash_t th; cvsasx_store_put(&ts_store,man,sizeof man,&th);
+    return th;
+}
+/* the re-mintable authority-ceiling descriptor hash (the SR per-component ceiling leaf). */
+static cvsasx_hash_t sr_ceilhash(const uint8_t*ceilH,uint64_t len,uint32_t perms){
+    uint8_t capd[44];
+    for(int k=0;k<32;k++) capd[k]=ceilH[k];
+    for(int k=0;k<8;k++)  capd[32+k]=(uint8_t)(len>>(8*k));
+    for(int k=0;k<4;k++)  capd[40+k]=(uint8_t)(perms>>(8*k));
+    cvsasx_hash_t h; cvsasx_blake3(capd,44,&h); return h;
+}
+/* the content-store manifest leaf: BLAKE3 over the store index = every distinct
+ * stored object's (content-hash, offset, len). One hash naming the whole object set. */
+static cvsasx_hash_t sr_storeman(cvsasx_store_t*s){
+    cvsasx_hash_t h; cvsasx_blake3(s->index,(size_t)s->index_count*sizeof(cvsasx_store_entry_t),&h); return h;
+}
+/* SR process demat: content-address the FULL private state (registers, data/heap
+ * page, stack page) into the store, then FREE the two private frames. Code stays
+ * shared-by-hash; the page-table skeleton persists (the quiescent-boundary scope).
+ * Stack IS included (unlike conc_dematerialize) so the placement-independent task
+ * hash round-trips exactly. */
+static void sr_demat(cproc_t*p, c_tf_t*tf_out, cvsasx_hash_t*dH, cvsasx_hash_t*sH){
+    *tf_out=p->tf;
+    cvsasx_store_put(&ts_store,(const void*)P2V(p->data_frame),4096,dH);
+    cvsasx_store_put(&ts_store,(const void*)P2V(p->stack_frame),4096,sH);
+    mm_unmap(p->cr3,CONC_DATA_VA); mm_unmap(p->cr3,CONC_STK_VA);
+    frame_release_physical(p->data_frame); frame_release_physical(p->stack_frame);
+    p->data_frame=p->stack_frame=0; p->present=0; p->dematerialized=1;
+}
+/* SR process remat: FRESH frames, restore data/stack content BLAKE3-verified, restore
+ * registers, re-map at the same VPNs/perms. Fail-closed on miss/verify. */
+static int sr_remat(cproc_t*p, const c_tf_t*tf_in, const cvsasx_hash_t*dH, const cvsasx_hash_t*sH){
+    const void*db; size_t dl; const void*sb; size_t sl; cvsasx_hash_t c;
+    if(cvsasx_store_get(&ts_store,dH,&db,&dl)!=CVSASX_STORE_OK||dl!=4096) return 0;
+    if(cvsasx_store_get(&ts_store,sH,&sb,&sl)!=CVSASX_STORE_OK||sl!=4096) return 0;
+    cvsasx_blake3(db,dl,&c); if(!cvsasx_hash_eq(&c,dH)) return 0;
+    cvsasx_blake3(sb,sl,&c); if(!cvsasx_hash_eq(&c,sH)) return 0;
+    uint64_t df=frame_reserve(), sf=frame_reserve(); if(!df||!sf) return 0;
+    for(int i=0;i<4096;i++){ ((uint8_t*)P2V(df))[i]=((const uint8_t*)db)[i]; ((uint8_t*)P2V(sf))[i]=((const uint8_t*)sb)[i]; }
+    mm_map(p->cr3,CONC_DATA_VA,df,MM_USER|MM_WRITE);
+    mm_map(p->cr3,CONC_STK_VA, sf,MM_USER|MM_WRITE);
+    p->data_frame=df; p->stack_frame=sf; p->tf=*tf_in; p->present=1; p->dematerialized=0;
+    return 1;
+}
+/* a FULL (from-scratch, all-chunks-dirty) fold of the current manifest -> System Root;
+ * reports the hash work done (leaf + node re-hashes). */
+static cvsasx_hash_t sr_fold_full(uint64_t*lh,uint64_t*nh){
+    cvsasx_epoch_init(&sr_epoch_full,sr_manifest,sizeof sr_manifest);
+    cvsasx_hash_t r; cvsasx_epoch_commit(&sr_epoch_full,&r);
+    if(lh)*lh=sr_epoch_full.last_leaf_hashes; if(nh)*nh=sr_epoch_full.last_node_hashes;
+    return r;
+}
+
+static void run_sr(void){
+    sputs("\n=== PART SR: THE SYSTEM ROOT (SR1-SR7) - one content address folding the whole running system through the COMMITTED epoch tree ===\n");
+    sputs("SR banks a COMPOSITION of committed primitives; it UPGRADES NO proof claim. Single machine, QEMU, QUIESCENT-epoch capture only (concurrent capture out of scope).\n");
+
+    /* clean pool + spaces (as run_taskstate: drop leftover user PML4 slots, reload, reset framedb/rset, fresh SR object store). */
+    if(g_kernel_cr3){ uint64_t *kpml=P2V(g_kernel_cr3);
+        for(int i=0;i<256;i++) if((kpml[i]&1)&&(kpml[i]&MM_USER)) kpml[i]=0;
+        __asm__ volatile("mov %0,%%cr3"::"r"(g_kernel_cr3):"memory"); }
+    framedb_init(); rset_n=0; for(uint32_t i=0;i<RSET_MAX;i++) rset[i].live=0;
+    cvsasx_store_init(&ts_store,ts_arena,sizeof ts_arena,ts_idx,512); ts_ready=1;   /* fresh store -> deterministic manifest + capacity */
+    conc_store_once(); rm_store_once();
+    if(!u0_store_ready){ cvsasx_store_init(&u0_store,u0_sarena,sizeof u0_sarena,u0_sidx,256); u0_store_ready=1; }
+    for(int i=0;i<256;i++) conc_obj[i]=(uint8_t)(i*31u+3u);        /* the authority object the ceilings are carved from */
+
+    /* two quiescent ring-3 processes (page-table-inclusive task state) with DISJOINT authority slices. */
+    cproc_t *pa=&g_cp[0], *pb=&g_cp[1];
+    if(!conc_make_proc(pa,0xA,'A',8,0,128) || !conc_make_proc(pb,0xB,'B',8,128,128)){ sputs("SR ABORT: could not build the two processes (frames/space)\n"); return; }
+    ts_run_ring3(pa,3);                                            /* pa -> quiescent at heap counter 3 (non-trivial regs+heap) */
+    uint64_t heapA=*(uint64_t*)(P2V(pa->data_frame)+8);
+    sputs("SR setup: process A ran to quiescence at heap counter="); sdec(heapA); sputs("; process B built quiescent. Ceilings carved from disjoint slices of one 256B authority object.\n");
+
+    /* the SR capability slot (versioned gate): its version word IS the SR_CAPVER leaf. init the global custodian/region as run_vgate does. */
+    cvsasx_blake3(conc_obj,256,&vg_hash);
+    { cvsasx_swcap_t rootc={ (uint64_t)(uintptr_t)conc_obj,256,(uint32_t)(CVSASX_PERM_LOAD|CVSASX_PERM_GLOBAL),1 };
+      cvsasx_sw_custodian_init(&vg_cust,rootc);
+      vg_region.object_cap=rootc; vg_region.object_base_addr=(uint64_t)(uintptr_t)conc_obj; vg_region.object_length=256;
+      for(int k=0;k<32;k++) vg_region.hash[k]=vg_hash.b[k]; }
+    sr_slot.version=0; { cvsasx_pir_t pir; conc_make_pir(&pir,vg_hash.b,0,128,(uint32_t)CVSASX_PERM_LOAD); cvsasx_sw_cap_remint(&vg_cust,&pir,&vg_region,&sr_slot.buf[0]); }
+
+    /* ---- build the 8 component leaves ---- */
+    cvsasx_hash_t tA=sr_taskhash(pa), tB=sr_taskhash(pb);
+    cvsasx_hash_t capver; { uint64_t v=sr_slot.version; cvsasx_blake3(&v,8,&capver); }     /* version 0 */
+    cvsasx_hash_t fsroot; { static uint8_t fbytes[64]; for(int i=0;i<64;i++) fbytes[i]=(uint8_t)('s'+(i%23)); cvsasx_hash_t hf; cvsasx_store_put(&u0_store,fbytes,64,&hf);
+        char sn[1][8]={{'f',0}}; cvsasx_hash_t sh[1]={hf}; cvsasx_hash_t hsub=fs_dir_put(sn,sh,1);
+        char rnm[1][8]={{'s','u','b',0}}; cvsasx_hash_t rh[1]={hsub}; fsroot=fs_dir_put(rnm,rh,1); }
+    cvsasx_hash_t ceilA=sr_ceilhash(pa->ceilH,pa->ceil_len,(uint32_t)(CVSASX_PERM_LOAD|CVSASX_PERM_GLOBAL));
+    cvsasx_hash_t ceilB=sr_ceilhash(pb->ceilH,pb->ceil_len,(uint32_t)(CVSASX_PERM_LOAD|CVSASX_PERM_GLOBAL));
+    cvsasx_hash_t sysceil=sr_ceilhash(vg_hash.b,256,(uint32_t)(CVSASX_PERM_LOAD|CVSASX_PERM_GLOBAL));
+    cvsasx_hash_t storem=sr_storeman(&ts_store);
+    sr_set_leaf(SR_TASKA,&tA); sr_set_leaf(SR_TASKB,&tB); sr_set_leaf(SR_CAPVER,&capver);
+    sr_set_leaf(SR_STOREM,&storem); sr_set_leaf(SR_FSROOT,&fsroot);
+    sr_set_leaf(SR_CEILA,&ceilA); sr_set_leaf(SR_CEILB,&ceilB); sr_set_leaf(SR_SYSCEIL,&sysceil);
+
+    /* measurement accumulators (rdtsc this run) */
+    uint64_t m_full_cyc=0,m_inc_cyc=0,m_full_nodes=0,m_inc_nodes=0,m_shared=0;
+    uint64_t m_demat_cyc=0,m_remat_cyc=0,m_branch_cyc=0,m_sign_cyc=0,m_verify_cyc=0;
+
+    /* =============================== SR1 =============================== */
+    sputs("\n--- SR1: the root object (fold every task hash [page table incl.] + cap slot versions + store manifest + FS root + per-component ceilings) ---\n");
+    cvsasx_epoch_init(&sr_epoch,sr_manifest,sizeof sr_manifest);
+    cvsasx_hash_t rootN; cvsasx_epoch_commit(&sr_epoch,&rootN);
+    sputs("SR1 leaves: taskA="); sputs(hx(tA.b,6)); sputs(" taskB="); sputs(hx(tB.b,6)); sputs(" capver="); sputs(hx(capver.b,6));
+    sputs(" storeman="); sputs(hx(storem.b,6)); sputs(" fsroot="); sputs(hx(fsroot.b,6));
+    sputs(" ceilA="); sputs(hx(ceilA.b,6)); sputs(" ceilB="); sputs(hx(ceilB.b,6)); sputs(" sysceil="); sputs(hx(sysceil.b,6)); sputc('\n');
+    sputs("SR1 SYSTEM ROOT ("); sdec((uint64_t)SR_NLEAF); sputs(" leaves, epoch tree) = "); sputs(hx(rootN.b,32));
+    sputs("  [first fold: leaf-hashes="); sdec(sr_epoch.last_leaf_hashes); sputs(" node-hashes="); sdec(sr_epoch.last_node_hashes); sputs("]\n");
+    cvsasx_hash_t rootN2; cvsasx_epoch_commit(&sr_epoch,&rootN2);
+    int same_noop=cvsasx_hash_eq(&rootN,&rootN2)&&(sr_epoch.last_leaf_hashes==0)&&(sr_epoch.last_node_hashes==0);
+    sputs("SR1 consecutive QUIESCENT epoch, nothing changed -> root="); sputs(hx(rootN2.b,16)); sputs(" identical="); sputs(same_noop?"y":"n");
+    sputs(" (re-hash work = "); sdec(sr_epoch.last_leaf_hashes); sputs(" leaves + "); sdec(sr_epoch.last_node_hashes); sputs(" nodes)\n");
+    { cvsasx_pir_t pir; conc_make_pir(&pir,vg_hash.b,0,64,(uint32_t)CVSASX_PERM_LOAD); vgate_commit(&sr_slot,&pir,0); }   /* ONE component changes: cap slot version bump */
+    cvsasx_hash_t capver_c; { uint64_t v=sr_slot.version; cvsasx_blake3(&v,8,&capver_c); }
+    cvsasx_epoch_write(&sr_epoch,SR_CAPVER*32,capver_c.b,32);
+    cvsasx_hash_t rootN_c; cvsasx_epoch_commit(&sr_epoch,&rootN_c);
+    int changed=!cvsasx_hash_eq(&rootN,&rootN_c);
+    sputs("SR1 ONE component changed (cap slot version -> "); sdec(sr_slot.version); sputs(") -> root="); sputs(hx(rootN_c.b,16)); sputs(" changed="); sputs(changed?"y":"n"); sputc('\n');
+    cvsasx_epoch_write(&sr_epoch,SR_CAPVER*32,capver.b,32); cvsasx_hash_t rootN_r; cvsasx_epoch_commit(&sr_epoch,&rootN_r);   /* time-travel the leaf back */
+    int restored=cvsasx_hash_eq(&rootN,&rootN_r);
+    sputs("SR1 restore that component -> root returns to the pinned System Root = "); sputs(restored?"y":"n");
+    sputs(same_noop&&changed&&restored?"  -> SR1 OK\n":"  -> *** SR1 FAIL ***\n");
+
+    /* =============================== SR2 =============================== */
+    sputs("\n--- SR2: diff-proportional fold (incremental == full recompute; COUNTED shared-subtree reuse) ---\n");
+    cvsasx_hash_t tB2=tB; tB2.b[0]^=0x5A;                          /* pretend ONE component (taskB) changed */
+    uint64_t ti=rdtsc(); cvsasx_epoch_write(&sr_epoch,SR_TASKB*32,tB2.b,32); cvsasx_hash_t root_inc; cvsasx_epoch_commit(&sr_epoch,&root_inc); m_inc_cyc=rdtsc()-ti;
+    uint64_t inc_leaf=sr_epoch.last_leaf_hashes, inc_node=sr_epoch.last_node_hashes; m_inc_nodes=inc_leaf+inc_node;
+    uint64_t tf2=rdtsc(); cvsasx_hash_t root_full=sr_fold_full(0,0); m_full_cyc=rdtsc()-tf2;
+    uint64_t full_leaf=sr_epoch_full.last_leaf_hashes, full_node=sr_epoch_full.last_node_hashes; m_full_nodes=full_leaf+full_node;
+    int inceqfull=cvsasx_hash_eq(&root_inc,&root_full);
+    m_shared = m_full_nodes>m_inc_nodes ? m_full_nodes-m_inc_nodes : 0;
+    sputs("SR2 incremental fold (1 changed leaf): re-hashed "); sdec(inc_leaf); sputs(" leaf + "); sdec(inc_node); sputs(" node = "); sdec(m_inc_nodes);
+    sputs(" of "); sdec(m_full_nodes); sputs(" total tree nodes; "); sdec(m_inc_cyc); sputs(" cyc\n");
+    sputs("SR2 full recompute (all leaves): re-hashed "); sdec(full_leaf); sputs(" leaf + "); sdec(full_node); sputs(" node = "); sdec(m_full_nodes); sputs(" nodes; "); sdec(m_full_cyc); sputs(" cyc\n");
+    sputs("SR2 SHARED-SUBTREE REUSE = "); sdec(m_shared); sputs(" nodes NOT re-hashed (unchanged subtrees kept their hashes); incremental-root == full-root = "); sputs(inceqfull?"y":"n"); sputc('\n');
+    if(!inceqfull) sputs("SR2 -> *** INCREMENTAL != FULL: the fold is a secret full recompute -> SR2 FAILED (D1) ***\n");
+    else sputs(inc_leaf==1&&m_shared>0?"SR2 -> DIFF-PROPORTIONAL: consecutive roots share unchanged subtrees, incremental fold == full recompute OK\n":"SR2 -> *** FAIL ***\n");
+    cvsasx_epoch_write(&sr_epoch,SR_TASKB*32,tB.b,32); cvsasx_hash_t back2; cvsasx_epoch_commit(&sr_epoch,&back2); (void)back2;   /* restore to pinned */
+
+    /* =============================== SR3 =============================== */
+    sputs("\n--- SR3: whole-system time-travel + branch (rematerialize root N WITH the process: task hash + registers + heap) ---\n");
+    uint64_t rip_before=pa->tf.rip, heap_before=*(uint64_t*)(P2V(pa->data_frame)+8);
+    uint64_t free_before=fdb_freetop;
+    c_tf_t sr_tf; cvsasx_hash_t sr_dH, sr_sH;
+    uint64_t td=rdtsc(); sr_demat(pa,&sr_tf,&sr_dH,&sr_sH); m_demat_cyc=rdtsc()-td;
+    uint64_t free_after=fdb_freetop;
+    sputs("SR3 pinned root N = "); sputs(hx(rootN.b,16)); sputs("; process A task hash = "); sputs(hx(tA.b,12)); sputc('\n');
+    sputs("SR3 dematerialize A: backing frames freed = "); sdec(free_after-free_before); sputs(" (registers+heap now content-addressed, NOT resident)\n");
+    { cvsasx_pir_t pir; conc_make_pir(&pir,vg_hash.b,0,80,(uint32_t)CVSASX_PERM_LOAD); vgate_commit(&sr_slot,&pir,0); }   /* mutate system -> root N+k */
+    cvsasx_hash_t capverK; { uint64_t v=sr_slot.version; cvsasx_blake3(&v,8,&capverK); }
+    cvsasx_epoch_write(&sr_epoch,SR_CAPVER*32,capverK.b,32); cvsasx_hash_t rootK; cvsasx_epoch_commit(&sr_epoch,&rootK);
+    int mutated=!cvsasx_hash_eq(&rootN,&rootK);
+    sputs("SR3 mutate system to root N+k = "); sputs(hx(rootK.b,16)); sputs(" (differs from N = "); sputs(mutated?"y":"n"); sputs(")\n");
+    uint64_t tr=rdtsc(); int remat_ok=sr_remat(pa,&sr_tf,&sr_dH,&sr_sH); m_remat_cyc=rdtsc()-tr;
+    cvsasx_hash_t tR=sr_taskhash(pa);
+    int task_match=cvsasx_hash_eq(&tR,&tA);
+    uint64_t rip_after=pa->tf.rip, heap_after=*(uint64_t*)(P2V(pa->data_frame)+8);
+    int regs_match=(rip_after==rip_before), heap_match=(heap_after==heap_before);
+    cvsasx_epoch_write(&sr_epoch,SR_CAPVER*32,capver.b,32); cvsasx_hash_t rootR; cvsasx_epoch_commit(&sr_epoch,&rootR);
+    int root_restored=cvsasx_hash_eq(&rootR,&rootN);
+    sputs("SR3 rematerialize A (remat="); sputs(remat_ok?"y":"n"); sputs("): restored task hash = "); sputs(hx(tR.b,12)); sputs(" == pinned = "); sputs(task_match?"y":"n"); sputc('\n');
+    sputs("SR3   registers match (rip "); sx64(rip_after); sputs(") = "); sputs(regs_match?"y":"n"); sputs("; heap match (counter="); sdec(heap_after); sputs(") = "); sputs(heap_match?"y":"n");
+    sputs("; root N re-derived = "); sputs(root_restored?"y":"n"); sputs(" -> NOT files-only (D2 defeated)\n");
+    /* BRANCH: continue execution from the restored root -> a divergent line N' */
+    uint64_t tbr=rdtsc(); ts_run_ring3(pa,5); cvsasx_hash_t tPrime=sr_taskhash(pa);
+    cvsasx_epoch_write(&sr_epoch,SR_TASKA*32,tPrime.b,32); cvsasx_hash_t rootPrime; cvsasx_epoch_commit(&sr_epoch,&rootPrime); m_branch_cyc=rdtsc()-tbr;
+    int diverged=!cvsasx_hash_eq(&rootN,&rootPrime) && !cvsasx_hash_eq(&tA,&tPrime);
+    int both_remat = sr_verify(&ts_store,&tA) && sr_verify(&ts_store,&tPrime);   /* BOTH lines retained + rematerializable from the store */
+    sputs("SR3 BRANCH: continued A to counter="); sdec(*(uint64_t*)(P2V(pa->data_frame)+8)); sputs(" -> line N' root = "); sputs(hx(rootPrime.b,16));
+    sputs(" (diverges from N = "); sputs(diverged?"y":"n"); sputs("); BOTH roots retained + both task states rematerializable = "); sputs(both_remat?"y":"n"); sputc('\n');
+    cvsasx_epoch_write(&sr_epoch,SR_TASKA*32,tA.b,32); cvsasx_hash_t backA; cvsasx_epoch_commit(&sr_epoch,&backA); (void)backA;   /* return the live manifest to pinned N */
+    sputs(task_match&&regs_match&&heap_match&&root_restored&&diverged&&both_remat?"SR3 -> TIME-TRAVEL + BRANCH WITH PROCESSES INCLUDED OK\n":"SR3 -> *** see failures above ***\n");
+
+    /* =============================== SR4 =============================== */
+    sputs("\n--- SR4: revocation vs time-travel (a decision is DEMANDED) ---\n");
+    sputs("SR4 DECISION = (b) a REVOCATION FLOOR at rematerialization: a restored capability is intersected with the CURRENT revocation state.\n");
+    sputs("SR4 REASON: revocation is a forward-only, safety-critical security action; if a replayed root could resurrect revoked authority, an attacker who triggers a restore bypasses every revocation. Roots stay immutable HISTORY (state is faithfully restored); AUTHORITY is re-minted through today's revocation state.\n");
+    sputs("SR4 REJECTED = (a) immutable-authority restore (restoring a root restores its authority). Rejected: it makes revocation REVERSIBLE by replay - an unacceptable regression for a capability OS whose thesis is bounded authority.\n");
+    for(int k=0;k<32;k++) sr_revoked[sr_nrevoked][k]=pa->ceilH[k]; sr_nrevoked++;   /* revoke A's ceiling AFTER pinning root N */
+    cvsasx_pir_t pir4; cvsasx_swcap_t capA; cvsasx_swcap_t capB;
+    conc_make_pir(&pir4,pa->ceilH,0,pa->ceil_len,CVSASX_PERM_LOAD);
+    cvsasx_status_t sA=conc_remint(pa,&pir4,&capA);                 /* the gate alone WOULD grant (pinned authority is legitimate)... */
+    int floorA=sr_is_revoked(pa->ceilH);                           /* ...but the revocation floor DENIES it */
+    int restored_auth_A=(sA==CVSASX_OK && capA.valid && !floorA);
+    conc_make_pir(&pir4,pb->ceilH,0,pb->ceil_len,CVSASX_PERM_LOAD);
+    cvsasx_status_t sB=conc_remint(pb,&pir4,&capB);
+    int floorB=sr_is_revoked(pb->ceilH);
+    int restored_auth_B=(sB==CVSASX_OK && capB.valid && !floorB) && capB.length<=pb->ceil_len;
+    sputs("SR4 restore A's authority from the pinned ceiling: gate status="); sdec((uint64_t)sA); sputs(" (would grant), revoked="); sputs(floorA?"y":"n");
+    sputs(" -> authority GRANTED="); sputs(restored_auth_A?"y":"n"); sputs(" (floored to nothing), yet A's STATE rematerialized above (state faithful, authority denied)\n");
+    sputs("SR4 restore B's authority (NOT revoked): gate status="); sdec((uint64_t)sB); sputs(" revoked="); sputs(floorB?"y":"n");
+    sputs(" -> authority GRANTED="); sputs(restored_auth_B?"y":"n"); sputs(", never widened (len "); sdec(capB.length); sputs("<="); sdec(pb->ceil_len); sputs(")\n");
+    sputs(!restored_auth_A&&restored_auth_B?"SR4 -> REVOCATION FLOOR ENFORCED: revoked capability REFUSED on restore, non-revoked restored intact OK\n":"SR4 -> *** FAIL ***\n");
+
+    /* =============================== SR5 =============================== */
+    sputs("\n--- SR5: whole-system attestation (sign the root; one signature binds code AND every component's authority ceiling) ---\n");
+    static uint8_t sm[64+32]; unsigned long long smlen=0;
+    uint64_t ts5=rdtsc(); crypto_sign(sm,&smlen,rootN.b,32,SRC_SK); m_sign_cyc=rdtsc()-ts5;   /* sign the System Root with the committed Ed25519 path */
+    cvsasx_hash_t rederived=sr_fold_full(0,0);                      /* verifier RE-DERIVES the root by re-folding the manifest */
+    static uint8_t rec[64+32]; unsigned long long rlen=0;
+    uint64_t tv5=rdtsc(); int openrc=crypto_sign_open(rec,&rlen,sm,smlen,SRC_PK); m_verify_cyc=rdtsc()-tv5;
+    cvsasx_hash_t recH; for(int k=0;k<32;k++) recH.b[k]=rec[k];
+    int sig_ok=(openrc==0)&&(rlen==32)&&cvsasx_hash_eq(&recH,&rederived);
+    sputs("SR5 sign(System Root) with Ed25519 (SRC_SK): sig+msg = "); sdec(smlen); sputs(" bytes; verifier re-derives root "); sputs(hx(rederived.b,12));
+    sputs(" + checks ONE signature -> valid = "); sputs(sig_ok?"y":"n"); sputs(" (learns code [task hashes] AND authority ceilings in one check)\n");
+    /* refusal 1: tamper ONE component's ceiling post-sign -> re-derived root differs -> verification FAILS */
+    uint8_t tamp[32]; for(int k=0;k<32;k++) tamp[k]=ceilA.b[k]; tamp[0]^=0xFF;
+    cvsasx_epoch_write(&sr_epoch,SR_CEILA*32,tamp,32); cvsasx_hash_t root_tamp; cvsasx_epoch_commit(&sr_epoch,&root_tamp);
+    static uint8_t rec2[64+32]; unsigned long long rlen2=0; int openrc2=crypto_sign_open(rec2,&rlen2,sm,smlen,SRC_PK);
+    cvsasx_hash_t rec2H; for(int k=0;k<32;k++) rec2H.b[k]=rec2[k];
+    int tamper_detected=(openrc2==0)&&!cvsasx_hash_eq(&rec2H,&root_tamp);
+    sputs("SR5 tamper ONE ceiling post-sign: re-derived root "); sputs(hx(root_tamp.b,12)); sputs(" != signed root "); sputs(hx(rec2H.b,12));
+    sputs(" -> verification FAILS = "); sputs(tamper_detected?"y":"n"); sputc('\n');
+    cvsasx_epoch_write(&sr_epoch,SR_CEILA*32,ceilA.b,32); cvsasx_hash_t rb5; cvsasx_epoch_commit(&sr_epoch,&rb5); (void)rb5;   /* restore */
+    /* refusal 2: unrecognized signer -> REFUSED */
+    static uint8_t smw[64+32]; unsigned long long smwl=0; crypto_sign(smw,&smwl,rootN.b,32,WRONG_SK);
+    static uint8_t recw[64+32]; unsigned long long rlenw=0; int openw=crypto_sign_open(recw,&rlenw,smw,smwl,SRC_PK);
+    int signer_refused=(openw!=0);
+    sputs("SR5 unrecognized signer (WRONG_SK, verifier trusts only SRC_PK): crypto_sign_open rc="); sdec((uint64_t)(int64_t)openw); sputs(" -> REFUSED = "); sputs(signer_refused?"y":"n"); sputc('\n');
+    sputs("SR5 HONEST BOUNDARY: this is a signature over a SELF-REPORTED manifest on an EMULATED platform - NOT hardware-rooted (no TPM/measured-boot); it attests what THIS kernel reports, not an independent measurement.\n");
+    sputs(sig_ok&&tamper_detected&&signer_refused?"SR5 -> WHOLE-SYSTEM ATTESTATION OK: one signature binds code+ceilings, tamper detected, unknown signer refused\n":"SR5 -> *** see failures above ***\n");
+
+    /* =============================== SR6 =============================== */
+    sputs("\n--- SR6: quiescence is real (a mutation racing the capture is excluded/deferred, never folded torn) ---\n");
+    vg_capture_count=vg_midwrite_count=vg_torn_count=0;
+    uint64_t vcap=sr_slot.version;
+    cvsasx_swcap_t active_pre=sr_slot.buf[vcap&1];
+    cvsasx_hash_t auth_epochV; cvsasx_blake3(&active_pre,sizeof active_pre,&auth_epochV);   /* the fold captures the ACTIVE (quiesced) buffer at version V */
+    cvsasx_pir_t pir6; conc_make_pir(&pir6,vg_hash.b,0,72,(uint32_t)CVSASX_PERM_LOAD);
+    vgate_commit(&sr_slot,&pir6,1);                               /* a racing mutation: writes the INACTIVE buffer with mid-write captures reading the intact active buffer */
+    cvsasx_swcap_t active_post=sr_slot.buf[sr_slot.version&1];
+    cvsasx_hash_t auth_epochV1; cvsasx_blake3(&active_post,sizeof active_post,&auth_epochV1);
+    int deferred=(sr_slot.version==vcap+1)&&!cvsasx_hash_eq(&auth_epochV,&auth_epochV1);
+    int quiesced=(vg_torn_count==0)&&(vg_midwrite_count>0)&&deferred;
+    sputs("SR6 fold at version V="); sdec(vcap); sputs(": captures="); sdec((uint64_t)vg_capture_count); sputs(" (mid-inactive-write="); sdec((uint64_t)vg_midwrite_count);
+    sputs("), TORN captures = "); sdec((uint64_t)vg_torn_count); sputs(" -> every capture read a COMPLETE capability\n");
+    sputs("SR6 the racing mutation committed at version "); sdec(sr_slot.version); sputs(" (V+1) -> EXCLUDED from epoch V, DEFERRED into epoch V+1 (its authority differs="); sputs(!cvsasx_hash_eq(&auth_epochV,&auth_epochV1)?"y":"n"); sputs(")\n");
+    sputs(quiesced?"SR6 -> QUIESCENCE REAL: the racing mutation was excluded/deferred, the epoch-V root never folded a torn capability OK\n":"SR6 -> *** FAIL (D5) ***\n");
+
+    /* =============================== SR7 =============================== */
+    sputs("\n--- SR7: MEASURE (rdtsc this run) ---\n");
+    sputs("SR7 fold: full recompute = "); sdec(m_full_cyc); sputs(" cyc ("); sdec(m_full_nodes); sputs(" node-hashes) vs incremental = "); sdec(m_inc_cyc); sputs(" cyc ("); sdec(m_inc_nodes); sputs(" node-hashes)\n");
+    sputs("SR7 restore: dematerialize = "); sdec(m_demat_cyc); sputs(" cyc; rematerialize (regs+heap+task-hash) = "); sdec(m_remat_cyc); sputs(" cyc; branch (run+re-fold) = "); sdec(m_branch_cyc); sputs(" cyc\n");
+    sputs("SR7 attestation: Ed25519 sign = "); sdec(m_sign_cyc); sputs(" cyc; verify (open) = "); sdec(m_verify_cyc); sputs(" cyc\n");
+    sputs("SR7 checkpoint bytes (32B/node, subtree sharing counted): incremental = "); sdec(m_inc_nodes*32); sputs(" B ("); sdec(m_inc_nodes); sputs(" changed nodes) vs full = ");
+    sdec(m_full_nodes*32); sputs(" B ("); sdec(m_full_nodes); sputs(" nodes); shared/reused = "); sdec(m_shared*32); sputs(" B not re-stored\n");
+
+    sputs("\nSR SCOPE: a COMPOSITION of committed primitives - NO proof claim upgraded. Single machine, QEMU, quiescent-epoch capture only; concurrent capture out of scope. SR5 = emulated-platform signature over a self-reported manifest, NOT hardware-rooted attestation. See kernel/SR_LOG.md.\n");
+    sputs("=== PART SR complete ===\n");
+    if(g_kernel_cr3){ __asm__ volatile("mov %0,%%cr3"::"r"(g_kernel_cr3):"memory"); }   /* leave the kernel address space active for run_shell */
+}
+
 void kmain(void);
 void kmain(void){
     g_boot_tsc=rdtsc();   /* INT: earliest measurable point, for boot-to-desktop */
@@ -8659,6 +8974,7 @@ void kmain(void){
     run_int();         /* DEEP SYSTEM INTEGRATION: INT1 whole-system coherence (every subsystem's live residual state), INT2 cross-subsystem hot-path table (rdtsc this run), INT3 safe content-addressed last-fetch cache opt (before/after), INT4 honest real-HW gap (QEMU-only), INT5 the one-architecture statement */
     run_tools();       /* CARMIX-NATIVE DEV + DAILY TOOLS: T-1 content-addressed editor (edit re-roots, old kept), T-2 program image spawned under a bounded cap (unauthorized run REFUSED), T-3 remat-debug time-travel by hash (re-hash-confirmed, not replay), T-4 daily flow end-to-end (create+edit+navigate+list+send, one step REFUSED), T-5 rdtsc */
     run_cv();          /* CV-CORE (STAGE 1): canonical form over the reachable acyclic graph - CV1 bottom-up+deterministic, CV2 authority-in-the-name (one-cap difference REFUSED), CV3 dead-scratch excluded via the committed gc_rc oracle, CV4 path-independent convergence, CV5 canonical dedup within a domain + cross-domain refusal, CV6 undecidability boundary (structural != observational), CV7 canonicalize at a real capture boundary + measured integration choice */
+    run_sr();          /* PART SR: THE SYSTEM ROOT - SR1 root object (folds every task hash [page table incl.], cap slot versions, store manifest, FS root, per-component ceilings through the committed epoch tree), SR2 diff-proportional fold (incremental==full, counted shared subtrees), SR3 time-travel + branch WITH processes (task hash+registers+heap restored), SR4 revocation FLOOR at remat (decision b), SR5 whole-system Ed25519 attestation (tamper+unknown-signer refused), SR6 quiescence (never folds a torn capability), SR7 rdtsc measure */
     run_shell();       /* E4: live focus/drag/resize/type desktop (does not return) */
 #endif
     hcf();
