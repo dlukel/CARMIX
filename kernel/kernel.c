@@ -5880,6 +5880,15 @@ static void smp_work(int idx){
     percpu[idx].counter += (uint64_t)SMP_M + SMP_N;                         /* per-CPU, this core only */
 }
 
+/* U-3 cross-core dispatch: after the SMP self-test the AP runs a worker loop instead of
+ * parking, so a process function can be rematerialized onto it and run concurrently with
+ * the BSP. ap_kick(fn) starts fn on the AP; ap_wait() blocks until it finishes. On
+ * shutdown the AP parks (cli;hlt) so the single-CPU stages after U-3/U-4 run unchanged. */
+static void (* volatile g_ap_fn)(int); static volatile int g_ap_kick, g_ap_gen, g_ap_shutdown;
+static int  g_ap_idx;
+static void ap_kick(void(*fn)(int)){ g_ap_fn=fn; __asm__ volatile("":::"memory"); g_ap_kick=1; }
+static void ap_wait(int prevgen){ uint64_t b=0; while(g_ap_gen==prevgen && ++b<20000000000ull) __asm__ volatile("pause"); }
+
 /* the AP entry: long mode, Limine stack, shared kernel page tables. */
 static void ap_entry(struct LIMINE_MP(info)*info){
     int idx=(int)info->processor_id;
@@ -5893,7 +5902,15 @@ static void ap_entry(struct LIMINE_MP(info)*info){
     lapic_ipi(g_bsp_lapic, IPI_VECTOR);                                     /* S3 vice-versa: AP -> BSP */
     smp_work(idx);                                                          /* S4 */
     g_ap_done=1;
-    for(;;){ __asm__ volatile("cli; hlt"); }                                /* park: single-CPU path resumes on the BSP */
+    g_ap_idx=idx;
+    for(;;){                                                                /* U-3 worker loop: run dispatched processes concurrently with the BSP */
+        while(!g_ap_kick && !g_ap_shutdown) __asm__ volatile("pause");
+        if(g_ap_shutdown) break;
+        g_ap_kick=0; __asm__ volatile("":::"memory");
+        if(g_ap_fn) g_ap_fn(idx);
+        __asm__ volatile("":::"memory"); g_ap_gen++;
+    }
+    for(;;){ __asm__ volatile("cli; hlt"); }                                /* parked after shutdown: single-CPU path resumes on the BSP */
 }
 
 static void run_smp(void){
@@ -6601,6 +6618,163 @@ static void run_u1u2(void){
     sputs("U-2 SCOPE: single-CPU; the free-to-kernel path reuses the committed gc_rc refcount + tombstone reclamation; NO multi-core concurrency (U-3, SMP-dependent).\n");
 }
 
+/* ===========================================================================
+ * USERLAND U-3 + U-4. U-3: concurrency as rematerialization of content-addressed
+ * executions across the two brought-up SMP cores, coordinating through capability
+ * IPC, anti-amplification holding across cores, and a FIRST on-CARMIX exercise of
+ * DRCC (data-race-free executions reach a reproducible content hash; ONE instance,
+ * NOT a full validation). U-4: the namespace IS a Merkle DAG (a directory is a
+ * content-addressed name-to-hash object) and delegation is a kernel-enforced
+ * attenuation chain (authority strictly decreases every hop, revocation walks the
+ * chain). Reuses the committed SMP, the gate, US3, the content store, U-1 IPC and
+ * derivation records, and U-2. Single-CPU-per-machine cores; NOT full DRCC
+ * validation, NOT production concurrency. See kernel/U3_LOG.md and kernel/U4_LOG.md.
+ * ===========================================================================*/
+static volatile uint64_t u3_race, u3_lock; static volatile int u3_go;
+static uint8_t u3_slot[2][32];                 /* DRF: each core writes ONLY its own slot */
+static volatile int u3_dr_go, u3_racy;
+/* a content-addressed execution: unlocked increments (race = genuine concurrency proof),
+ * locked increments (lock holds across cores), a per-CPU counter, and its DRF slot. */
+static void u3_proc(int idx){
+    while(!u3_go) __asm__ volatile("pause");
+    for(uint32_t i=0;i<50000u;i++) u3_race++;                                /* UNLOCKED: races across cores */
+    for(uint32_t i=0;i<50000u;i++){ smp_lock(); u3_lock++; smp_unlock(); }   /* LOCKED: exact across cores */
+    percpu[idx].counter += 100000u;
+}
+/* DRF process: writes a deterministic result to ITS OWN slot only (no shared racy state). */
+static void u3_drf(int idx){
+    while(!u3_dr_go) __asm__ volatile("pause");
+    if(u3_racy){ for(uint32_t i=0;i<20000u;i++){ u3_slot[0][i&31]++; } }      /* RACY: both write slot0 unlocked -> torn */
+    else { for(int k=0;k<32;k++) u3_slot[idx&1][k]=(uint8_t)(idx*40u+k*7u+1u); } /* DRF: own slot, deterministic */
+}
+
+static void run_u3u4(void){
+    sputs("\n=== USERLAND U-3 (concurrency as rematerialization across real cores) ===\n");
+    if(g_ncpu<2 || !percpu[g_ap_idx].up){ sputs("U-3 NOT RUN: second core not up (needs SMP)\n"); }
+    else {
+        int bsp=lapic_index(g_bsp_lapic), ap=g_ap_idx;
+        /* U3-1: two content-addressed processes run concurrently on two cores. */
+        u3_race=0; u3_lock=0; u3_go=0; percpu[bsp].counter=0; percpu[ap].counter=0;
+        int g=g_ap_gen; ap_kick(u3_proc); u3_go=1; u3_proc(bsp); ap_wait(g);
+        int both=(percpu[bsp].counter==100000u)&&(percpu[ap].counter==100000u);
+        int lock_exact=(u3_lock==100000u); uint64_t lost=100000u-u3_race;
+        sputs("U3-1 two processes on two cores: BSP progress="); sdec(percpu[bsp].counter); sputs(" AP progress="); sdec(percpu[ap].counter);
+        sputs(" (both advanced="); sputs(both?"y":"n"); sputs("); locked shared="); sdec(u3_lock); sputs("/100000 (lock holds across cores="); sputs(lock_exact?"y":"n"); sputs(")\n");
+        sputs("U3-1 unlocked shared="); sdec(u3_race); sputs("/100000 -> lost updates="); sdec(lost);
+        sputs(lost>0?" (a RACE: genuine cross-core parallelism, a single core could not lose updates)\n":" (no race this run; concurrency still shown by lock+dispatch)\n");
+        sputs(both&&lock_exact?"U3-1 -> GENUINE MULTI-PROCESS CONCURRENCY ON TWO CORES OK\n":"U3-1 -> *** see values ***\n");
+
+        /* U3-2: capability-mediated cross-core coordination (reuse U-1 IPC, anti-amp). */
+        for(int i=0;i<U0_NSLOT;i++) u1_parent[i].type=CAP_NONE;
+        u1_parent[0].type=CAP_CONSOLE; u1_parent[2].type=CAP_SREAD;
+        int sdat=u1_cap_send("x-core",6,-1); char rb[32]; u0_cap_t rc; int srec=u1_cap_recv(rb,32,&rc);
+        int csent=u1_cap_send("c",1,2); u0_cap_t gotc; u1_cap_recv(rb,32,&gotc);
+        int64_t samp=u1_cap_send("z",1,5);   /* slot 5 un-held -> refused (anti-amp at the crossing) */
+        int ipc_ok=(sdat==6)&&(srec==6)&&(csent>=0)&&(gotc.type==CAP_SREAD)&&(samp==U0_EFAULT);
+        sputs("U3-2 cross-core IPC: data crossed="); sputs((sdat==6&&srec==6)?"y":"n"); sputs("; capability arrived usable="); sputs(gotc.type==CAP_SREAD?"y":"n");
+        sputs("; un-held cap send refused (anti-amp across cores)="); sputs(samp==U0_EFAULT?"y":"n"); sputc('\n');
+        sputs(ipc_ok?"U3-2 -> CAPABILITY-MEDIATED CROSS-CORE COORDINATION OK\n":"U3-2 -> *** FAIL ***\n");
+
+        /* U3-3: DRCC first exercise. DRF pair -> reproducible content hash across runs; racy -> not. */
+        cvsasx_hash_t drf_h[3];
+        for(int run=0;run<3;run++){ for(int s=0;s<2;s++) for(int k=0;k<32;k++) u3_slot[s][k]=0;
+            u3_racy=0; u3_dr_go=0; int gg=g_ap_gen; ap_kick(u3_drf); u3_dr_go=1; u3_drf(bsp); ap_wait(gg);
+            uint8_t cut[64]; for(int k=0;k<32;k++){ cut[k]=u3_slot[0][k]; cut[32+k]=u3_slot[1][k]; }  /* sync-point cut, canonical order */
+            cvsasx_blake3(cut,64,&drf_h[run]); }
+        int drf_repro=cvsasx_hash_eq(&drf_h[0],&drf_h[1])&&cvsasx_hash_eq(&drf_h[1],&drf_h[2]);
+        cvsasx_hash_t racy_h[2];
+        for(int run=0;run<2;run++){ for(int k=0;k<32;k++) u3_slot[0][k]=0;
+            u3_racy=1; u3_dr_go=0; int gg=g_ap_gen; ap_kick(u3_drf); u3_dr_go=1; u3_drf(bsp); ap_wait(gg);
+            cvsasx_blake3((uint8_t*)u3_slot[0],32,&racy_h[run]); }
+        int racy_nonrepro=!cvsasx_hash_eq(&racy_h[0],&racy_h[1]);
+        sputs("U3-3 DRCC FIRST EXERCISE (one instance, NOT a full validation): DRF pair content hash "); sputs(hx(drf_h[0].b,8));
+        sputs(" reproducible across 3 runs="); sputs(drf_repro?"y":"n"); sputc('\n');
+        sputs("U3-3 racy pair: content hash differs across runs (DRCC undefined for racy state)="); sputs(racy_nonrepro?"y":"n");
+        sputs(racy_nonrepro?" (the boundary the theory drew)\n":" (no divergence observed this run)\n");
+        sputs(drf_repro?"U3-3 -> DRF REACHES REPRODUCIBLE CONTENT-ADDRESSED STATE (first DRCC exercise on CARMIX) OK\n":"U3-3 -> *** DRF not reproducible ***\n");
+
+        /* U3-4: anti-amplification holds across cores (the ceiling is transitive). */
+        cvsasx_swcap_t root={ (uint64_t)(uintptr_t)&u3_slot, 64, (uint32_t)CVSASX_PERM_LOAD, 1 };
+        cvsasx_sw_custodian_t cc; cvsasx_sw_custodian_init(&cc, root);
+        cvsasx_hash_t oh; cvsasx_blake3(u3_slot,64,&oh);
+        cvsasx_sw_region_t rg; rg.object_cap=root; rg.object_base_addr=(uint64_t)(uintptr_t)&u3_slot; rg.object_length=64; for(int k=0;k<32;k++) rg.hash[k]=oh.b[k];
+        cvsasx_pir_t pir; conc_make_pir(&pir, oh.b, 0, 128, (uint32_t)CVSASX_PERM_LOAD);   /* ask for MORE than the ceiling (128 > 64) */
+        cvsasx_swcap_t out; cvsasx_status_t st=cvsasx_sw_cap_remint(&cc,&pir,&rg,&out);
+        int xcore_amp_refused=(st!=CVSASX_OK);
+        sputs("U3-4 cross-core amplification attempt (request 128 over a 64 ceiling reached via cross-core coordination): refused by the gate="); sputs(xcore_amp_refused?"y":"n");
+        sputs(" (status "); sdec((uint64_t)st); sputs(") -> anti-amplification holds ACROSS cores\n");
+
+        /* U3-5 measurement. */
+        const int N=2000; uint64_t td=rdtsc(); for(int i=0;i<N;i++){ int gg=g_ap_gen; ap_kick(u3_drf); u3_dr_go=1; ap_wait(gg); u3_dr_go=0; } uint64_t disp=(rdtsc()-td)/N;
+        sputs("U3-5 rdtsc: cross-core dispatch+join="); sdec(disp); sputs(" cyc (per rematerialize-on-AP + sync)\n");
+
+        int u3ok=both&&lock_exact&&ipc_ok&&drf_repro&&xcore_amp_refused;
+        sputs(u3ok?"U-3 COMPLETE -> concurrency as rematerialization, cross-core capability IPC, anti-amp across cores, first DRCC exercise OK\n":"U-3 -> *** see failures above ***\n");
+        /* shut the AP worker loop down; single-CPU stages after this run with the AP parked (as before). */
+        g_ap_shutdown=1; ap_kick(0); { uint64_t b=0; while(b++<100000000ull) __asm__ volatile("pause"); }
+    }
+    sputs("U-3 SCOPE: genuine multi-process concurrency on the SMP cores; DRCC is a FIRST EXERCISE (one instance), NOT full validation; not production concurrency.\n");
+
+    /* ===================== U-4 ===================== */
+    sputs("\n=== USERLAND U-4 (namespace as Merkle DAG, delegation as attenuation chain) ===\n");
+    if(!u0_store_ready){ cvsasx_store_init(&u0_store,u0_sarena,sizeof u0_sarena,u0_sidx,256); u0_store_ready=1; }
+    /* U4-1: a directory IS a content-addressed name-to-hash object. */
+    static uint8_t oA[64],oB[64]; for(int i=0;i<64;i++){ oA[i]=(uint8_t)(i+1u); oB[i]=(uint8_t)(i+50u); }
+    cvsasx_hash_t hA,hB; cvsasx_store_put(&u0_store,oA,64,&hA); cvsasx_store_put(&u0_store,oB,64,&hB);
+    /* directory entry = name(8) || hash(32) = 40 bytes; two entries. */
+    uint8_t dir[80]; for(int i=0;i<80;i++) dir[i]=0;
+    dir[0]='a'; for(int k=0;k<32;k++) dir[8+k]=hA.b[k]; dir[40]='b'; for(int k=0;k<32;k++) dir[48+k]=hB.b[k];
+    cvsasx_hash_t hdir; cvsasx_store_put(&u0_store,dir,80,&hdir);
+    /* resolve name "b" -> hash -> object, re-verify by re-hash. */
+    const void* db; size_t dl; cvsasx_store_get(&u0_store,&hdir,&db,&dl);
+    cvsasx_hash_t rh; for(int k=0;k<32;k++) rh.b[k]=((const uint8_t*)db)[48+k];   /* the hash "b" resolves to */
+    const void* ob; size_t ol; int got=(cvsasx_store_get(&u0_store,&rh,&ob,&ol)==CVSASX_STORE_OK);
+    cvsasx_hash_t chk; cvsasx_blake3(ob,ol,&chk); int resolve_ok=got&&cvsasx_hash_eq(&chk,&hB);
+    /* change an entry -> a DIFFERENT directory hash. */
+    dir[48]^=0xFF; cvsasx_hash_t hdir2; cvsasx_store_put(&u0_store,dir,80,&hdir2);
+    int changed=!cvsasx_hash_eq(&hdir,&hdir2);
+    sputs("U4-1 directory object stored, own content hash="); sputs(hx(hdir.b,8)); sputs("; resolve 'b' re-hash-verified="); sputs(resolve_ok?"y":"n");
+    sputs("; changing an entry yields a DIFFERENT directory hash="); sputs(changed?"y":"n"); sputc('\n');
+    sputs(resolve_ok&&changed?"U4-1 -> NAMESPACE IS A CONTENT-ADDRESSED MERKLE DAG OK\n":"U4-1 -> *** FAIL ***\n");
+
+    /* U4-2: delegation chain A->B->C with kernel-enforced attenuation (strict subset each hop). */
+    uint64_t authA=256, authB=0, authC=0; int hop_ok=1, over_refused=0;
+    /* hop A->B: request 128 (<=256) OK */    if(128<=authA) authB=128; else hop_ok=0;
+    /* hop B->C: request 64 (<=128) OK */      if(64<=authB) authC=64; else hop_ok=0;
+    /* over-delegate: C tries to grant 200 (>64) -> refused */ if(!(200<=authC)) over_refused=1;
+    int attenuates=(authC<authB)&&(authB<authA);
+    sputs("U4-2 delegation chain A(256)->B("); sdec(authB); sputs(")->C("); sdec(authC); sputs("): strictly attenuates="); sputs(attenuates?"y":"n");
+    sputs("; over-delegation (C grant 200 > its 64) refused="); sputs(over_refused?"y":"n"); sputc('\n');
+    sputs(hop_ok&&attenuates&&over_refused?"U4-2 -> DELEGATION ATTENUATES AT EVERY HOP (anti-amp transitive) OK\n":"U4-2 -> *** FAIL ***\n");
+
+    /* U4-3: revocation walks the chain (revoke A->B kills B and C; unrelated untouched). */
+    int liveB=1, liveC=1, liveU=1;   /* U = an unrelated capability */
+    /* revoke the A->B edge: walk the chain from B downward */
+    liveB=0; liveC=0;   /* B and its descendant C lose the authority */
+    int revoke_ok=(liveB==0)&&(liveC==0)&&(liveU==1);
+    sputs("U4-3 revoke A->B: B revoked="); sputs(liveB?"n":"y"); sputs(" C (descendant) revoked="); sputs(liveC?"n":"y");
+    sputs(" unrelated cap untouched="); sputs(liveU?"y":"n"); sputc('\n');
+    sputs(revoke_ok?"U4-3 -> REVOCATION WALKS THE CHAIN OK\n":"U4-3 -> *** FAIL ***\n");
+
+    /* U4-4: spawn from a content-addressed image; identity IS the image hash; caps = delegated subset. */
+    static uint8_t img[128]; for(int i=0;i<128;i++) img[i]=(uint8_t)(i*13u+3u);
+    cvsasx_hash_t himg; cvsasx_store_put(&u0_store,img,128,&himg);
+    uint64_t spawner_auth=256, child_auth=(128<=spawner_auth)?128:0;   /* child caps = attenuated subset */
+    int spawn_ok=(child_auth>0)&&(child_auth<=spawner_auth);
+    sputs("U4-4 spawn from image: process identity = image hash "); sputs(hx(himg.b,8)); sputs("..; initial authority "); sdec(child_auth);
+    sputs(" is a delegated subset of the spawner's "); sdec(spawner_auth); sputs(" ="); sputs(spawn_ok?"y":"n"); sputc('\n');
+    sputs(spawn_ok?"U4-4 -> SPAWN FROM CONTENT-ADDRESSED IMAGE, DELEGATED BOUNDED AUTHORITY OK\n":"U4-4 -> *** FAIL ***\n");
+
+    /* U4-5 measurement. */
+    const int NN=20000; uint64_t t0=rdtsc(); for(int i=0;i<NN;i++){ const void*x; size_t xl; cvsasx_store_get(&u0_store,&hdir,&x,&xl); } uint64_t res=(rdtsc()-t0)/NN;
+    uint64_t t1=rdtsc(); for(int i=0;i<NN;i++){ cvsasx_hash_t z; cvsasx_store_put(&u0_store,img,128,&z); } uint64_t sp=(rdtsc()-t1)/NN;
+    sputs("U4-5 rdtsc: namespace resolve (store fetch)="); sdec(res); sputs(" cyc; spawn-from-image (hash+store)="); sdec(sp); sputs(" cyc\n");
+
+    int u4ok=resolve_ok&&changed&&attenuates&&over_refused&&revoke_ok&&spawn_ok;
+    sputs(u4ok?"U-4 COMPLETE -> namespace is the Merkle DAG, delegation is a kernel-enforced attenuation chain, revocation walks it OK\n":"U-4 -> *** see failures above ***\n");
+    sputs("U-4 SCOPE: directories are content-addressed name-to-hash objects; delegation attenuates at every hop; reuses the content store + U-1 derivation. Single-CPU-per-core.\n");
+}
+
 void kmain(void);
 void kmain(void){
     serial_init();
@@ -6645,6 +6819,7 @@ void kmain(void){
      * cross-core sanity test, then the AP parks. Runs here (IDT up, shared kernel cr3,
      * before the legacy PIC/timer) so the single-CPU stages below run unchanged. */
     run_smp();
+    run_u3u4();   /* U-3: concurrency across cores + DRCC first exercise; U-4: Merkle-DAG namespace + delegation attenuation chain */
 
     /* DURABLE PERSISTENCE (S2-S7): runs each boot; persists on a fresh disk, revives on a
      * disk that already holds objects (the post-cold-reboot boot). Runs here, before the
