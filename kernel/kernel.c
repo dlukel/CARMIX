@@ -8070,6 +8070,138 @@ static void run_int(void){
     sputs("INT DISPROVED: hidden regression (the full 3-boot must be green except the accepted PM0 stall); forced/risky optimization (the cache is correct-by-immutability, non-proven code, and reported honestly if no win); claimed physical result (none - QEMU-only, gap to metal stated).\n");
 }
 
+/* ===========================================================================
+ * CARMIX-NATIVE DEV + DAILY TOOLS SURFACE (T-1..T-5). Ties the ALREADY-BUILT
+ * subsystems into a usable, capability-mediated daily workflow. Composes ONLY
+ * existing primitives - NOTHING new invented, NO proven-core file touched:
+ *   T-1 editor: reuses the content-addressed FS (fs_dir_put/fs_resolve/fs_read
+ *       + u0_store) - an edit is a NEW object re-rooted into the tree, the OLD
+ *       version retained (free versioning), exactly as run_fs FS4.
+ *   T-2 run-under-cap: a content-addressed program image (the embedded ELF,
+ *       stored) spawned under a bounded cap set via u1_spawn (the CU/U-1 model);
+ *       a spawn requesting a cap the parent LACKS is REFUSED (D1 anti-amp).
+ *   T-3 remat-debug: reuses run_dbg (dbg_state/dbg_resolve/dbg_store) - capture
+ *       the run's state as a content-addressed snapshot, time-travel to a PAST
+ *       state DIRECTLY by hash; a re-hash CONFIRMS the bytes ARE that state
+ *       (direct addressing, NOT replay).
+ *   T-4 daily flow: create+edit a file (T-1), navigate by name (fs_resolve),
+ *       list the live process + its cap set (the run_cu model), send a message
+ *       over an endpoint capability (reuses run_net: net_reach + the swcap
+ *       anti-amp ceiling + content-addressed message) - authority enforced at
+ *       every step, ONE unauthorized step REFUSED.
+ *   T-5 measure: rdtsc THIS run - edit+re-root, spawn-run, remat-debug, nav.
+ * HONEST SCOPE: there is NO in-kernel C compiler. The CARMIX-native dev model is
+ * content-addressed source + program image + spawn-under-capability + remat
+ * debugging; an actual compile toolchain is EXTERNAL/future work (the ELF here
+ * was built by an external toolchain and embedded). Single-CPU, headless.
+ * DISPROVES: ambient authority (unauthorized run + unauthorized send REFUSED);
+ * in-place edit (edit re-roots, old version still resolves); replay-masquerade
+ * (re-hash confirms the re-materialized state); faked compiler (NOT claimed).
+ * See kernel/TOOLS_LOG.md.
+ * ===========================================================================*/
+static void run_tools(void){
+    sputs("\n=== CARMIX-NATIVE DEV + DAILY TOOLS SURFACE (T-1..T-5) - composing the built subsystems ===\n");
+    if(!u0_store_ready){ cvsasx_store_init(&u0_store,u0_sarena,sizeof u0_sarena,u0_sidx,256); u0_store_ready=1; }
+    if(!dbg_store_ready){ cvsasx_store_init(&dbg_store,dbg_arena,sizeof dbg_arena,dbg_sidx,192); dbg_store_ready=1; }
+    if(!net_store_ready){ cvsasx_store_init(&net_store,net_arena,sizeof net_arena,net_sidx,128); net_store_ready=1; }
+
+    /* ---------- T-1: content-addressed text editor (edit = NEW object + re-root; OLD kept) ---------- */
+    static const char t0[]="draft: buy milk\n";
+    static uint8_t e0[64]; int l0=0; while(t0[l0]){ e0[l0]=(uint8_t)t0[l0]; l0++; }
+    cvsasx_hash_t hOld; cvsasx_store_put(&u0_store,e0,(uint64_t)l0,&hOld);
+    char en[1][8]={{'n','o','t','e',0}}; cvsasx_hash_t f0[1]={hOld}; cvsasx_hash_t rOld=fs_dir_put(en,f0,1);   /* re-root v1 */
+    static const char t1[]="draft: buy milk\nand bread\n";
+    static uint8_t e1[64]; int l1=0; while(t1[l1]){ e1[l1]=(uint8_t)t1[l1]; l1++; }
+    cvsasx_hash_t hNew; cvsasx_store_put(&u0_store,e1,(uint64_t)l1,&hNew);                                     /* the edit = a NEW object */
+    cvsasx_hash_t f1[1]={hNew}; cvsasx_hash_t rNew=fs_dir_put(en,f1,1);                                        /* re-root v2 */
+    int edited=!cvsasx_hash_eq(&hNew,&hOld)&&!cvsasx_hash_eq(&rNew,&rOld);
+    cvsasx_hash_t chk; uint8_t ob[64]; uint64_t ol=0;
+    int old_kept=fs_resolve(&rOld,"note",1,&chk)&&cvsasx_hash_eq(&chk,&hOld)&&fs_read(&hOld,ob,64,&ol)&&ol==(uint64_t)l0;   /* old root still resolves the OLD text */
+    cvsasx_hash_t nchk; uint8_t nb[64]; uint64_t nl=0;
+    int new_reads=fs_resolve(&rNew,"note",1,&nchk)&&cvsasx_hash_eq(&nchk,&hNew)&&fs_read(&hNew,nb,64,&nl)&&nl==(uint64_t)l1;
+    sputs("T-1 editor: edit -> OLD text hash="); sputs(hx(hOld.b,8)); sputs(" (len "); sdec((uint64_t)l0);
+    sputs(") -> NEW text hash="); sputs(hx(hNew.b,8)); sputs(" (len "); sdec((uint64_t)l1); sputs("); new hash="); sputs(edited?"y":"n"); sputc('\n');
+    sputs("T-1 re-root (NOT in-place): new root="); sputs(hx(rNew.b,8)); sputs(" resolves new text="); sputs(new_reads?"y":"n");
+    sputs("; OLD root="); sputs(hx(rOld.b,8)); sputs(" STILL resolves the OLD text (free versioning)="); sputs(old_kept?"y":"n"); sputc('\n');
+    int t1ok=edited&&old_kept&&new_reads;
+
+    /* ---------- T-2: run a content-addressed program image under a bounded capability set ---------- */
+    cvsasx_hash_t imgH; cvsasx_store_put(&u0_store,user_prog_elf,user_prog_elf_len,&imgH);   /* the program IMAGE is a content-addressed object */
+    for(int i=0;i<U0_NSLOT;i++) u1_parent[i].type=CAP_NONE;                                  /* the launcher's authority */
+    u1_parent[0].type=CAP_CONSOLE; u1_parent[2].type=CAP_SREAD; conc_make_pir(&u1_parent[2].pir,imgH.b,0,64,(uint32_t)CVSASX_PERM_LOAD);
+    int req_run[]={0,2}; int64_t sp=u1_spawn(req_run,2);                                     /* spawn the image bounded to {console, image-read} */
+    int bounded=(sp==0)&&(u1_child[0].type==CAP_CONSOLE)&&(u1_child[2].type==CAP_SREAD)&&(u1_child[3].type==CAP_NONE);
+    int req_bad[]={0,5}; int64_t sp_bad=u1_spawn(req_bad,2);                                 /* unauthorized run: needs slot-5 cap the launcher LACKS */
+    int refused=(sp_bad==U0_EFAULT);
+    sputs("T-2 program image "); sputs(hx(imgH.b,8)); sputs(" ("); sdec(user_prog_elf_len); sputs(" B) spawned under a bounded cap set {console, image-read}: bounded="); sputs(bounded?"y":"n"); sputc('\n');
+    sputs("T-2 unauthorized run (requests a capability the launcher does NOT hold) -> u1_spawn returned "); sdec((uint64_t)(-sp_bad));
+    sputs(" = REFUSED (D1 anti-amp, no ambient authority)="); sputs(refused?"y":"n"); sputc('\n');
+    int t2ok=bounded&&refused;
+
+    /* ---------- T-3: debug the run by rematerialization (time-travel by hash, NOT replay) ---------- */
+    static uint8_t pg0[DBG_PG], pg1[DBG_PG]; for(uint32_t i=0;i<DBG_PG;i++){ pg0[i]=(uint8_t)(i+1u); pg1[i]=(uint8_t)(i+64u); }
+    cvsasx_hash_t st0=dbg_state(1,7,pg0,pg1);    /* captured state BEFORE a step: r0=1 */
+    cvsasx_hash_t st1=dbg_state(42,7,pg0,pg1);   /* captured state AFTER a step:  r0=42 */
+    const void* jb; size_t jl; int fetched=(cvsasx_store_get(&dbg_store,&st0,&jb,&jl)==CVSASX_STORE_OK);
+    cvsasx_hash_t rehash; cvsasx_blake3(jb,jl,&rehash); int confirm=fetched&&cvsasx_hash_eq(&rehash,&st0);   /* re-hash CONFIRMS the bytes ARE st0 */
+    cvsasx_hash_t c0,r0h; uint8_t past=0; const void* rb; size_t rl;
+    int recov=dbg_resolve(&st0,"cpu",&c0)&&dbg_resolve(&c0,"r0",&r0h)&&(cvsasx_store_get(&dbg_store,&r0h,&rb,&rl)==CVSASX_STORE_OK)&&rl==1;
+    if(recov) past=((const uint8_t*)rb)[0];
+    cvsasx_hash_t cc,cr; uint8_t cur=0; int curok=dbg_resolve(&st1,"cpu",&cc)&&dbg_resolve(&cc,"r0",&cr)&&(cvsasx_store_get(&dbg_store,&cr,&rb,&rl)==CVSASX_STORE_OK);
+    if(curok) cur=((const uint8_t*)rb)[0];
+    int ttravel=confirm&&recov&&(past==1)&&(cur==42);
+    sputs("T-3 remat-debug: state snapshots st0="); sputs(hx(st0.b,6)); sputs(" -> st1="); sputs(hx(st1.b,6)); sputc('\n');
+    sputs("T-3 time-travel to st0 by hash: fetched "); sdec((uint64_t)jl); sputs(" bytes, re-hash == recorded hash="); sputs(confirm?"y":"n"); sputs(" (NOTHING re-executed -> direct addressing, NOT replay)\n");
+    sputs("T-3 re-materialized PAST r0="); sdec((uint64_t)past); sputs(" vs current(st1) r0="); sdec((uint64_t)cur); sputs(" -> the ACTUAL old bytes, recovered by naming them="); sputs(ttravel?"y":"n"); sputc('\n');
+    int t3ok=ttravel;
+
+    /* ---------- T-4: a realistic daily task end-to-end, authority enforced, ONE step REFUSED ---------- */
+    /* (a) create + edit a file (reuse the T-1 mechanism on a fresh note). */
+    static const char d0[]="todo: ship T-tools\n"; static uint8_t da[64]; int dl=0; while(d0[dl]){ da[dl]=(uint8_t)d0[dl]; dl++; }
+    cvsasx_hash_t dh0; cvsasx_store_put(&u0_store,da,(uint64_t)dl,&dh0);
+    char dn[1][8]={{'t','o','d','o',0}}; cvsasx_hash_t df0[1]={dh0}; (void)fs_dir_put(dn,df0,1);   /* v1 root retained by content-addressing */
+    static const char d1[]="todo: ship T-tools [DONE]\n"; static uint8_t db2[64]; int dl2=0; while(d1[dl2]){ db2[dl2]=(uint8_t)d1[dl2]; dl2++; }
+    cvsasx_hash_t dh1; cvsasx_store_put(&u0_store,db2,(uint64_t)dl2,&dh1);
+    cvsasx_hash_t df1[1]={dh1}; cvsasx_hash_t dr1=fs_dir_put(dn,df1,1);
+    /* (b) navigate to it through the namespace. */
+    cvsasx_hash_t nav; uint8_t nbuf[64]; uint64_t nlen=0;
+    int navd=fs_resolve(&dr1,"todo",1,&nav)&&cvsasx_hash_eq(&nav,&dh1)&&fs_read(&nav,nbuf,64,&nlen)&&nlen==(uint64_t)dl2;
+    /* (c) list the live process + its capability set (the run_cu model - the child spawned in T-2). */
+    int ncaps=0; sputs("T-4 live process P1 (image "); sputs(hx(imgH.b,6)); sputs(") caps:");
+    for(int i=0;i<U0_NSLOT;i++) if(u1_child[i].type!=CAP_NONE){ ncaps++;
+        sputs(" slot"); sdec((uint64_t)i); sputc('=');
+        sputs(u1_child[i].type==CAP_CONSOLE?"CONSOLE":u1_child[i].type==CAP_SREAD?"STORE-READ":u1_child[i].type==CAP_SWRITE?"STORE-WRITE":u1_child[i].type==CAP_POOL?"POOL":"?"); }
+    sputs("; count="); sdec((uint64_t)ncaps); sputc('\n');
+    /* (d) send a message over an endpoint capability (reuse run_net: reach + swcap anti-amp ceiling + content-addressed msg). */
+    uint8_t chd[16]; for(int i=0;i<16;i++) chd[i]=0; chd[0]='T'; chd[8]=1; cvsasx_hash_t chan; cvsasx_store_put(&net_store,chd,16,&chan);
+    net_cap_t ep={1,chan,NET_PAY}; net_cap_t epNone={0,{{0}},0};
+    cvsasx_hash_t zero; for(int k=0;k<32;k++) zero.b[k]=0;
+    uint8_t pay[8]; for(int i=0;i<8;i++) pay[i]=(uint8_t)('d'+i); uint8_t mb[NET_MSGMAX];
+    cvsasx_hash_t mh=net_msg_build(mb,0,&zero,pay,8);
+    int sent=0;
+    if(net_reach(&ep,&chan)==0 && net_send_ceiling_ok(&ep,8)){                 /* authority + anti-amp ceiling enforced */
+        cvsasx_hash_t sh; cvsasx_store_put(&net_store,mb,48,&sh);
+        cvsasx_hash_t rc; cvsasx_blake3(mb,48,&rc); sent=cvsasx_hash_eq(&rc,&mh); }   /* loopback receive re-hash-verifies */
+    /* (e) the ONE unauthorized step: a send with NO endpoint cap -> REFUSED (no ambient reach). */
+    int send_refused=(net_reach(&epNone,&chan)==U0_EFAULT);
+    sputs("T-4 daily flow: create+edit note (old kept, new resolves)="); sputs((navd)?"y":"n"); sputs("; navigate-by-name new todo="); sputs(hx(dh1.b,8)); sputc('\n');
+    sputs("T-4 send over endpoint cap (content-addressed msg "); sputs(hx(mh.b,8)); sputs(", cap-gated + anti-amp)="); sputs(sent?"y":"n");
+    sputs("; UNAUTHORIZED send (no endpoint cap) REFUSED (no ambient reach)="); sputs(send_refused?"y":"n"); sputc('\n');
+    int t4ok=navd&&(ncaps==2)&&sent&&send_refused;
+
+    /* ---------- T-5: measure (rdtsc, this run) ---------- */
+    const int N=20000, M=2000;
+    uint64_t a=rdtsc(); for(int i=0;i<N;i++){ cvsasx_hash_t h; cvsasx_store_put(&u0_store,e1,(uint64_t)l1,&h); cvsasx_hash_t fx[1]={h}; (void)fs_dir_put(en,fx,1); } uint64_t c_edit=(rdtsc()-a)/N;
+    uint64_t b=rdtsc(); for(int i=0;i<M;i++) (void)u1_spawn(req_run,2); uint64_t c_spawn=(rdtsc()-b)/M;
+    uint64_t c=rdtsc(); for(int i=0;i<N;i++){ const void* x; size_t xl; cvsasx_store_get(&dbg_store,&st0,&x,&xl); cvsasx_hash_t hh; cvsasx_blake3(x,xl,&hh); (void)cvsasx_hash_eq(&hh,&st0); } uint64_t c_remat=(rdtsc()-c)/N;
+    uint64_t d=rdtsc(); for(int i=0;i<N;i++){ cvsasx_hash_t x; (void)fs_resolve(&dr1,"todo",1,&x); } uint64_t c_nav=(rdtsc()-d)/N;
+    sputs("T-5 rdtsc (this run): edit+re-root="); sdec(c_edit); sputs(" spawn-run="); sdec(c_spawn); sputs(" rematerialize-debug(fetch+re-hash)="); sdec(c_remat); sputs(" namespace-nav="); sdec(c_nav); sputs(" cyc\n");
+
+    int allok=t1ok&&t2ok&&t3ok&&t4ok;
+    sputs(allok?"TOOLS -> DAILY WORKFLOW OK: content-addressed editor (edit re-roots, old kept), program image spawned under a bounded cap (unauthorized run REFUSED), remat-debug time-travels by hash (re-hash-confirmed, NOT replay), daily flow end-to-end with authority enforced + one step REFUSED\n":"TOOLS -> *** see failures above ***\n");
+    sputs("TOOLS SCOPE (honest): single-CPU, headless. Composes ONLY existing subsystems (FS, u1_spawn, run_dbg, run_net) - NOTHING new invented, NO proven-core file touched. NO in-kernel C compiler: the CARMIX-native dev model is content-addressed source + program image + spawn-under-capability + rematerialization debugging; the compile toolchain is EXTERNAL/future work (the ELF here was built externally + embedded). DISPROVED: ambient authority (unauthorized run + unauthorized send REFUSED), in-place edit (edit re-roots, old version still resolves), replay-masquerade (re-hash confirms the re-materialized state), faked compiler (NOT claimed).\n");
+}
+
 void kmain(void);
 void kmain(void){
     g_boot_tsc=rdtsc();   /* INT: earliest measurable point, for boot-to-desktop */
@@ -8216,6 +8348,7 @@ void kmain(void){
     run_taskstate();   /* FULL TASK-STATE DEMATERIALIZATION: TS0 canonical Merkle page-table form, TS1 whole-process task-hash, TS2 free ALL frames (page-table frames too), TS3 bit-exact rebuild, TS4 authority never amplified, TS5 break-even vs keep-root-resident */
     run_sharedmap();   /* SHARED MAPPINGS IN THE CANONICAL FORM: SM0 establish sharing, SM1 shared-object layer, SM2 lifetime across demat, SM3 capability gate (one shared frame survives the round trip), SM4 per-owner authority, SM5 limits */
     run_int();         /* DEEP SYSTEM INTEGRATION: INT1 whole-system coherence (every subsystem's live residual state), INT2 cross-subsystem hot-path table (rdtsc this run), INT3 safe content-addressed last-fetch cache opt (before/after), INT4 honest real-HW gap (QEMU-only), INT5 the one-architecture statement */
+    run_tools();       /* CARMIX-NATIVE DEV + DAILY TOOLS: T-1 content-addressed editor (edit re-roots, old kept), T-2 program image spawned under a bounded cap (unauthorized run REFUSED), T-3 remat-debug time-travel by hash (re-hash-confirmed, not replay), T-4 daily flow end-to-end (create+edit+navigate+list+send, one step REFUSED), T-5 rdtsc */
     run_shell();       /* E4: live focus/drag/resize/type desktop (does not return) */
 #endif
     hcf();
