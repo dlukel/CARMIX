@@ -355,3 +355,35 @@ that need physical hardware are the boot itself and a physical NVMe device.
 This is the beginning of a long path, stated as the beginning. It does not claim a hardware OS,
 a broad driver suite, or production readiness. kernel.c and the proven core are untouched, and
 the QEMU regression remains green.
+
+## Cycle 1: ACPI topology, IOAPIC routing, LAPIC timer, device authority (QEMU real ACPI/APIC)
+
+Built as kernel/hwtest.c (kernel.c and the proven core untouched; swcap linked only), booted on
+one QEMU q35 which provides real ACPI, a real IOAPIC, and a real LAPIC. Every rung ran against
+those real interfaces, which is genuine progress toward metal. Physical boot on a real machine
+is a separate gap (no physical hardware here), stated honestly below.
+
+- HW-1 ACPI MADT parse: the RSDP (revision 0, so the 32-bit RSDT) was walked to the MADT and the
+  real interrupt topology read from the machine's tables, not hardcoded: 1 Local APIC, LAPIC base
+  0xfee00000, IOAPIC at 0xfec00000, 5 interrupt source overrides.
+- HW-2 IOAPIC/LAPIC routing: an IOAPIC redirection entry (GSI 2 to LAPIC vector 0x41) was
+  programmed, the legacy PIC masked, and the PIT driven so its IRQ routes through the IOAPIC. 5
+  real device interrupts were delivered IOAPIC to LAPIC, handled, and acknowledged with EOI.
+- HW-3 LAPIC timer: calibrated against the PIT (a real 10 ms one-shot), measured about 63,145,600
+  LAPIC-timer ticks per second, set periodic at 100 Hz, and observed 20 real periodic ticks. This
+  is the real LAPIC timer, not a PIT relabeled.
+- HW-4 physical boot: NOT run on metal, no physical x86-64 machine in this environment. The
+  ACPI/IOAPIC/timer rungs ran against QEMU's real ACPI/APIC. Physical boot and a physical NVMe SSD
+  await real hardware. No physical boot is claimed. The boot artifact is real-media-ready.
+- HW-5 device authority under the ceiling (the CARMIX-specific rung): a driver holds a bounded
+  device capability over exactly its MMIO region (base 0xfec00000, length 4096) via the proven
+  swcap gate. In-region access is allowed, an out-of-region access is refused, and an over-length
+  access is refused. Device access is capability-bounded, anti-amplification at the driver level,
+  no ambient MMIO. This is what makes CARMIX on metal structurally different from a conventional
+  kernel.
+- HW-6 measurement (rdtsc, QEMU this run): ACPI MADT parse about 292M cyc (includes the on-demand
+  ACPI page mappings), LAPIC-timer bring-up plus calibration about 892M cyc (includes the 10 ms
+  calibration wall time), calibrated rate 63,145,600 ticks/sec.
+
+The QEMU regression is unaffected (kernel.c and the proven core are byte-identical). The remaining
+gap to metal is the physical boot itself and a physical device, which need real hardware.
