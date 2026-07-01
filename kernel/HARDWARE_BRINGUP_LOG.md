@@ -288,7 +288,7 @@ MCFG table for extended capabilities and MSI/MSI-X setup.
 
 ---
 
-## Part B status: mapped, and the honest real blocker
+## Part B status: NVMe rung built (QEMU-NVMe, real interface), physical boot still blocked
 
 Part B is the first concrete rung: CARMIX booting via Limine on a real x86-64 machine
 with real content-addressed storage. The honest observed result this cycle is that the
@@ -309,19 +309,49 @@ What is genuinely true and carries toward metal:
 - The only hard real-IRQ dependency is a periodic tick (the storage and keyboard paths are
   polled), which narrows what a first real boot must get right on interrupts (H-R4).
 
-The recommended next code rung, per H-R1, is an NVMe driver. NVMe is the most tractable real
-storage controller (a clean queue-based MMIO interface) and, crucially, it can be developed
-and tested against QEMU's own NVMe device emulation, which implements the real NVMe register
-and queue interface. That is an intermediate rung: closer to metal than virtio because it is
-the real NVMe interface, but still emulator-tested, not physical-tested, and it must be
-labeled that way. Building it does not require physical hardware. It is the honest next step
-that this environment can take toward real storage, and it is not built in this cycle.
+The code rung per H-R1, an NVMe driver, is now BUILT (kernel/nvmetest.c, kernel/nvme_build.sh).
+NVMe is the most tractable real storage controller (a clean queue-based MMIO interface). The
+driver does the real controller bring-up: it finds the NVMe controller by PCI class (01h 08h),
+maps BAR0 uncached, resets the controller (CC.EN=0, waits CSTS.RDY=0), sets up the admin
+submission and completion queues (AQA, ASQ, ACQ), enables the controller (CC.EN=1, waits
+CSTS.RDY=1), creates an I/O queue pair with the admin Create-I/O-CQ and Create-I/O-SQ commands,
+and does I/O reads and writes through the I/O submission queue with PRP1 data pointers and
+completion-queue phase-bit polling and doorbell rings. This is the real NVMe register and queue
+interface, not virtio.
 
-So the honest deliverable here is the research map above (Part A) plus this frank Part B
-status: the path to metal is mapped concretely and grounded in the actual code, the first
-real blocker is the absence of a physical machine in this environment, and the shortest code
-rung this environment can still take (an NVMe driver against the real NVMe interface as QEMU
-presents it) is identified and deferred, not faked. The QEMU regression remains green.
+It is tested against QEMU's own NVMe device emulation (-device nvme), which implements the NVMe
+spec, so it exercises the real interface. It is EMULATOR-tested, NOT physical-NVMe-tested.
+Running it on a physical NVMe SSD is the next step and needs physical hardware this environment
+does not have. That distinction is stated everywhere the rung is reported.
 
-This is the beginning of a long path, stated as the beginning. It does not claim a hardware
-OS, a driver suite, or production readiness.
+Observed this run (QEMU-NVMe):
+
+```
+HW-B NVMe found bus=0 dev=3 fn=0 BAR0=0xfebd4000   CAP DSTRD=0 MQES=2048
+HW-B controller ENABLED (CSTS.RDY=1); admin queues live; I/O queue pair created (qid 1)
+HW-B1 NVMe init OK: 199473658 cyc
+HW-B2 object 512B content address BLAKE3=45e04ceedb6460dc..
+HW-B2 wrote payload@LBA1 status=0 header@LBA0 status=0; write 975345 cyc
+HW-B2 read header status=0 payload status=0; read 621766 cyc
+HW-B2 re-hash of the read-back payload == the stored content address = y
+HW-B2 tamper: flip 1 payload byte -> re-hash MISMATCH detected = y
+-> RUNG (b) DONE: a real NVMe controller driver does content-addressed I/O, re-verified from the device (QEMU-NVMe; physical-NVMe untested)
+```
+
+A content-addressed object (512 bytes, named by its BLAKE3 hash) is written to the NVMe device
+(payload LBA plus a header LBA that binds the length and the hash, the torn-tail record shape),
+read back, and re-verified by re-hashing the read-back bytes to the stored content address. A
+single flipped byte in the read-back payload fails the re-hash, so the device is treated as
+untrusted media and every load is re-verified. This is the architecture's content store proving
+itself over a real storage-controller interface. All numbers are rdtsc-measured this run and
+labeled QEMU-NVMe, not physical-hardware.
+
+What remains blocked is the PHYSICAL step: an actual metal boot and an actual physical NVMe SSD.
+This environment has no physical x86-64 machine and no bare-metal instance, so no real-hardware
+boot or real-disk write is claimed. The boot artifact is real-media-ready (a hybrid BIOS plus
+UEFI Limine ISO), and the storage driver now speaks the real NVMe interface, so the two pieces
+that need physical hardware are the boot itself and a physical NVMe device.
+
+This is the beginning of a long path, stated as the beginning. It does not claim a hardware OS,
+a broad driver suite, or production readiness. kernel.c and the proven core are untouched, and
+the QEMU regression remains green.

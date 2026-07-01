@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+# CARMIX hardware bring-up rung (b): build nvmetest.elf, boot ONE QEMU with a real
+# NVMe controller (-device nvme, the real NVMe register/queue interface), capture serial.
+# kernel.c and the proven modules are NOT touched (store/ + blake3/ are LINKED only).
+set -e
+HERE="$(cd "$(dirname "$0")" && pwd)"
+LIM="${LIMINE_DIR:?set LIMINE_DIR}"
+X="${X86TOOLS:?set X86TOOLS}"
+CL="${CVSASX_CLANG:?set CVSASX_CLANG}"
+LD="${CVSASX_LLD:?set CVSASX_LLD}"
+NM="${CVSASX_NM:?set CVSASX_NM}"
+ROOT="$(dirname "$HERE")"; ST="$ROOT/store"
+OUT="$(mktemp -d)"
+export LD_LIBRARY_PATH="$X/usr/lib/x86_64-linux-gnu:$X/lib/x86_64-linux-gnu${QEMU_LIBS:+:$QEMU_LIBS}"
+KF="--target=x86_64-unknown-none-elf -ffreestanding -nostdlib -fno-stack-protector -fno-pic -fno-pie \
+    -mno-red-zone -mno-mmx -mno-sse -mno-sse2 -mgeneral-regs-only -mcmodel=kernel -O2 -Wall -Wextra \
+    -Wno-sign-compare -I $LIM -I $HERE -I $ST -I $ST/blake3 -I $ST/freestanding"
+B3="-DNDEBUG -DBLAKE3_NO_SSE2 -DBLAKE3_NO_SSE41 -DBLAKE3_NO_AVX2 -DBLAKE3_NO_AVX512 -DBLAKE3_USE_NEON=0 -fno-builtin"
+
+echo "=== build nvmetest + BLAKE3/store (LINKED, proven core untouched) ==="
+$CL $KF     -c "$HERE/nvmetest.c"              -o "$OUT/nvmetest.o"
+$CL $KF     -c "$ST/store_mem.c"               -o "$OUT/store_mem.o"
+$CL $KF $B3 -c "$ST/object_store.c"            -o "$OUT/object_store.o"
+$CL $KF $B3 -c "$ST/blake3_wrap.c"             -o "$OUT/blake3_wrap.o"
+$CL $KF $B3 -c "$ST/blake3/blake3.c"           -o "$OUT/blake3.o"
+$CL $KF $B3 -c "$ST/blake3/blake3_dispatch.c"  -o "$OUT/blake3_dispatch.o"
+$CL $KF $B3 -c "$ST/blake3/blake3_portable.c"  -o "$OUT/blake3_portable.o"
+"$LD" -m elf_x86_64 -static -T "$HERE/linker.ld" --build-id=none -z noexecstack -o "$OUT/nvmetest.elf" "$OUT"/*.o
+echo "link OK: nvmetest.elf = $(stat -c%s "$OUT/nvmetest.elf") bytes"
+echo "undefined symbols : $("$NM" "$OUT/nvmetest.elf" 2>/dev/null | grep -c ' U ' || true)  (expect 0)"
+
+echo "=== bootable ISO (Limine BIOS+UEFI) ==="
+ISO=$OUT/iso; mkdir -p "$ISO/boot/limine" "$ISO/EFI/BOOT"
+cp "$OUT/nvmetest.elf" "$ISO/boot/kernel.elf"
+cp "$LIM/limine-bios.sys" "$LIM/limine-bios-cd.bin" "$LIM/limine-uefi-cd.bin" "$ISO/boot/limine/"
+cp "$LIM/BOOTX64.EFI" "$ISO/EFI/BOOT/"
+cat > "$ISO/boot/limine/limine.conf" <<'EOF'
+timeout: 0
+serial: yes
+
+/CARMIX-NVMETEST
+    protocol: limine
+    path: boot():/boot/kernel.elf
+EOF
+( cd "$OUT" && "$X/usr/bin/xorriso" -as mkisofs -R -r -J \
+    -b boot/limine/limine-bios-cd.bin -no-emul-boot -boot-load-size 4 -boot-info-table \
+    --efi-boot boot/limine/limine-uefi-cd.bin -efi-boot-part --efi-boot-image \
+    --protective-msdos-label iso -o nvmetest.iso ) 2>&1 | tail -1
+"$LIM/limine" bios-install "$OUT/nvmetest.iso" 2>&1 | tail -1
+cp "$OUT/nvmetest.iso" "$HERE/nvmetest.iso"
+
+echo "=== boot ONE QEMU with a real NVMe controller (-device nvme) ==="
+DISK="$OUT/nvme-disk.img"; truncate -s 64M "$DISK"
+QEMU="$X/usr/bin/qemu-system-x86_64"
+LOG="$HERE/serial_nvme.log"; rm -f "$LOG"
+timeout 90 "$QEMU" -M q35 -m 512M \
+    -drive file="$DISK",if=none,id=nvm,format=raw \
+    -device nvme,serial=cafe0001,drive=nvm \
+    -cdrom "$OUT/nvmetest.iso" -serial "file:$LOG" -display none -no-reboot \
+    -L "$X/usr/share/seabios" -L "$X/usr/share/qemu" >/dev/null 2>&1 || true
+echo "================= SERIAL (nvmetest) ================="
+cat "$LOG" 2>/dev/null || echo "(no log)"
+rm -rf "$OUT"
