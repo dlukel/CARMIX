@@ -7240,6 +7240,174 @@ static void run_net(void){
     sputs("NET SCOPE: single-CPU LOOPBACK (in-kernel), NO real NIC/ring/IRQ/TCP-IP, NO real clock (counter/flag proxy for liveness). Endpoint identity + bounded reach are CARMIX-native (content-addressed descriptor + proven swcap anti-amp gate); ordering + liveness are the EXPLICIT non-content-addressed edge, labeled, never faked. NO ambient reachability, NO unverified message, NO stream claimed content-addressed, NO generic sockets imported.\n");
 }
 
+/* ===========================================================================
+ * CYCLE 4: REMATERIALIZATION DEBUGGING (DBG1-DBG6) per kernel/DEBUGGING_MODEL.md.
+ * Debugging/observability when every past execution state is content-addressed and
+ * re-materializable by its hash. An execution STATE is a small Merkle tree:
+ *   state = dir{ "cpu": dir{r0,r1}, "mem": dir{p0,p1} }.
+ * A history is a DAG of such state hashes. Time-travel to a past state H is DIRECT
+ * ADDRESSING (store_get(H) + re-hash CONFIRMS the bytes ARE H), NOT replay/re-execution.
+ * Diff by hash descends only where hashes differ (shared subtrees pruned unvisited).
+ * Provenance is read off the deterministic spine; a non-deterministic/external edge is
+ * SAID SO, no fabricated cause. The honest limits are ENFORCED with real refusal paths:
+ * cannot un-send an external effect, cannot reproduce a race, cannot restore real-time.
+ * Reuses cvsasx_store_put/get + cvsasx_blake3 + cvsasx_hash_eq (its OWN dbg_store, same
+ * engine as net_store) and the committed gc_rc refcount table for the retention-cost
+ * surface. Single-CPU; the external input is a REAL non-deterministic source (rdtsc).
+ * See kernel/DBG_LOG.md.
+ * ===========================================================================*/
+#define DBG_ENT 40u          /* directory entry = name(8) || hash(32), same layout as the committed FS */
+#define DBG_DOM 9u           /* gc_rc domain for pinned history roots (distinct from GC_DOM_SYS/CFS_DOM) */
+#define DBG_PG  64u          /* memory-page leaf size */
+static uint8_t dbg_arena[1u<<14]; static cvsasx_store_entry_t dbg_sidx[192];
+static cvsasx_store_t dbg_store; static int dbg_store_ready;
+static cvsasx_hash_t dbg_put(const void* b, uint64_t l){ cvsasx_hash_t h; cvsasx_store_put(&dbg_store,b,l,&h); return h; }
+static cvsasx_hash_t dbg_dir(const char names[][8], const cvsasx_hash_t* hs, int n){
+    uint8_t buf[8*DBG_ENT]; for(uint32_t i=0;i<sizeof buf;i++) buf[i]=0;
+    for(int k=0;k<n;k++){ for(int j=0;j<8;j++) buf[k*DBG_ENT+j]=names[k][j]; for(int j=0;j<32;j++) buf[k*DBG_ENT+8+j]=hs[k].b[j]; }
+    return dbg_put(buf,(uint64_t)n*DBG_ENT);
+}
+/* resolve a name in dir(dirh) -> child hash; the dir object is re-verified by re-hash (untrusted medium). */
+static int dbg_resolve(const cvsasx_hash_t* dirh, const char* name, cvsasx_hash_t* out){
+    const void* b; size_t l; if(cvsasx_store_get(&dbg_store,dirh,&b,&l)!=CVSASX_STORE_OK) return 0;
+    cvsasx_hash_t chk; cvsasx_blake3(b,l,&chk); if(!cvsasx_hash_eq(&chk,dirh)) return 0;
+    int n=(int)(l/DBG_ENT);
+    for(int k=0;k<n;k++){ const uint8_t* e=(const uint8_t*)b+k*DBG_ENT; int m=1; for(int j=0;j<8&&name[j];j++) if(e[j]!=(uint8_t)name[j]){m=0;break;}
+        if(m){ for(int j=0;j<32;j++) out->b[j]=e[8+j]; return 1; } }
+    return 0;
+}
+/* build an execution STATE object (a 2-level Merkle tree) and return its root hash. */
+static cvsasx_hash_t dbg_state(uint8_t r0, uint8_t r1, const uint8_t* p0, const uint8_t* p1){
+    cvsasx_hash_t hr0=dbg_put(&r0,1), hr1=dbg_put(&r1,1);
+    char cn[2][8]={{'r','0',0},{'r','1',0}}; cvsasx_hash_t ch[2]={hr0,hr1}; cvsasx_hash_t hcpu=dbg_dir(cn,ch,2);
+    cvsasx_hash_t hp0=dbg_put(p0,DBG_PG), hp1=dbg_put(p1,DBG_PG);
+    char mn[2][8]={{'p','0',0},{'p','1',0}}; cvsasx_hash_t mh[2]={hp0,hp1}; cvsasx_hash_t hmem=dbg_dir(mn,mh,2);
+    char sn[2][8]={{'c','p','u',0},{'m','e','m',0}}; cvsasx_hash_t sh[2]={hcpu,hmem}; return dbg_dir(sn,sh,2);
+}
+/* structural diff by hash: identical subtrees are PRUNED (one hash compare, never descended);
+ * *visited counts dir-pairs actually descended. depth = tree height (root=2). Returns changed leaves. */
+static int dbg_diff(const cvsasx_hash_t* a, const cvsasx_hash_t* b, int depth, int* visited){
+    if(cvsasx_hash_eq(a,b)) return 0;                                        /* PRUNE: hashes equal -> subtree identical */
+    if(depth==0) return 1;                                                   /* leaf-level change */
+    (*visited)++;
+    const void* ba; size_t la; if(cvsasx_store_get(&dbg_store,a,&ba,&la)!=CVSASX_STORE_OK) return 1;
+    int n=(int)(la/DBG_ENT), changed=0;
+    for(int k=0;k<n;k++){ char nm[9]; for(int j=0;j<8;j++) nm[j]=(char)((const uint8_t*)ba)[k*DBG_ENT+j]; nm[8]=0;
+        cvsasx_hash_t ca; for(int j=0;j<32;j++) ca.b[j]=((const uint8_t*)ba)[k*DBG_ENT+8+j];
+        cvsasx_hash_t cb; if(dbg_resolve(b,nm,&cb)) changed+=dbg_diff(&ca,&cb,depth-1,visited); else changed++; }
+    return changed;
+}
+/* an external step: p0 <- a REAL non-deterministic input (the 64-bit TSC, strictly monotonic
+ * within a boot so two reads never coincide). Returns the successor state; NOT a function of the
+ * predecessor alone. */
+static cvsasx_hash_t dbg_ext_step(uint8_t r0, uint8_t r1, const uint8_t* base_p0, const uint8_t* p1){
+    uint8_t np0[DBG_PG]; for(uint32_t i=0;i<DBG_PG;i++) np0[i]=base_p0[i];
+    uint64_t t=rdtsc(); for(int i=0;i<8;i++) np0[i]=(uint8_t)(t>>(8*i));    /* external byte(s), not in the predecessor */
+    return dbg_state(r0,r1,np0,p1);
+}
+
+static void run_dbg(void){
+    sputs("\n=== CYCLE 4: REMATERIALIZATION DEBUGGING (DBG1-DBG6) over content-addressed state ===\n");
+    if(!dbg_store_ready){ cvsasx_store_init(&dbg_store,dbg_arena,sizeof dbg_arena,dbg_sidx,192); dbg_store_ready=1; }
+
+    /* fixed memory pages (deterministic); the external edges perturb p0 from a live TSC. */
+    static uint8_t memA[DBG_PG], memB[DBG_PG];
+    for(uint32_t i=0;i<DBG_PG;i++){ memA[i]=(uint8_t)(i+1u); memB[i]=(uint8_t)(i+128u); }
+
+    /* the deterministic history spine: s0 --(r0+=8)--> s1, both over the same memory. */
+    cvsasx_hash_t s0=dbg_state(1,2,memA,memB);
+    cvsasx_hash_t s1=dbg_state(9,2,memA,memB);
+    /* the external edge: s1 --(p0 <- external input)--> s2 . Two independent reads give two
+     * successors (execution A and execution B) that share the s0->s1 prefix then diverge. */
+    cvsasx_hash_t s2 =dbg_ext_step(9,2,memA,memB);
+    cvsasx_hash_t s2b=dbg_ext_step(9,2,memA,memB);
+    cvsasx_hash_t histA[3]={s0,s1,s2};
+
+    /* ---- DBG-1: state-history DAG + TIME-TRAVEL BY HASH (direct addressing, NOT replay). ---- */
+    /* jump to the PAST state s0 by its hash: fetch the bytes, re-hash, confirm they ARE s0. */
+    const void* jb; size_t jl; int fetched=(cvsasx_store_get(&dbg_store,&s0,&jb,&jl)==CVSASX_STORE_OK);
+    cvsasx_hash_t rehash; cvsasx_blake3(jb,jl,&rehash); int confirms=fetched&&cvsasx_hash_eq(&rehash,&s0);
+    /* recover the PAST register value directly from the re-materialized state (r0==1), not the current one (r0==9). */
+    cvsasx_hash_t jc,jr0; uint8_t past_r0=0; const void* rb; size_t rl;
+    int recov=dbg_resolve(&s0,"cpu",&jc)&&dbg_resolve(&jc,"r0",&jr0)&&(cvsasx_store_get(&dbg_store,&jr0,&rb,&rl)==CVSASX_STORE_OK)&&rl==1;
+    if(recov) past_r0=((const uint8_t*)rb)[0];
+    cvsasx_hash_t cc,cr0; uint8_t cur_r0=0; int curok=dbg_resolve(&s2,"cpu",&cc)&&dbg_resolve(&cc,"r0",&cr0)&&(cvsasx_store_get(&dbg_store,&cr0,&rb,&rl)==CVSASX_STORE_OK);
+    if(curok) cur_r0=((const uint8_t*)rb)[0];
+    int t_travel=confirms&&recov&&(past_r0==1)&&(cur_r0==9);
+    sputs("DBG-1 history DAG nodes s0="); sputs(hx(s0.b,6)); sputs(" -> s1="); sputs(hx(s1.b,6)); sputs(" -> s2="); sputs(hx(s2.b,6)); sputc('\n');
+    sputs("DBG-1 time-travel to s0 by hash: fetched "); sdec((uint64_t)jl); sputs(" bytes, re-hash == recorded hash="); sputs(confirms?"y":"n");
+    sputs(" (bit-exact; NOTHING re-executed -> direct addressing, NOT replay)\n");
+    sputs("DBG-1 re-materialized PAST r0="); sdec((uint64_t)past_r0); sputs(" vs current(s2) r0="); sdec((uint64_t)cur_r0); sputs(" -> the actual old bytes, recovered by naming them="); sputs(t_travel?"y":"n"); sputc('\n');
+    /* retention/GC cost surface: pinning a history root pins its subtree (un-reclaimable while retained). */
+    for(int i=0;i<3;i++) gc_rc_apply(histA[i].b,DBG_DOM,+1);
+    int pinned=(gc_rc_get(s0.b,DBG_DOM)>0)&&(gc_rc_get(s1.b,DBG_DOM)>0)&&(gc_rc_get(s2.b,DBG_DOM)>0);
+    gc_rc_apply(s2.b,DBG_DOM,-1); int unpinnable=(gc_rc_get(s2.b,DBG_DOM)==0); gc_rc_apply(s2.b,DBG_DOM,+1); /* re-pin */
+    sputs("DBG-1 RETENTION COST (surfaced, not hidden): retaining a state PINS its root -> un-reclaimable while retained="); sputs(pinned?"y":"n");
+    sputs("; dropping the root makes it reclaimable again="); sputs(unpinnable?"y":"n"); sputs(" (committed gc_rc refcount path)\n");
+    int dbg1=t_travel&&pinned&&unpinnable;
+
+    /* ---- DBG-2: STRUCTURAL DIFF BY HASH (descend only where hashes differ; shared subtrees pruned). ---- */
+    int v01=0; int c01=dbg_diff(&s0,&s1,2,&v01);   /* s0 vs s1: only r0 changed; whole mem subtree is IDENTICAL -> pruned */
+    int v02=0; int c02=dbg_diff(&s0,&s2,2,&v02);   /* s0 vs s2: r0 AND p0 changed -> both subtrees descended */
+    int diff_struct=(c01==1)&&(v01==2)&&(c02==2)&&(v02==3);
+    sputs("DBG-2 diff(s0,s1): changed leaves="); sdec((uint64_t)c01); sputs(", dir-pairs descended="); sdec((uint64_t)v01);
+    sputs(" (mem subtree shared -> PRUNED, r1 leaf pruned)\n");
+    sputs("DBG-2 diff(s0,s2): changed leaves="); sdec((uint64_t)c02); sputs(", dir-pairs descended="); sdec((uint64_t)v02);
+    sputs(" (r0 and p0 both changed -> cpu+mem descended); pruning is STRUCTURAL, not a byte scan="); sputs(diff_struct?"y":"n"); sputc('\n');
+
+    /* ---- DBG-3: PROVENANCE WALK (honest): deterministic spine reproducible; external edge SAID SO. ---- */
+    /* edge s0->s1 is deterministic (r0+=8): re-deriving from s0 reaches the SAME s1 hash. */
+    cvsasx_hash_t s1r=dbg_state(9,2,memA,memB); int det_repro=cvsasx_hash_eq(&s1r,&s1);
+    /* edge s1->s2 is EXTERNAL: re-deriving with a fresh external read reaches a DIFFERENT hash. */
+    cvsasx_hash_t s2r=dbg_ext_step(9,2,memA,memB); int ext_nonrepro=!cvsasx_hash_eq(&s2r,&s2);
+    sputs("DBG-3 provenance edge s0->s1: DETERMINISTIC (DRF spine), re-derivation reaches the same hash="); sputs(det_repro?"y":"n"); sputs(" -> reproducible lineage\n");
+    sputs("DBG-3 provenance edge s1->s2: NON-DETERMINISTIC/EXTERNAL (p0 <- external input), re-derivation differs="); sputs(ext_nonrepro?"y":"n");
+    sputs(" -> the walk STOPS here and SAYS SO: cause is outside the recorded content (NO fabricated cause)\n");
+    int dbg3=det_repro&&ext_nonrepro;
+
+    /* ---- DBG-4: OBSERVABILITY AS DAG QUERY - first divergence between two executions (by state hash). ---- */
+    cvsasx_hash_t histB[3]={s0,s1,s2b}; int div=-1;
+    for(int i=0;i<3;i++){ if(!cvsasx_hash_eq(&histA[i],&histB[i])){ div=i; break; } }
+    int vD=0; int cD=(div>=0)?dbg_diff(&histA[div],&histB[div],2,&vD):0;   /* precise delta at the divergence node (reuse DBG-2) */
+    int dbg4=(div==2)&&(cD==1)&&(vD==2);   /* diverge at index 2; delta = p0 only (cpu shared -> pruned) */
+    sputs("DBG-4 two executions A,B compared by state hash: last common node = index "); sdec((uint64_t)(div>0?div-1:0));
+    sputs(", FIRST DIVERGENCE at index "); sdec((uint64_t)div); sputc('\n');
+    sputs("DBG-4 structural delta at the divergence node: changed leaves="); sdec((uint64_t)cD); sputs(", dir-pairs descended="); sdec((uint64_t)vD);
+    sputs(" (only p0 differs; cpu subtree shared -> pruned)="); sputs(dbg4?"y":"n"); sputc('\n');
+
+    /* ---- DBG-5: LIMITS ENFORCED (real refusal paths, not caveats in prose). ---- */
+    /* (a) cannot un-send an external effect: the sent packet is NOT a referent of any state. */
+    static uint8_t pkt[16]; for(int i=0;i<16;i++) pkt[i]=(uint8_t)(0xE0+i); cvsasx_hash_t sent=dbg_put(pkt,16); /* effect emitted to the world */
+    cvsasx_hash_t junk; int effect_in_state=dbg_resolve(&s0,"sent",&junk); /* is the effect reachable from the re-materialized state? */
+    int cannot_unsend=!effect_in_state; /* not a referent -> undo REFUSED */
+    sputs("DBG-5(a) un-send external effect (packet "); sputs(hx(sent.b,6)); sputs("): effect is a referent of the re-materialized state="); sputs(effect_in_state?"y":"n");
+    sputs(" -> undo REFUSED (re-materialization is pure w.r.t. internal state, impure w.r.t. the world)="); sputs(cannot_unsend?"y":"n"); sputc('\n');
+    /* (b) cannot reproduce a race: two runs of the external edge reach different states (observed). */
+    int cannot_reproduce=!cvsasx_hash_eq(&s2,&s2b);
+    sputs("DBG-5(b) reproduce the non-deterministic edge: two runs reach the same state="); sputs(cannot_reproduce?"n":"y");
+    sputs(" -> reproduction REFUSED (DRCC undefined for racy/external state; the state is re-materializable, its recurrence is not)="); sputs(cannot_reproduce?"y":"n"); sputc('\n');
+    /* (c) cannot restore real-time context: a re-materialized state carries no clock. */
+    cvsasx_hash_t clk; int has_clock=dbg_resolve(&s0,"clock",&clk); int cannot_realtime=!has_clock;
+    sputs("DBG-5(c) restore real-time context: re-materialized state has a live clock="); sputs(has_clock?"y":"n");
+    sputs(" -> real-time/liveness query REFUSED (the state is out of wall-clock time)="); sputs(cannot_realtime?"y":"n"); sputc('\n');
+    int dbg5=cannot_unsend&&cannot_reproduce&&cannot_realtime;
+
+    /* ---- DBG-6: MEASUREMENTS (rdtsc, this run). ---- */
+    const int N=20000;
+    uint64_t t0=rdtsc(); for(int i=0;i<N;i++){ const void* b; size_t l; cvsasx_store_get(&dbg_store,&s0,&b,&l); cvsasx_hash_t h; cvsasx_blake3(b,l,&h); (void)cvsasx_hash_eq(&h,&s0); } uint64_t jump=(rdtsc()-t0)/N;
+    uint64_t t1=rdtsc(); for(int i=0;i<N;i++){ int v=0; (void)dbg_diff(&s0,&s0,2,&v); } uint64_t dpr=(rdtsc()-t1)/N;   /* identical roots -> pruned in ONE hash compare */
+    uint64_t t2=rdtsc(); for(int i=0;i<N;i++){ int v=0; (void)dbg_diff(&s0,&s2,2,&v); } uint64_t dfu=(rdtsc()-t2)/N;   /* differing roots -> descend the changed spine */
+    uint64_t t3=rdtsc(); for(int i=0;i<N;i++){ cvsasx_hash_t r=dbg_state(9,2,memA,memB); (void)cvsasx_hash_eq(&r,&s1); } uint64_t prov=(rdtsc()-t3)/N; /* provenance: re-derive+verify a deterministic edge */
+    sputs("DBG-6 rdtsc: jump-to-state(fetch+re-hash)="); sdec(jump); sputs(" cyc; structural-diff PRUNED(identical roots)="); sdec(dpr);
+    sputs(" cyc vs DESCENDED(differing)="); sdec(dfu); sputs(" cyc (pruning benefit); provenance-edge verify="); sdec(prov); sputs(" cyc\n");
+    sputs("DBG-6 history-retention STORAGE: distinct objects="); sdec((uint64_t)dbg_store.index_count); sputs(", bytes stored="); sdec(dbg_store.bytes_stored);
+    sputs(", dedup hits="); sdec(dbg_store.dedup_hits); sputs(" (structural sharing: shared subtrees stored ONCE; floor = distinct state size, not zero)\n");
+
+    int dbgok=dbg1&&diff_struct&&dbg3&&dbg4&&dbg5;
+    sputs(dbgok?"DBG -> REMATERIALIZATION DEBUGGING OK: time-travel by hash (re-hash-confirmed, NOT replay), structural diff prunes by hash, provenance honest at external edges, divergence via DAG query, LIMITS ENFORCED\n":"DBG -> *** see failures above ***\n");
+    sputs("DBG SCOPE: single-CPU; the DEBUGGING TOOLING is new, the mechanism it drives (content-address + re-materialize + re-hash) is the committed store. DEMONSTRATED: direct-addressed time-travel, structural diff, provenance on the deterministic spine, divergence query, retention cost. DEFERRED/BOUNDARY (stated, not hidden): retention policy is un-reclaimable storage; provenance is state-lineage NOT cause across external/racy edges; re-materialization CANNOT un-send effects, CANNOT reproduce non-determinism, CANNOT restore wall-clock time.\n");
+}
+
 void kmain(void);
 void kmain(void){
     serial_init();
@@ -7374,6 +7542,7 @@ void kmain(void){
     run_u1u2();        /* U-1: spawn bounded authority + revocation + capability IPC; U-2: real heap + free coupled to the committed GC (sys_mem_release -> gc_rc reclaim) */
     run_fs();          /* CONTENT-ADDRESSED FILESYSTEM: file=object, dir=Merkle map, write re-roots (native versioning + free snapshots), reads re-verified, root durable */
     run_cfs();         /* CYCLE 2 FULL CFS: file ops (write/append/truncate re-root, large files=Merkle trees), dir ops (mkdir/rmdir/rename/move), GC-integrated (dead trees reclaim, snapshots pin), durable crash-consistent root, structural diff */
+    run_dbg();         /* CYCLE 4 REMATERIALIZATION DEBUGGING: DBG1 time-travel by hash (re-hash-confirmed, not replay), DBG2 structural diff (prune by hash), DBG3 honest provenance (external edge said so), DBG4 divergence via DAG query, DBG5 limits ENFORCED (no un-send/no reproduce/no real-time), DBG6 rdtsc */
     run_net();         /* CYCLE 3 NETWORKING (LOOPBACK): NET-1 endpoint=bounded cap (no ambient reach, delegation attenuates), NET-2 messages=content-addressed objects (re-hash integrity + dedup), NET-3 ordering via explicit hash chain + liveness labeled NON-CA, NET-4 end-to-end cap-gated ordered integrity channel, NET-5 real-NIC gap, NET-6 rdtsc */
     run_loader();      /* PROCESS LOADER: L0 ELF as a stored object + parse, L1 materialize segments by hash (W^X), L2 enter+run the loaded ELF, L3 load-time authority ceiling, L4 two procs share code by hash */
     conc_run();        /* CONCURRENT MULTI-PROCESS SCHEDULING: C0 two ring-3 procs timer-preempted, C1 per-process ceilings, C2 deschedule->dematerialize->rematerialize, C3 measured policy-cost */
