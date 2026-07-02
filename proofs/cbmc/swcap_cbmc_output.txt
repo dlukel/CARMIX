@@ -1,0 +1,68 @@
+CBMC bounded decision of the REAL swcap bounds + permission (anti-amplification) logic.
+A COMPLETE SAT/SMT decision WITHIN THE STATED BOUNDS. NOT a Coq/Qed proof; NOT seL4-scale refinement.
+swcap.c is byte-identical: only #include-d by the harness, never edited.
+
+==== cbmc --version ====
+6.6.0 (cbmc-6.6.0)
+
+==== command (run from repo root) ====
+cbmc proofs/cbmc/swcap_check_harness.c -I carmix -I cap --drop-unused-functions --unsigned-overflow-check --pointer-check --bounds-check
+
+==== bounds / unwind justification ====
+--drop-unused-functions : keep only functions reachable from main (main + cvsasx_swcap_check),
+                          so every reported property is REACHABLE (non-vacuous). D4.
+unwind bounds           : NONE. The reachable code (cvsasx_swcap_check, main) has no loops and
+                          no recursion, so no unwind bound is required and the decision is
+                          COMPLETE/EXHAUSTIVE over the full nondet input domain (all 2^64 offset,
+                          2^64 size, 2^32 need_perms, 2^64 base, 2^64 length, 2^8 valid).
+--unsigned-overflow-check: substantiates the source comment that length-offset is overflow-safe.
+--pointer-check --bounds-check: memory safety of the &c dereferences.
+
+==== output ====
+CBMC version 6.6.0 (cbmc-6.6.0) 64-bit x86_64 linux
+Type-checking swcap_check_harness
+Generating GOTO Program
+Adding CPROVER library (x86_64)
+Removal of function pointers and virtual functions
+Generic Property Instrumentation
+Removing unused functions
+Starting Bounded Model Checking
+Passing problem to propositional reduction
+converting SSA
+Running propositional reduction
+SAT checker: instance is UNSATISFIABLE
+
+** Results:
+proofs/cbmc/../../carmix/swcap.c function cvsasx_swcap_check
+[cvsasx_swcap_check.pointer_dereference.1] line 99 dereference failure: pointer NULL in c->valid: SUCCESS
+[cvsasx_swcap_check.pointer_dereference.2] line 99 dereference failure: pointer invalid in c->valid: SUCCESS
+[cvsasx_swcap_check.pointer_dereference.3] line 99 dereference failure: deallocated dynamic object in c->valid: SUCCESS
+[cvsasx_swcap_check.pointer_dereference.4] line 99 dereference failure: dead object in c->valid: SUCCESS
+[cvsasx_swcap_check.pointer_dereference.5] line 99 dereference failure: pointer outside object bounds in c->valid: SUCCESS
+[cvsasx_swcap_check.pointer_dereference.6] line 99 dereference failure: invalid integer address in c->valid: SUCCESS
+[cvsasx_swcap_check.pointer_dereference.7] line 100 dereference failure: pointer NULL in c->perms: SUCCESS
+[cvsasx_swcap_check.pointer_dereference.8] line 100 dereference failure: pointer invalid in c->perms: SUCCESS
+[cvsasx_swcap_check.pointer_dereference.9] line 100 dereference failure: deallocated dynamic object in c->perms: SUCCESS
+[cvsasx_swcap_check.pointer_dereference.10] line 100 dereference failure: dead object in c->perms: SUCCESS
+[cvsasx_swcap_check.pointer_dereference.11] line 100 dereference failure: pointer outside object bounds in c->perms: SUCCESS
+[cvsasx_swcap_check.pointer_dereference.12] line 100 dereference failure: invalid integer address in c->perms: SUCCESS
+[cvsasx_swcap_check.pointer_dereference.13] line 101 dereference failure: pointer NULL in c->length: SUCCESS
+[cvsasx_swcap_check.pointer_dereference.14] line 101 dereference failure: pointer invalid in c->length: SUCCESS
+[cvsasx_swcap_check.pointer_dereference.15] line 101 dereference failure: deallocated dynamic object in c->length: SUCCESS
+[cvsasx_swcap_check.pointer_dereference.16] line 101 dereference failure: dead object in c->length: SUCCESS
+[cvsasx_swcap_check.pointer_dereference.17] line 101 dereference failure: pointer outside object bounds in c->length: SUCCESS
+[cvsasx_swcap_check.pointer_dereference.18] line 101 dereference failure: invalid integer address in c->length: SUCCESS
+[cvsasx_swcap_check.overflow.1] line 102 arithmetic overflow on unsigned - in c->length - offset: SUCCESS
+[cvsasx_swcap_check.pointer_dereference.19] line 102 dereference failure: pointer NULL in c->length: SUCCESS
+[cvsasx_swcap_check.pointer_dereference.20] line 102 dereference failure: pointer invalid in c->length: SUCCESS
+[cvsasx_swcap_check.pointer_dereference.21] line 102 dereference failure: deallocated dynamic object in c->length: SUCCESS
+[cvsasx_swcap_check.pointer_dereference.22] line 102 dereference failure: dead object in c->length: SUCCESS
+[cvsasx_swcap_check.pointer_dereference.23] line 102 dereference failure: pointer outside object bounds in c->length: SUCCESS
+[cvsasx_swcap_check.pointer_dereference.24] line 102 dereference failure: invalid integer address in c->length: SUCCESS
+
+proofs/cbmc/swcap_check_harness.c function main
+[main.overflow.1] line 80 arithmetic overflow on unsigned - in c.length - offset: SUCCESS
+[main.assertion.1] line 89 assertion grant == spec: SUCCESS
+
+** 0 of 27 failed (1 iterations)
+VERIFICATION SUCCESSFUL
