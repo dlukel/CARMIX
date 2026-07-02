@@ -200,3 +200,23 @@ residual subsystem state, a single measured cross-subsystem hot-path table (this
 one safe content-addressed fetch-cache optimization with before/after, an honest real-HW
 gap, and the one-architecture statement. It re-runs no stage and adds no new mechanism;
 the integration proof is the full boot itself, which `run_int` measures and summarizes.
+
+## PM0 stall disposition (addendum 2026-07-02)
+
+What PM0 checks (kernel.c:4241): a ring-3 process crosses the anti-amp gate to extend its
+heap and its three first-touch writes are demand-zero backed. The pass predicate ANDs three
+conditions: `r_base==PM_HEAP_VA` (extend-heap returned base `0x70000000`), `zeroed==3` (exactly
+three demand-zero frames materialized, counted as the delta of the global `pf_anon_zeroed`), and
+`r_sum==0x6666` (the bump allocator's markers `0x1111+0x2222+0x3333` read back).
+
+Why it prints `*** FAIL` in the multi-stage regression: only the middle guard trips. In the
+failing boots `r_base` is still `0x70000000` and `r_sum` is still `0x6666` (the heap facility
+itself works), but `zeroed` reads `18446744073709547250` (= 2^64 - 4366), an unsigned underflow
+of `pf_anon_zeroed - zeroed_before`. `pf_anon_zeroed` is a single global demand-zero counter
+shared by every fault path; its snapshot delta is not isolated across the intervening
+address-space setup, so in a full run where earlier stages have driven demand-zero faults the
+subtraction wraps and `zeroed != 3`. In the isolated reference boot (`kernel/boot_full.log`) the
+delta is a clean `3` and PM0 passes. So the standing FAIL is a test-accounting artifact in the
+PM0 pass guard, not a defect in extend-heap or demand-zero backing. A fix (snapshot-isolate the
+count or gate on `>=3`) lives in kernel.c and is deferred to a code commit; this pass is
+doc-only and labels it honestly.

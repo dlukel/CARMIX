@@ -38,8 +38,8 @@ boot_full.log
 *.tmp
 build/
 
-# Local verification reports (not shipped)
-kernel/VERIFY_PUBLIC.md
+# Captured serial transcript (not shipped; the claim-boundary map that cites it,
+# kernel/VERIFY_PUBLIC.md, IS shipped)
 kernel/boot_full.log
 
 # local tooling / editor scratch (not part of the project)

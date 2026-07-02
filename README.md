@@ -7,7 +7,8 @@ the source held.
 
 The system boots on x86-64 through a standard bootloader, runs a capability-guarded WebAssembly
 executor in the kernel, rematerializes computation state on the running machine and across two
-machines, and ships with a machine-checked Coq proof of its core authority guarantee. It is a
+machines, and ships with a machine-checked Coq proof of its core authority guarantee (the proof
+is of the abstract re-mint model; the C gate is tested against attack tables, not machine-checked). It is a
 research prototype verified in an emulator, not a general-purpose operating system. The sections
 below state precisely what is proven, what is measured, and what is not built yet.
 
@@ -116,7 +117,8 @@ ring-3 userspace and re-minting syscall boundary, a content-addressed process lo
 concurrent processes with descheduling as rematerialization, a rematerialization-aware scheduling
 policy with a fairness control, a per-process heap, two-machine diff-proportional migration over
 ivshmem, signed cross-machine authorization with real Ed25519, a signed key lifecycle, and a
-machine-checked Coq proof of the core authority guarantee.
+machine-checked Coq proof of the core authority guarantee (of the abstract re-mint model; the C
+gate is tested against attack tables, not machine-checked).
 
 What is not built, the gap to general purpose: there is no filesystem and no persistent storage
 (the store is in RAM), no full heap allocator (the userspace allocator is bump-only with no free),

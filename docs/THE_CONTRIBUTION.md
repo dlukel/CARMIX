@@ -51,7 +51,8 @@ in software-fault-isolation form. CARMIX does not claim either of these alone.
 The difference is the fusion. Prior content-addressed migration does not re-mint capabilities under
 an authority-monotonic gate as part of the transfer. Prior capability systems do not migrate live
 state diff-proportionally by content address. CARMIX enforces both in one path, and ties the
-authority bound to a machine-checked proof.
+authority bound to a machine-checked proof (of the abstract re_mint model; the C gate is tested
+against attack tables, not machine-checked).
 
 The nearest active project in the space content-addresses program binaries, so that a function is
 named by the hash of its code and shared across a cluster. CARMIX content-addresses live
