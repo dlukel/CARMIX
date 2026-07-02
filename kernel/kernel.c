@@ -1105,6 +1105,8 @@ static int materialize(task_t *t, const cvsasx_hash_t *h){
     for(int i=0;i<8;i++) rsp |=(uint64_t)p[i]<<(8*i);
     for(int i=0;i<8;i++) used|=(uint64_t)p[8+i]<<(8*i);
     if(used>U_STACK_SZ || l!=16+used) return 0;        /* fail-closed on a malformed object */
+    uint64_t slo=(uint64_t)t->stack, shi=slo+U_STACK_SZ;                 /* F-U1: the restore range MUST lie inside this task's stack */
+    if(rsp<slo || rsp>shi || used>shi-rsp) return 0;   /* fail-closed: no write to an out-of-range dst (subtraction form, no overflow) */
     uint8_t *dst=(uint8_t*)rsp;                          /* fixed VA: same stack region */
     for(uint64_t i=0;i<used;i++) dst[i]=p[16+i];
     t->rsp=rsp;
@@ -1223,6 +1225,15 @@ static void run_unified(void){
     sputs("U1 hash back="); sputs(hx(H2.b,32)); sputs(hash_match?"  MATCH\n":"  *** MISMATCH ***\n");
     sputs("U1 counter before="); sdec(before); sputs(" after="); sdec(after); sputs(" resumed-phase="); sdec((uint64_t)u1_phase);
     sputs(u1?"  -> ACTIVATE-BY-HASH ROUND-TRIP OK\n":"  -> FAIL\n");
+    /* F-U1 demonstrated negative: an object whose restore range falls OUTSIDE the task stack
+     * must be REFUSED before any copy (fail-closed), not written to a wild address. */
+    { uint8_t ob[24]; uint64_t badrsp=(uint64_t)T->stack + U_STACK_SZ + 64, badused=8;
+      for(int i=0;i<8;i++) ob[i]=(uint8_t)(badrsp>>(8*i));
+      for(int i=0;i<8;i++) ob[8+i]=(uint8_t)(badused>>(8*i));
+      for(int i=0;i<8;i++) ob[16+i]=0xAB;
+      cvsasx_hash_t oh; cvsasx_store_put(&u_store,ob,24,&oh);
+      int refused=(materialize(T,&oh)==0);
+      sputs("U1 F-U1: an out-of-range rsp restore is REFUSED (no wild write)="); sputs(refused?"y":"n"); sputc('\n'); }
 
     /* ----- U2: incremental content-address - small dirty vs large dirty (MEASURED). */
     sputs("\nU2 incremental content-address (re-store ONLY the dirty set):\n");
@@ -2797,7 +2808,7 @@ static int elf_parse(const uint8_t *img, uint64_t len, uint64_t *entry, ld_phdr_
     uint64_t phoff = rd64(img+32);
     uint16_t phentsize = rd16(img+54), phnum = rd16(img+56);
     if(phentsize < 56) return -1;
-    if(phoff + (uint64_t)phnum*phentsize > len) return -1;   /* phdr table within the image */
+    if(phoff > len || (uint64_t)phnum*phentsize > len - phoff) return -1;   /* F-ELF1: phdr table within the image (subtraction form, no 64-bit wrap) */
     int n=0;
     for(uint16_t i=0;i<phnum;i++){
         const uint8_t *ph = img + phoff + (uint64_t)i*phentsize;
@@ -2806,7 +2817,7 @@ static int elf_parse(const uint8_t *img, uint64_t len, uint64_t *entry, ld_phdr_
         if(n >= maxp) return -1;
         ld_phdr_t s; s.type=type; s.flags=rd32(ph+4); s.off=rd64(ph+8);
         s.vaddr=rd64(ph+16); s.filesz=rd64(ph+32); s.memsz=rd64(ph+40);
-        if(s.off + s.filesz > len) return -1;       /* segment file range within the image */
+        if(s.off > len || s.filesz > len - s.off) return -1;       /* F-ELF1: segment file range within the image (subtraction form, no 64-bit wrap) */
         if(s.memsz < s.filesz) return -1;           /* memsz includes the BSS tail */
         if(s.memsz > 4096) return -1;               /* one object/frame granularity (store/rm bound) */
         out[n++]=s;
@@ -2973,6 +2984,21 @@ static void run_loader(void){
       sputs("L0 malformed image (corrupted ELF magic) -> elf_parse returned ");
       if(r<0){ sputc('-'); sdec((uint64_t)(-r)); } else sdec((uint64_t)r);
       sputs(r<0?" -> REJECTED (fail-closed) OK\n":" -> *** ACCEPTED A MALFORMED IMAGE ***\n"); }
+    /* F-ELF1 demonstrated negative: a valid header + one PT_LOAD whose p_offset is near 2^64
+     * (off+filesz wraps below len under the old add) must be REJECTED by the subtraction-form
+     * range check, not read out of bounds. */
+    { static uint8_t bad2[120]; for(int i=0;i<64;i++) bad2[i]=user_prog_elf[i]; for(int i=64;i<120;i++) bad2[i]=0;
+      bad2[32]=64;                                   /* e_phoff = 64 (phdr right after the header) */
+      bad2[54]=56; bad2[56]=1;                       /* e_phentsize=56, e_phnum=1 */
+      bad2[64]=1;                                    /* p_type = PT_LOAD */
+      bad2[68]=4;                                    /* p_flags = R */
+      bad2[72]=0x00; for(int i=1;i<8;i++) bad2[72+i]=0xFF;  /* p_offset = 0xFFFFFFFFFFFFFF00 (near 2^64) */
+      bad2[96]=0x00; bad2[97]=0x01;                  /* p_filesz = 256 -> off+filesz wraps to 0 under the old add */
+      bad2[104]=0x00; bad2[105]=0x01;               /* p_memsz  = 256 */
+      uint64_t e3; ld_phdr_t t3[LD_MAXSEG]; int r2=elf_parse(bad2,120,&e3,t3,LD_MAXSEG);
+      sputs("L0 F-ELF1 malformed image (p_offset near 2^64) -> elf_parse returned ");
+      if(r2<0){ sputc('-'); sdec((uint64_t)(-r2)); } else sdec((uint64_t)r2);
+      sputs(r2<0?" -> REJECTED (overflow-safe, fail-closed) OK\n":" -> *** ACCEPTED OOB p_offset ***\n"); }
 
     /* ---- L1: LOAD = materialize the segments by hash into a FRESH space. ---- */
     sputs("\n=== L1: load = materialize segments by hash into a fresh ring-3 space (W^X held) ===\n");
@@ -5863,13 +5889,13 @@ static volatile int g_smp_go, g_ap_done, g_smp_lock, g_ap_announced;
 static volatile uint64_t shared_u, shared_l;
 #define SMP_M 100000u
 #define SMP_N 100000u
-static int lapic_index(uint32_t lid){ for(int i=0;i<g_ncpu;i++) if(percpu[i].lapic_id==lid) return i; return 0; }
+static int lapic_index(uint32_t lid){ for(int i=0;i<g_ncpu;i++) if(percpu[i].lapic_id==lid) return i; return -1; }  /* F-SMP1: -1 on miss (was 0, which misattributed unknown ids to CPU0) */
 static inline int xchg32(volatile int*p,int v){ __asm__ volatile("xchgl %0,%1":"+r"(v),"+m"(*p)::"memory"); return v; }
 static inline void smp_lock(void){ while(xchg32(&g_smp_lock,1)) __asm__ volatile("pause"); }
 static inline void smp_unlock(void){ __asm__ volatile("":::"memory"); g_smp_lock=0; }
 
 /* the IPI handler: the receiving core records it and EOIs. Real interrupt, real LAPIC EOI. */
-__attribute__((interrupt)) static void isr_ipi(struct iframe*f){ (void)f; percpu[lapic_index(lapic_id())].ipi_received=1; lapic_eoi(); }
+__attribute__((interrupt)) static void isr_ipi(struct iframe*f){ (void)f; int idx=lapic_index(lapic_id()); if(idx>=0) percpu[idx].ipi_received=1; lapic_eoi(); }  /* F-SMP1: reject a spurious IPI from an unknown lapic id, do not charge CPU0 */
 
 /* the cross-core work both cores run concurrently (S4): unlocked increments that RACE
  * (proof of real concurrency) + locked increments that must total exactly (proof the
@@ -5892,12 +5918,13 @@ static void ap_wait(int prevgen){ uint64_t b=0; while(g_ap_gen==prevgen && ++b<2
 
 /* the AP entry: long mode, Limine stack, shared kernel page tables. */
 static void ap_entry(struct LIMINE_MP(info)*info){
-    int idx=(int)info->processor_id;
-    percpu[idx].lapic_id=info->lapic_id; percpu[idx].proc_id=(uint32_t)idx; percpu[idx].counter=0; percpu[idx].ipi_received=0;
+    int idx=(int)info->extra_argument;                                     /* F-SMP1: DENSE slot assigned by the BSP, not the ACPI processor_id */
+    if(idx<0 || idx>=SMP_MAXCPU){ for(;;) __asm__ volatile("cli; hlt"); }  /* F-SMP1: guard every percpu write; never index percpu[>=8] */
+    percpu[idx].lapic_id=info->lapic_id; percpu[idx].proc_id=(uint32_t)info->processor_id; percpu[idx].counter=0; percpu[idx].ipi_received=0;
     struct idtr idtr={(uint16_t)(sizeof(idt)-1),(uint64_t)idt}; __asm__ volatile("lidt %0"::"m"(idtr):"memory");  /* shared IDT */
     lapic_enable();
     percpu[idx].up=1;                                                       /* signal BSP: clean startup latency stops here (excludes the serial print) */
-    sputs("S1 AP reached kernel C: lapic_id="); sdec(info->lapic_id); sputs(" proc_id="); sdec((uint64_t)idx); sputs(" (a second core is executing)\n");
+    sputs("S1 AP reached kernel C: lapic_id="); sdec(info->lapic_id); sputs(" proc_id="); sdec(info->processor_id); sputs(" slot="); sdec((uint64_t)idx); sputs(" (a second core is executing)\n");
     g_ap_announced=1;
     __asm__ volatile("sti");                                                /* receive IPIs */
     lapic_ipi(g_bsp_lapic, IPI_VECTOR);                                     /* S3 vice-versa: AP -> BSP */
@@ -5927,14 +5954,24 @@ static void run_smp(void){
     g_lapic=(volatile uint32_t*)LAPIC_VA;
     lapic_enable();                                                        /* BSP LAPIC */
     outb(0x21,0xFF); outb(0xA1,0xFF);                                       /* mask the legacy PIC so sti only takes IPIs (B5 re-inits it) */
-    for(int i=0;i<g_ncpu;i++){ struct LIMINE_MP(info)*c=r->cpus[i]; int idx=(int)c->processor_id;
-        percpu[idx].lapic_id=c->lapic_id; percpu[idx].proc_id=(uint32_t)idx; percpu[idx].counter=0; percpu[idx].up=0; percpu[idx].ipi_received=0; }
-    int bsp_idx=lapic_index(g_bsp_lapic); percpu[bsp_idx].up=1;
+    int slot_ok=1;                                                          /* F-SMP1: key percpu by a DENSE slot 0..g_ncpu-1, not the ACPI processor_id */
+    for(int i=0;i<g_ncpu;i++){ struct LIMINE_MP(info)*c=r->cpus[i];
+        if(i>=SMP_MAXCPU) break;                                            /* guard idx<SMP_MAXCPU at every percpu write */
+        c->extra_argument=(uint64_t)i;                                      /* carry the dense slot to ap_entry */
+        percpu[i].lapic_id=c->lapic_id; percpu[i].proc_id=(uint32_t)c->processor_id; percpu[i].counter=0; percpu[i].up=0; percpu[i].ipi_received=0;
+        sputs("S2 core slot="); sdec((uint64_t)i); sputs(" processor_id="); sdec(c->processor_id); sputs(" lapic_id="); sdec(c->lapic_id);
+        if(lapic_index(c->lapic_id)!=i || i>=g_ncpu) slot_ok=0;             /* seam: dense-slot<g_ncpu AND lapic_index(lapic_id)==slot */
+        sputs(lapic_index(c->lapic_id)==i?" (dense map OK)\n":" *** DENSE MAP BROKEN ***\n"); }
+    sputs(slot_ok?"S2 -> DENSE per-CPU slot map: lapic_index(lapic_id)==slot<g_ncpu for every core OK\n":"S2 -> *** DENSE SLOT MAP FAIL ***\n");
+    int bsp_idx=lapic_index(g_bsp_lapic);
+    if(bsp_idx<0){ sputs("S1 -> *** BSP lapic id absent from the MP table - STOP ***\n"); return; }  /* F-SMP1: lapic_index now returns -1 on miss */
+    percpu[bsp_idx].up=1;
     uint16_t cs; __asm__ volatile("mov %%cs,%0":"=r"(cs)); idt_set(IPI_VECTOR,(void*)isr_ipi,cs);
     /* S1: start the first AP (set its goto_address; Limine releases it into ap_entry). */
     int ap_idx=-1; uint32_t ap_lapic=0;
     for(int i=0;i<g_ncpu;i++){ struct LIMINE_MP(info)*c=r->cpus[i]; if(c->lapic_id==g_bsp_lapic) continue;
-        ap_idx=(int)c->processor_id; ap_lapic=c->lapic_id; c->goto_address=ap_entry; break; }
+        ap_idx=i; ap_lapic=c->lapic_id; c->goto_address=ap_entry; break; }  /* F-SMP1: ap_idx is the DENSE slot (matches extra_argument set above) */
+    if(ap_idx<0){ sputs("S1 -> *** no application processor found - STOP ***\n"); return; }
     uint64_t t0=rdtsc(); while(!percpu[ap_idx].up && (rdtsc()-t0)<5000000000ull) __asm__ volatile("pause");
     if(!percpu[ap_idx].up){ sputs("S1 -> *** AP DID NOT START (timeout) - STOP ***\n"); return; }
     uint64_t ap_cyc=rdtsc()-t0;
@@ -5952,6 +5989,11 @@ static void run_smp(void){
     sputs("S3 IPI CPU0->CPU1 delivered+handled="); sputs(ipi_fwd?"y":"n");
     sputs("  IPI CPU1->CPU0 delivered+handled="); sputs(ipi_rev?"y":"n"); sputc('\n');
     sputs(ipi_fwd&&ipi_rev?"S3 -> IPI PATH WORKS BOTH WAYS (real LAPIC IPI, handler fired, EOI) OK\n":"S3 -> *** IPI FAILED - STOP ***\n");
+    /* F-SMP1 demonstrated negative: an IPI from an UNKNOWN lapic id maps to no slot, so isr_ipi
+     * rejects it (guarded on idx>=0) instead of charging CPU0. lapic_index now returns -1 on miss. */
+    { int unk=lapic_index(0x7FFFFFFFu);
+      sputs("S3 F-SMP1: an IPI from an unknown lapic id -> slot="); if(unk<0){ sputs("-1"); } else sdec((uint64_t)unk);
+      sputs(unk<0?" REJECTED by isr_ipi (not charged to CPU0) OK\n":" *** misattributed ***\n"); }
 
     /* S4: cross-core sanity. Both cores run smp_work concurrently. */
     shared_u=0; shared_l=0; g_smp_lock=0; g_ap_done=0;
@@ -6062,16 +6104,23 @@ static void run_gc(void){
     /* ---- GC3: root set (durable + volatile), volatile-only object held live ---- */
     cvsasx_hash_t hV; { uint8_t v[64]; for(int i=0;i<64;i++) v[i]=(uint8_t)(i*13u+5u); cvsasx_blake3(v,64,&hV); }
     int durable_roots = dur_nidx;                                        /* the persisted objects + ROOT are the durable roots */
-    int e=gc_rc_find(hV.b,GC_DOM_SYS); if(e<0){ e=gc_nrc++; for(int k=0;k<32;k++) gc_rc[e].hash[k]=hV.b[k]; gc_rc[e].domain=GC_DOM_SYS; gc_rc[e].count=0; gc_rc[e].tombstoned=0; }
-    gc_rc[e].count=1;                                                    /* held by a VOLATILE root (a live hash) */
-    int held_live = gc_rc_get(hV.b,GC_DOM_SYS)>0;
-    gc_rc[e].count=0;                                                    /* drop the volatile root */
+    gc_rc_apply(hV.b,GC_DOM_SYS,+1);                                     /* F-GC1: insert via the bounds-checked path (was a raw gc_nrc++ that could write gc_rc[256]) */
+    int e=gc_rc_find(hV.b,GC_DOM_SYS);                                   /* held by a VOLATILE root (a live hash) */
+    int held_live = e>=0 && gc_rc_get(hV.b,GC_DOM_SYS)>0;
+    if(e>=0) gc_rc[e].count=0;                                           /* drop the volatile root */
     int now_reclaimable = gc_rc_get(hV.b,GC_DOM_SYS)==0;
     sputs("GC3 root set: durable roots (persisted objects/ROOT)="); sdec((uint64_t)durable_roots);
     sputs(" + volatile roots (live hashes). Quiesce is trivial on single-CPU (snapshot at the GC invocation point).\n");
     sputs("GC3 a volatile-only-rooted object: held live while the root exists="); sputs(held_live?"y":"n");
     sputs(", reclaimable after the root drops="); sputs(now_reclaimable?"y":"n");
     sputs(held_live&&now_reclaimable?" -> ROOT SET SPANS DURABLE+VOLATILE OK\n":" -> *** FAIL ***\n");
+    /* F-GC1 demonstrated negative: with gc_nrc scratch-set to the 256 cap, the insert REFUSES
+     * (no gc_rc[256] write) and gc_nrc is unchanged. Restore gc_nrc afterwards (nothing was written). */
+    { int saved=gc_nrc; gc_nrc=256; uint8_t z[8]; for(int i=0;i<8;i++) z[i]=(uint8_t)(i+1); cvsasx_hash_t hz; cvsasx_blake3(z,8,&hz);
+      int before=gc_nrc; gc_rc_apply(hz.b,GC_DOM_SYS,+1);
+      int refused=(gc_nrc==before) && (gc_rc_find(hz.b,GC_DOM_SYS)<0);
+      gc_nrc=saved;
+      sputs("GC3 F-GC1: at the 256-entry cap the root-set insert REFUSES (no gc_rc[256] write)="); sputs(refused?"y":"n"); sputc('\n'); }
 
     /* ---- GC4: crash-consistent reclamation, ordered-prefix proof (tombstone = commit) ---- */
     {
