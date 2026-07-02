@@ -40,6 +40,26 @@ acyclic, because content addressing makes the graph faithful to a finite tree, a
 is well-founded. The result does not claim that hashing by itself, without the finite-structure
 model, forces acyclicity.
 
+proofs/CarmixDag.v strengthens this result from a finite inductive tree to a genuinely shared,
+hash-consed DAG, the store shape a content-addressed system actually has, where one child hash sits
+under several parents as a single resident object. It proves that store graph acyclic under two
+named assumptions, each an explicit Hypothesis: H_CF, store-level collision-freedom (a hash
+resolves to at most one resident content), and H_WF, a hash-before-name creation order (a child
+name already resolves to resident content of strictly smaller creation rank). Every proof closes
+with Qed under coqc 8.20.1, and acyclicity still does not rest on hash collision-freedom alone; the
+crypto-only variant is ruled out in the file's boundary note.
+
+## The DRCC minimal model
+
+proofs/CarmixDrcc.v machine-checks Deterministically Reproducible Consistent Cut in a minimal
+operational model: for a data-race-free program, all schedules reaching the cut yield one canonical
+content name, so the cut is reproducible regardless of interleaving. The in-model theorem closes
+with Qed under coqc 8.20.1 and needs no Coq Hypothesis given its explicit DRF premise; the
+model-to-machine assumptions a real deployment rests on (an SC-for-DRF memory model and the like)
+are named as honest gaps in the file, not smuggled in as proved. This machine-checks the object that
+the CV8 measurement is an instance of: CV8 measured, over a DRF workload on two real cores, that the
+run set of names had size one.
+
 ## How to re-verify
 
 Install Coq (Rocq) 8.20.1 so that coqc and coqchk are on PATH. Then:
@@ -66,3 +86,12 @@ carmix/swcap.c refines this model. The runtime correspondence is demonstrated by
 that runs six attack classes against the software backend and observes each rejected by its
 intended check. A machine-checked refinement of the C code against this model is future work,
 listed in docs/ROADMAP.md.
+
+One rung of that refinement is now decided rather than tested. proofs/cbmc records a bounded,
+bit-precise CBMC decision of the real gate cvsasx_swcap_check in carmix/swcap.c: within the stated
+bounds it decides that the gate grants if and only if the access is valid, the requested permission
+bits are a subset of the capability's (no amplification), and the requested window lies within the
+capability's length. cbmc 6.6.0 reports VERIFICATION SUCCESSFUL, 0 of 27 properties failed, and the
+reachable code has no loops or recursion so the decision is exhaustive over the nondet input domain.
+carmix/swcap.c is byte-identical: the harness only includes it. This is a bounded decision within
+stated bounds, not a Coq Qed proof and not a whole-system refinement.

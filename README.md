@@ -79,7 +79,7 @@ it. docs/THE_CONTRIBUTION.md gives the precise prior-art difference.
 | --- | --- | --- |
 | Anti-amplification monotonicity. A re-minted capability's authority never exceeds the source. | Machine-checked in Coq. coqc and coqchk both accept it. Axiom-free except one stated collision-resistance hypothesis. | proofs/Carmix.v |
 | W^X and forbidden-permission cleanliness of a valid re-minted capability. | Machine-checked in Coq. | proofs/Carmix.v |
-| Object graph acyclicity. | Machine-checked in Coq, with objects modeled as finite trees and collision-resistance connecting the hash-graph to that structure. It does not derive acyclicity from hashing alone. See docs/PROOFS.md. | proofs/Carmix.v |
+| Object graph acyclicity. | Machine-checked in Coq. proofs/Carmix.v checks it for a finite inductive tree under one collision-resistance hypothesis; proofs/CarmixDag.v strengthens it to a genuinely shared, hash-consed DAG under the two named assumptions of that file (H_CF, store-level collision-freedom, and H_WF, a hash-before-name creation order), Qed under coqc 8.20.1. Neither derives acyclicity from hashing alone. See docs/PROOFS.md. | proofs/Carmix.v, proofs/CarmixDag.v |
 | Anti-amplification holds at runtime with no capability hardware. Six attack classes rejected, each by its intended check. | Observed in the kernel on x86-64 in an emulator. | kernel test E2 |
 | In-kernel rematerialization. A computation's state checkpoints and rematerializes bit-identically. | Observed in the kernel. | kernel test R3 |
 | Two-machine diff-proportional migration, hash-verified. Cold sync 44505 bytes over 1093 objects. Three warm hops after small changes move 1176, 1176, and 2219 bytes. | Measured bytes on the wire between two emulator instances. | kernel/net_repro.sh |
@@ -117,8 +117,11 @@ ring-3 userspace and re-minting syscall boundary, a content-addressed process lo
 concurrent processes with descheduling as rematerialization, a rematerialization-aware scheduling
 policy with a fairness control, a per-process heap, two-machine diff-proportional migration over
 ivshmem, signed cross-machine authorization with real Ed25519, a signed key lifecycle, and a
-machine-checked Coq proof of the core authority guarantee (of the abstract re-mint model; the C
-gate is tested against attack tables, not machine-checked).
+machine-checked Coq proof of the core authority guarantee (of the abstract re-mint model). The C
+gate cvsasx_swcap_check in carmix/swcap.c is not a Qed proof, but its bounds and permission
+(anti-amplification) logic is CBMC-decided within the stated bounds (cbmc 6.6.0, VERIFICATION
+SUCCESSFUL, 0 of 27 properties failed); its remaining runtime correspondence is tested against
+attack tables.
 
 What is not built, the gap to general purpose: there is no filesystem and no persistent storage
 (the store is in RAM), no full heap allocator (the userspace allocator is bump-only with no free),

@@ -59,10 +59,12 @@ hypothesis. To keep the claims separable, every result is placed in one of three
 maturity tiers. Tier 1 is built in \carmix{}, C-tested, and rdtsc-measured.
 Tier 2 is paper-argued theory not yet validated on \carmix{}. Tier 3 is a research
 verdict or formal result whose implementation is not built. The Deterministically
-Reproducible Consistent Cut result is Tier 2, paper-argued, with a first measured
-exercise (U-3, CV8) covering the exercised workloads and schedules only and a
-universal proof pending; its validation gap has narrowed now that the SMP
-foundation exists, but the multi-core consistent capture is not yet demonstrated. The deduplication impossibility bound, the content-addressed
+Reproducible Consistent Cut result is now machine-checked in the minimal model of
+\texttt{proofs/CarmixDrcc.v} (Qed under \texttt{coqc} 8.20.1, under named
+model-to-machine assumptions) and first-exercise-measured on two real cores (U-3,
+CV8) over the exercised workloads and schedules only; it stays Tier 2 on
+\carmix{} because the multi-core consistent capture is not yet demonstrated in
+running code. The deduplication impossibility bound, the content-addressed
 convergence verdict, and the userland phasing are Tier 3. Every runtime number
 reported here was observed in the QEMU emulator and is quoted from the captured
 serial transcript. \carmix{} is roughly forty to forty-five percent of the way to
@@ -718,12 +720,29 @@ development contains no \texttt{Admitted}, no \texttt{admit}, and no
 reports the three authority results as closed under the global context and
 \texttt{acyclic\_graph} as carrying only the collision-resistance hypothesis.
 
+A separate file, \texttt{proofs/CarmixDag.v}, strengthens the acyclicity result
+from that finite inductive tree to a genuinely shared, hash-consed DAG, the store
+shape a content-addressed system actually has, where one child hash sits under
+several parents as a single resident object. It proves that store graph acyclic
+under two named assumptions of the file, \texttt{H\_CF} (store-level
+collision-freedom) and \texttt{H\_WF} (a hash-before-name creation order), with
+every proof closed by Qed under \texttt{coqc} 8.20.1, and it still does not derive
+acyclicity from hash collision-freedom alone.
+
 The proof is about the abstract capability algebra. It is not a proof that the C
 implementation in \texttt{carmix/swcap.c} refines this model. The runtime
 correspondence is demonstrated, not proven, by the kernel attack tables (E2, US3,
 D2, KA), each of which runs the real software backend and observes each adversary
 rejected by its intended check. A machine-checked refinement of the C code against
-this model is future work.
+this model is future work. One rung of it is now decided rather than tested:
+\texttt{proofs/cbmc} records a bounded, bit-precise CBMC decision of the real gate
+\texttt{cvsasx\_swcap\_check}, which within stated bounds decides that the gate
+grants if and only if the access is valid, the requested permissions are a subset
+of the capability's (no amplification), and the requested window lies within the
+capability's length. \texttt{cbmc} 6.6.0 reports \textsc{verification successful},
+0 of 27 properties failed; the reachable code has no loops or recursion, so the
+decision is exhaustive over the nondet input domain. This is a bounded decision
+within stated bounds, not a Coq Qed proof.
 
 \section{Evaluation}
 
@@ -974,9 +993,15 @@ raw compute speed, cold-start migration, or operating-system completeness.
 
 \section{Formal Results Not Yet Validated on \carmix{} (Tier 2)}
 
-The result in this section is paper-argued theory. The SMP foundation of the earlier
-sections has narrowed its validation gap, but \carmix{} does not yet exhibit it in
-running code, so it is Tier 2 and not Tier 1.
+The result in this section is now machine-checked in a minimal model, not only
+paper-argued. \texttt{proofs/CarmixDrcc.v} proves, with Qed under \texttt{coqc}
+8.20.1, that for a data-race-free program all schedules reaching the cut yield one
+canonical content name; the in-model theorem needs no Coq hypothesis given its
+explicit DRF premise, and the model-to-machine assumptions a deployment rests on
+are named as honest gaps rather than smuggled in as proved. The SMP foundation of
+the earlier sections has narrowed the validation gap further, but \carmix{} does
+not yet exhibit the multi-core capture in running code, so the result is Tier 2 and
+not Tier 1.
 
 \subsection{Deterministically Reproducible Consistent Cut}
 
@@ -1111,10 +1136,12 @@ concurrent cross-core attacker is not exercised because it depends on the SMP wo
 \item \textbf{SMP is a foundation only.} A second CPU is up with per-CPU state, a
 working inter-processor interrupt path, and a cross-core test that shows genuine
 parallelism (Tier 1). The multi-core consistent capture and the DRCC result are
-not validated on it. The DRCC result is paper-argued theory with a first measured
-exercise (U-3, CV8) covering the exercised workloads and schedules only and a
-universal proof pending; its validation gap has narrowed now that the foundation
-exists, but \carmix{} does not yet exhibit the multi-core cut (Tier 2).
+not validated on it. The DRCC result is machine-checked in the minimal model of
+\texttt{proofs/CarmixDrcc.v} (Qed under \texttt{coqc} 8.20.1, under named
+model-to-machine assumptions) and first-exercise-measured on two real cores (U-3,
+CV8) over the exercised workloads and schedules only; its validation gap has
+narrowed now that the foundation exists, but \carmix{} does not yet exhibit the
+multi-core cut (Tier 2).
 \item \textbf{Garbage collection and convergence have limits.} The durable
 collector is single-CPU. Concurrent tracing against a live multi-threaded mutator
 and cross-core reclamation are not built and wait on the SMP work.

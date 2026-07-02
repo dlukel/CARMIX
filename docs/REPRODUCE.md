@@ -110,3 +110,19 @@ make && make check && make audit
 `make check` prints `coqchk OK`. `make audit` prints `Closed under the global context` for
 anti_amplification, valid_dest_no_wx, and valid_dest_no_forbidden, and prints the single
 collision-resistance hypothesis for acyclic_graph. See docs/PROOFS.md.
+
+The two later proof files re-verify with coqc 8.20.1 directly, and each closes with Qed:
+
+```
+cd proofs
+coqc CarmixDag.v      # shared-DAG acyclicity under H_CF and H_WF
+coqc CarmixDrcc.v     # DRCC in the minimal model, DRF-premised
+```
+
+The bounded CBMC decision of the real swcap gate re-runs with cbmc 6.6.0 from the repo root and
+prints `VERIFICATION SUCCESSFUL`, 0 of 27 properties failed:
+
+```
+cbmc proofs/cbmc/swcap_check_harness.c -I carmix -I cap --drop-unused-functions \
+     --unsigned-overflow-check --pointer-check --bounds-check
+```

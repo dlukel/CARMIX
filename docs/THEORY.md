@@ -95,6 +95,12 @@ hashing by itself, without the finite-structure model, forces acyclicity. A dire
 no_id_fixpoint, states the fixed-point impossibility, no object's identity can equal the identity of
 one of its own proper descendants.
 
+proofs/CarmixDag.v carries this from the finite inductive tree to a genuinely shared, hash-consed
+DAG, the store shape where one child hash sits under several parents as a single resident object. It
+proves that store graph acyclic under two named assumptions of that file, H_CF, store-level
+collision-freedom, and H_WF, a hash-before-name creation order, with every proof closed by Qed under
+coqc 8.20.1, and still without deriving acyclicity from hash collision-freedom alone.
+
 ## What the proof does not cover
 
 The proof is about the abstract capability algebra. It is not a machine-checked refinement of the C
